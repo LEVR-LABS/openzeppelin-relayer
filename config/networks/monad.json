@@ -1,6 +1,7 @@
 {
   "networks": [
     {
+      "average_blocktime_ms": 500,
       "chain_id": 10143,
       "explorer_urls": [
         "https://testnet.monadexplorer.com",
