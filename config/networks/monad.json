@@ -22,7 +22,8 @@
       ],
       "symbol": "MON",
       "tags": [
-        "L1"
+        "L1",
+        "no-mempool"
       ],
       "type": "evm"
     }
