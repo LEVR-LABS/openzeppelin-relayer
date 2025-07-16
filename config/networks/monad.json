@@ -1,0 +1,29 @@
+{
+  "networks": [
+    {
+      "chain_id": 10143,
+      "explorer_urls": [
+        "https://testnet.monadexplorer.com",
+        "https://sourcify-api-monad.blockvision.org",
+        "https://testnet.monadscan.com",
+        "https://api-testnet.monadscan.com/api"
+      ],
+      "features": [
+        "eip1559"
+      ],
+      "is_testnet": true,
+      "network": "monad-testnet",
+      "required_confirmations": 1,
+      "rpc_urls": [
+        "https://monad-testnet.drpc.org",
+        "https://rpc.ankr.com/monad_testnet",
+        "https://testnet-rpc.monad.xyz"
+      ],
+      "symbol": "MON",
+      "tags": [
+        "L1"
+      ],
+      "type": "evm"
+    }
+  ]
+}
