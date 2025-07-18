@@ -23,15 +23,13 @@
       "type": "evm"
     },
     {
-      "average_blocktime_ms": 12000,
+      "from": "mainnet",
       "chain_id": 11155111,
       "explorer_urls": [
         "https://api-sepolia.etherscan.io/api",
         "https://sepolia.etherscan.io"
       ],
-      "features": [
-        "eip1559"
-      ],
+  
       "is_testnet": true,
       "network": "sepolia",
       "required_confirmations": 6,
@@ -42,18 +40,14 @@
         "https://ethereum-sepolia-public.nodies.app"
       ],
       "symbol": "ETH",
-      "tags": [],
       "type": "evm"
     },
     {
-      "average_blocktime_ms": 12000,
+      "from": "mainnet",
       "chain_id": 17000,
       "explorer_urls": [
         "https://api-holesky.etherscan.io/api",
         "https://holesky.etherscan.io"
-      ],
-      "features": [
-        "eip1559"
       ],
       "is_testnet": true,
       "network": "holesky",
@@ -64,7 +58,6 @@
         "https://ethereum-holesky-rpc.publicnode.com"
       ],
       "symbol": "ETH",
-      "tags": [],
       "type": "evm"
     }
   ]
