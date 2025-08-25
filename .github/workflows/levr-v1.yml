@@ -49,6 +49,32 @@ jobs:
                   ls -al ${APP_DIR}/config
                   cat ${APP_DIR}/config/config.json
 
+            - name: Install EFS utils
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y amazon-efs-utils
+
+            - name: Create mount point directory
+              run: |
+                  sudo mkdir -p /mnt/efs-config
+                  sudo chown $USER:$USER /mnt/efs-config
+
+            - name: Mount EFS Access Point
+              run: |
+                  EFS_ID=${{ secrets.EFS_ID }}
+                  EFS_AP_ID=${{ secrets.EFS_AP_ID }}
+                  AWS_REGION=${{ secrets.AWS_REGION }}
+                  sudo mount -t efs -o tls,accesspoint=${EFS_AP_ID} ${EFS_ID}:/ /mnt/efs-config
+                  ls -al /mnt/efs-config
+                  
+            - name: Copy config file to application directory
+              run: |
+                  cp ${APP_DIR}/config/config.json /mnt/efs-config/config.json
+                  ls -al ${APP_DIR}/config
+
+            - name: Verify upload
+              run: ls -la /mnt/efs-config/
+
             - name: Build and Push Docker Image to ECR (main)
               uses: docker/build-push-action@v2
               with:
