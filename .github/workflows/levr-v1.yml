@@ -52,8 +52,12 @@ jobs:
             - name: Install EFS utils
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y amazon-efs-utils
-
+                  sudo apt-get install -y git binutils rustc cargo pkg-config libssl-dev
+                  git clone https://github.com/aws/efs-utils
+                  cd efs-utils
+                  ./build-deb.sh
+                  sudo apt-get install -y ./build/amazon-efs-utils*deb
+                  
             - name: Create mount point directory
               run: |
                   sudo mkdir -p /mnt/efs-config
