@@ -68,9 +68,12 @@ jobs:
                   EFS_ID=${{ secrets.EFS_ID }}
                   EFS_AP_ID=${{ secrets.EFS_AP_ID }}
                   AWS_REGION=${{ secrets.AWS_REGION }}
-                  sudo mount -t efs -o tls,accesspoint=${EFS_AP_ID},region=${AWS_REGION} ${EFS_ID}:/ /mnt/efs-config
+                  # Pass AWS credentials to sudo environment
+                  sudo -E AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
+                      AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+                      AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }} \
+                      mount -t efs -o tls,accesspoint=${EFS_AP_ID},region=${AWS_REGION} ${EFS_ID}:/ /mnt/efs-config
                   ls -al /mnt/efs-config
-                  
             - name: Copy config file to application directory
               run: |
                   cp ${APP_DIR}/config/config.json /mnt/efs-config/config.json
