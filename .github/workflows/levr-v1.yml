@@ -49,38 +49,18 @@ jobs:
                   ls -al ${APP_DIR}/config
                   cat ${APP_DIR}/config/config.json
 
-            - name: Install EFS utils
+            - name: Upload to EFS via Lambda
               run: |
-                  sudo apt-get update
-                  sudo apt-get install -y git binutils rustc cargo pkg-config libssl-dev
-                  git clone https://github.com/aws/efs-utils
-                  cd efs-utils
-                  ./build-deb.sh
-                  sudo apt-get install -y ./build/amazon-efs-utils*deb
-
-            - name: Create mount point directory
-              run: |
-                  sudo mkdir -p /mnt/efs-config
-                  sudo chown $USER:$USER /mnt/efs-config
-
-            - name: Mount EFS Access Point
-              run: |
-                  EFS_ID=${{ secrets.EFS_ID }}
-                  EFS_AP_ID=${{ secrets.EFS_AP_ID }}
-                  AWS_REGION=${{ secrets.AWS_REGION }}
-                  # Pass AWS credentials to sudo environment
-                  sudo -E AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-                      AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-                      AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }} \
-                      mount -t efs -o tls,accesspoint=${EFS_AP_ID},region=${AWS_REGION} ${EFS_ID}:/ /mnt/efs-config
-                  ls -al /mnt/efs-config
-            - name: Copy config file to application directory
-              run: |
-                  cp ${APP_DIR}/config/config.json /mnt/efs-config/config.json
-                  ls -al ${APP_DIR}/config
-
-            - name: Verify upload
-              run: ls -la /mnt/efs-config/
+                # Base64 encode the file
+                CONFIG_CONTENT=$(base64 -w 0 ${APP_DIR}/config/config.json)
+                
+                # Invoke Lambda
+                aws lambda invoke \
+                  --function-name upload-to-efs \
+                  --payload "{\"filename\":\"config.json\",\"content\":\"$CONFIG_CONTENT\"}" \
+                  response.json
+                
+                cat response.json
 
             - name: Build and Push Docker Image to ECR (main)
               uses: docker/build-push-action@v2
