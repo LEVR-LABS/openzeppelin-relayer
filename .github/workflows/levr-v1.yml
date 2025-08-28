@@ -51,16 +51,35 @@ jobs:
 
             - name: Upload to EFS via Lambda
               run: |
-                # Base64 encode the file
-                CONFIG_CONTENT=$(base64 -w 0 ${APP_DIR}/config/config.json)
+                # Base64 encode without line breaks and escape properly
+                CONFIG_CONTENT=$(base64 -w 0 ${APP_DIR}/config/config.json | tr -d '\n')
                 
-                # Invoke Lambda
+                # Create JSON payload file to avoid shell escaping issues
+                cat > payload.json << EOF
+                  {
+                    "filename": "config.json",
+                    "content": "${CONFIG_CONTENT}",
+                    "efs_path": "openzeppelin/config/config.json"
+                  }
+                  EOF
+                
+                # Invoke Lambda with file payload
                 aws lambda invoke \
-                  --function-name upload-to-efs \
-                  --payload "{\"filename\":\"config.json\",\"content\":\"$CONFIG_CONTENT\"}" \
+                  --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+                  --payload file://payload.json \
                   response.json
                 
-                cat response.json
+                # Check response
+                if grep -q '"statusCode": 200' response.json; then
+                  echo "✅ Config uploaded successfully to EFS"
+                else
+                  echo "❌ Upload failed"
+                  cat response.json
+                  exit 1
+                fi
+                
+                # Clean up
+                rm payload.json
 
             - name: Build and Push Docker Image to ECR (main)
               uses: docker/build-push-action@v2
