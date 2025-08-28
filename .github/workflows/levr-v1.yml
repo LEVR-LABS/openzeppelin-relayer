@@ -53,10 +53,11 @@ jobs:
             - name: Upload to EFS via Lambda
               run: | 
                 aws lambda invoke \
-                  --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
-                  --payload "{\"bucket\":\"${{env.BUCKET_NAME}}\",\"key\":\"config.json\"}" \
+                  --function-name upload_to_efs \
+                  --cli-binary-format raw-in-base64-out \
+                  --payload '{"bucket":"levr-v1-openzeppelin-relayers-config","key":"config.json"}' \
                   response.json
-              
+                  
                 echo "Response:"
                 cat response.json
                 
