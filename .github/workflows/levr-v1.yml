@@ -10,6 +10,7 @@ env:
     ECR_REPOSITORY_APP: levr-v1-openzeppelin-relayer
     APP_DIR: "${{ github.workspace }}"
     BUCKET_NAME: levr-v1-openzeppelin-relayers-config
+    LAMBDA_FUNCTION_NAME: upload_to_efs
 jobs:
     build-and-push-ecr:
         runs-on: ubuntu-latest
@@ -50,24 +51,14 @@ jobs:
                   cat ${APP_DIR}/config/config.json
 
             - name: Upload to EFS via Lambda
-              run: |
-                # Base64 encode without line breaks and escape properly
-                CONFIG_CONTENT=$(base64 -w 0 ${APP_DIR}/config/config.json | tr -d '\n')
-                
-                # Create JSON payload file to avoid shell escaping issues
-                cat > payload.json << EOF
-                  {
-                    "filename": "config.json",
-                    "content": "${CONFIG_CONTENT}",
-                    "efs_path": "openzeppelin/config/config.json"
-                  }
-                  EOF
-                
-                # Invoke Lambda with file payload
+              run: | 
                 aws lambda invoke \
-                  --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
-                  --payload file://payload.json \
+                  --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+                  --payload "{\"bucket\":\"${{env.BUCKET_NAME}}\",\"key\":\"config.json\"}" \
                   response.json
+              
+                echo "Response:"
+                cat response.json
                 
                 # Check response
                 if grep -q '"statusCode": 200' response.json; then
@@ -77,9 +68,6 @@ jobs:
                   cat response.json
                   exit 1
                 fi
-                
-                # Clean up
-                rm payload.json
 
             - name: Build and Push Docker Image to ECR (main)
               uses: docker/build-push-action@v2
