@@ -1,0 +1,61 @@
+{
+  "relayers": [
+    {
+      "id": "game-admin-10143-1",
+      "name": "Game Admin 10143 1",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "game-admin-1",
+      "network_type": "evm",
+      "custom_rpc_urls": ["${MONAD_TESTNET_RPC_URL_1}"],
+      "policies": {
+        "min_balance": 0,
+        "whitelist_receivers": [
+          "0xF3A0c019336b489C01091B3B99DE0e8b0d1670a6",
+          "0xd8e37a089959e53f80cA2A8E9406CAE9950670dC"
+        ],
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "game-admin-10143-2",
+      "name": "Game Admin 10143 2",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "game-admin-2",
+      "network_type": "evm",
+      "custom_rpc_urls": ["${MONAD_TESTNET_RPC_URL_1}"],
+      "policies": {
+        "min_balance": 0,
+        "whitelist_receivers": [
+          "0xF3A0c019336b489C01091B3B99DE0e8b0d1670a6",
+          "0xd8e37a089959e53f80cA2A8E9406CAE9950670dC"
+        ],
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    }
+  ],
+  "notifications": [],
+  "signers": [
+    {
+      "id": "game-admin-1",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "a4b9f547-b078-452f-9d80-eb7f74a7b341"
+      }
+    },
+    {
+      "id": "game-admin-2",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "23b4e79f-9342-4952-b3e5-6ddbaeb1a484"
+      }
+    }
+  ],
+  "networks": "./config/networks",
+  "plugins": []
+}
