@@ -11,6 +11,10 @@ env:
     APP_DIR: "${{ github.workspace }}"
     BUCKET_NAME: levr-v1-openzeppelin-relayers-config
     LAMBDA_FUNCTION_NAME: upload_to_efs
+    ECS_CLUSTER: levr-v1-cluster
+    ECS_SERVICE: openzeppeline
+    ECS_TASK_DEFINITION_FAMILY: openzeppeline
+    CONTAINER_NAME: openzeppeline
 jobs:
     build-and-push-ecr:
         runs-on: ubuntu-latest
@@ -106,11 +110,30 @@ jobs:
                   echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
                 fi
 
-            # - name: Build and Push Docker Image to ECR (main)
-            #   uses: docker/build-push-action@v2
-            #   with:
-            #       context: .
-            #       file: ./Dockerfile.production
-            #       push: true
-            #       tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:latest
+            - name: Build and Push Docker Image to ECR (main)
+              uses: docker/build-push-action@v2
+              with:
+                  context: .
+                  file: ./Dockerfile.production
+                  push: true
+                  tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
+
+            - name: Fill in the new image ID in the Amazon ECS task definition
+              id: task-def
+              uses: aws-actions/amazon-ecs-render-task-definition@v1
+              with:
+                  # task-definition: ${{ env.ECS_TASK_DEFINITION }}
+                  # task-definition-arn: task-definition-arn
+                  task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
+                  container-name: ${{ env.CONTAINER_NAME }}
+                  image: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
+
+            - name: Deploy Amazon ECS task definition
+              uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+              with:
+                  task-definition: ${{ steps.task-def.outputs.task-definition }}
+                  service: ${{ env.ECS_SERVICE }}
+                  cluster: ${{ env.ECS_CLUSTER }}
+                  # wait-for-service-stability: true
+
 
