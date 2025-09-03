@@ -65,34 +65,44 @@ jobs:
 
             - name: Upload networks folder files to EFS via Lambda
               run: |
-                for file in ${APP_DIR}/networks/*; do
-                  filename=$(basename "$file")
-                  filepath="networks/$filename"
-                  echo "📤 Uploading $filepath"
-                  echo "File name: $filename"
+                set -euo pipefail
+                NETWORKS_DIR="${APP_DIR}/networks"
 
-                  PAYLOAD=$(jq -n \
-                    --arg filename "$filepath" \
-                    --argjson payload "$(cat "$file")" \
-                    '{filename: $filename, payload: $payload}')
+                if [ -d "$NETWORKS_DIR" ] && [ "$(ls -A "$NETWORKS_DIR")" ]; then
+                  for file in "$NETWORKS_DIR"/*; do
+                    filename=$(basename "$file")
+                    filepath="networks/$filename"
 
-                  aws lambda invoke \
-                    --function-name upload_to_efs \
-                    --cli-binary-format raw-in-base64-out \
-                    --payload "$PAYLOAD" \
-                    response.json
+                    echo "📤 Uploading $filepath"
 
-                  echo "Response for $filepath:"
-                  cat response.json
+                    # Read file content safely
+                    content=$(cat "$file")
 
-                  if grep -q '"statusCode": 200' response.json; then
-                    echo "✅ $filepath uploaded successfully to EFS"
-                  else
-                    echo "❌ Upload failed for $filepath"
+                    # Wrap into a JSON payload
+                    PAYLOAD=$(jq -n \
+                      --arg filename "$filepath" \
+                      --argjson payload "$content" \
+                      '{filename: $filename, payload: $payload}')
+
+                    aws lambda invoke \
+                      --function-name upload_to_efs \
+                      --cli-binary-format raw-in-base64-out \
+                      --payload "$PAYLOAD" \
+                      response.json
+
+                    echo "Response for $filepath:"
                     cat response.json
-                    exit 1
-                  fi
-                done
+
+                    if grep -q '"statusCode": 200' response.json; then
+                      echo "✅ $filepath uploaded successfully to EFS"
+                    else
+                      echo "❌ Upload failed for $filepath"
+                      cat response.json
+                      exit 1
+                    fi
+                  done
+                else
+                  echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
 
             # - name: Build and Push Docker Image to ECR (main)
             #   uses: docker/build-push-action@v2
