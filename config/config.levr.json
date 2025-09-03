@@ -7,7 +7,7 @@
       "paused": false,
       "signer_id": "game-admin-1",
       "network_type": "evm",
-      "custom_rpc_urls": ["${MONAD_TESTNET_RPC_URL_1}"],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
         "min_balance": 0,
         "whitelist_receivers": [
@@ -25,7 +25,7 @@
       "paused": false,
       "signer_id": "game-admin-2",
       "network_type": "evm",
-      "custom_rpc_urls": ["${MONAD_TESTNET_RPC_URL_1}"],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
         "min_balance": 0,
         "whitelist_receivers": [
