@@ -55,5 +55,7 @@
         "key_id": "23b4e79f-9342-4952-b3e5-6ddbaeb1a484"
       }
     }
-  ]
+  ],
+  "networks": "./config/networks",
+  "plugins": []
 }
