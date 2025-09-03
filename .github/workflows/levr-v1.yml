@@ -36,7 +36,7 @@ jobs:
             - name: Generate config file
               id: generate-config
               run: |
-                  mv ${APP_DIR}config/config.levr.json ${APP_DIR}/config/config.json
+                  mv ${APP_DIR}/config/config.levr.json ${APP_DIR}/config/config.json
                   ls -al ${APP_DIR}/config
                   cat ${APP_DIR}/config/config.json
 
