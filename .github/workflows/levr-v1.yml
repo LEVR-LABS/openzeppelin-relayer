@@ -65,8 +65,9 @@ jobs:
 
             - name: Upload networks folder files to EFS via Lambda
               run: |
-                set -euo pipefail
-                NETWORKS_DIR="${APP_DIR}/networks"
+                NETWORKS_DIR="${APP_DIR}/config/networks"
+
+                ls -al "$NETWORKS_DIR"
 
                 if [ -d "$NETWORKS_DIR" ] && [ "$(ls -A "$NETWORKS_DIR")" ]; then
                   for file in "$NETWORKS_DIR"/*; do
