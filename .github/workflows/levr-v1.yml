@@ -38,6 +38,7 @@ jobs:
               run: |
                   mv ${APP_DIR}/config/config.levr.json ${APP_DIR}/config/config.json
                   ls -al ${APP_DIR}/config
+                  sed -i 's/MONAD_TESTNET_RPC_URL_1/${{ secrets.MONAD_TESTNET_RPC_URL_1 }}/g' ${APP_DIR}/config/config.json
                   cat ${APP_DIR}/config/config.json
 
             # - name: Upload to EFS via Lambda
