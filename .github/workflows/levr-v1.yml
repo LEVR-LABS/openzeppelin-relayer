@@ -29,16 +29,6 @@ jobs:
                   aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
                   aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
                   aws-region: ${{ secrets.AWS_REGION }}
-            - name: Install build tools
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y build-essential
-
-            - name: Verify compiler installation
-              run: |
-                  g++ --version
-                  c++ --version
-
             - name: Login to Amazon ECR
               id: login-ecr
               uses: aws-actions/amazon-ecr-login@v1
@@ -46,35 +36,35 @@ jobs:
             - name: Generate config file
               id: generate-config
               run: |
-                  aws s3 cp s3://${{env.BUCKET_NAME}}/config.json ${APP_DIR}/config/config.json
+                  mv ${APP_DIR}config/config.levr.json ${APP_DIR}/config/config.json
                   ls -al ${APP_DIR}/config
                   cat ${APP_DIR}/config/config.json
 
-            - name: Upload to EFS via Lambda
-              run: | 
-                aws lambda invoke \
-                  --function-name upload_to_efs \
-                  --cli-binary-format raw-in-base64-out \
-                  --payload '{"bucket":"levr-v1-openzeppelin-relayers-config","key":"config.json"}' \
-                  response.json
+            # - name: Upload to EFS via Lambda
+            #   run: | 
+            #     aws lambda invoke \
+            #       --function-name upload_to_efs \
+            #       --cli-binary-format raw-in-base64-out \
+            #       --payload '{"bucket":"levr-v1-openzeppelin-relayers-config","key":"config.json"}' \
+            #       response.json
                   
-                echo "Response:"
-                cat response.json
+            #     echo "Response:"
+            #     cat response.json
                 
-                # Check response
-                if grep -q '"statusCode": 200' response.json; then
-                  echo "✅ Config uploaded successfully to EFS"
-                else
-                  echo "❌ Upload failed"
-                  cat response.json
-                  exit 1
-                fi
+            #     # Check response
+            #     if grep -q '"statusCode": 200' response.json; then
+            #       echo "✅ Config uploaded successfully to EFS"
+            #     else
+            #       echo "❌ Upload failed"
+            #       cat response.json
+            #       exit 1
+            #     fi
 
-            - name: Build and Push Docker Image to ECR (main)
-              uses: docker/build-push-action@v2
-              with:
-                  context: .
-                  file: ./Dockerfile.production
-                  push: true
-                  tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:latest
+            # - name: Build and Push Docker Image to ECR (main)
+            #   uses: docker/build-push-action@v2
+            #   with:
+            #       context: .
+            #       file: ./Dockerfile.production
+            #       push: true
+            #       tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:latest
 
