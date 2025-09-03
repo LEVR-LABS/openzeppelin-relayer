@@ -103,6 +103,7 @@ jobs:
                   done
                 else
                   echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
+                fi
 
             # - name: Build and Push Docker Image to ECR (main)
             #   uses: docker/build-push-action@v2
