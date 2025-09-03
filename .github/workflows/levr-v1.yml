@@ -63,11 +63,11 @@ jobs:
                   exit 1
                 fi
 
-            # - name: Build and Push Docker Image to ECR (main)
-            #   uses: docker/build-push-action@v2
-            #   with:
-            #       context: .
-            #       file: ./Dockerfile.production
-            #       push: true
-            #       tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:latest
+            - name: Build and Push Docker Image to ECR (main)
+              uses: docker/build-push-action@v2
+              with:
+                  context: .
+                  file: ./Dockerfile.production
+                  push: true
+                  tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/levr-v1-openzeppelin-relayer:latest
 
