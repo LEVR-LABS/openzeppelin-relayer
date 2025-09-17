@@ -35,6 +35,24 @@
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
+    },
+    {
+      "id": "game-admin-10143-3",
+      "name": "Game Admin 10143 3",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "game-admin-3",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 0,
+        "whitelist_receivers": [
+          "0xF3A0c019336b489C01091B3B99DE0e8b0d1670a6",
+          "0xd8e37a089959e53f80cA2A8E9406CAE9950670dC"
+        ],
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
     }
   ],
   "notifications": [],
@@ -53,6 +71,14 @@
       "config": {
         "region": "ap-south-1",
         "key_id": "23b4e79f-9342-4952-b3e5-6ddbaeb1a484"
+      }
+    },
+    {
+      "id": "game-admin-3",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "63784cda-5cac-48c4-ac78-7b00aa6c7957"
       }
     }
   ],
