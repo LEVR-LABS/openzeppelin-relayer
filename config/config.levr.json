@@ -7,11 +7,9 @@
       "paused": false,
       "signer_id": "game_admin_1",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -23,11 +21,9 @@
       "paused": false,
       "signer_id": "game_admin_2",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -39,11 +35,9 @@
       "paused": false,
       "signer_id": "game_admin_3",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -55,11 +49,9 @@
       "paused": false,
       "signer_id": "liquidator_1",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -71,11 +63,9 @@
       "paused": false,
       "signer_id": "liquidator_2",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -87,11 +77,9 @@
       "paused": false,
       "signer_id": "liquidator_3",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -103,11 +91,9 @@
       "paused": false,
       "signer_id": "feed_provider_1",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -119,11 +105,9 @@
       "paused": false,
       "signer_id": "feed_provider_2",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -135,11 +119,9 @@
       "paused": false,
       "signer_id": "feed_provider_3",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -151,11 +133,9 @@
       "paused": false,
       "signer_id": "match_maker_1",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -167,11 +147,9 @@
       "paused": false,
       "signer_id": "match_maker_2",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
@@ -183,11 +161,9 @@
       "paused": false,
       "signer_id": "match_maker_3",
       "network_type": "evm",
-      "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1"
-      ],
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
