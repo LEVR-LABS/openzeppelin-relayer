@@ -65,6 +65,9 @@ fn load_config_file(config_file_path: &str) -> Result<Config> {
 
 #[actix_web::main]
 async fn main() -> Result<()> {
+    // Initialize error reporting with eyre
+    color_eyre::install().wrap_err("Failed to initialize error reporting.")?;
+
     dotenv().ok();
 
     // Setup logging first so ErrorLayer is available
