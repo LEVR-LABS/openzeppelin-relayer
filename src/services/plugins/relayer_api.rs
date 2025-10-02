@@ -13,8 +13,9 @@ use crate::models::{
     AppState, NetworkRepoModel, NetworkTransactionRequest, NotificationRepoModel, RelayerRepoModel,
     SignerRepoModel, ThinDataAppState, TransactionRepoModel, TransactionResponse,
 };
+use crate::observability::request_id::set_request_id;
 use crate::repositories::{
-    NetworkRepository, PluginRepositoryTrait, RelayerRepository, Repository,
+    ApiKeyRepositoryTrait, NetworkRepository, PluginRepositoryTrait, RelayerRepository, Repository,
     TransactionCounterTrait, TransactionRepository,
 };
 use crate::services::plugins::PluginError;
@@ -22,6 +23,7 @@ use actix_web::web;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use strum::Display;
+use tracing::instrument;
 
 #[cfg(test)]
 use mockall::automock;
@@ -47,6 +49,7 @@ pub struct Request {
     pub relayer_id: String,
     pub method: PluginMethod,
     pub payload: serde_json::Value,
+    pub http_request_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -65,7 +68,7 @@ pub struct Response {
 
 #[async_trait]
 #[cfg_attr(test, automock)]
-pub trait RelayerApiTrait<J, RR, TR, NR, NFR, SR, TCR, PR>: Send + Sync
+pub trait RelayerApiTrait<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>: Send + Sync
 where
     J: JobProducerTrait + 'static,
     TR: TransactionRepository + Repository<TransactionRepoModel, String> + Send + Sync + 'static,
@@ -75,46 +78,47 @@ where
     SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
     TCR: TransactionCounterTrait + Send + Sync + 'static,
     PR: PluginRepositoryTrait + Send + Sync + 'static,
+    AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
 {
     async fn handle_request(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Response;
 
     async fn process_request(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<Response, PluginError>;
 
     async fn handle_send_transaction(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<Response, PluginError>;
 
     async fn handle_get_transaction(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<Response, PluginError>;
 
     async fn handle_get_relayer_status(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<Response, PluginError>;
 
     async fn handle_sign_transaction(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<Response, PluginError>;
     async fn handle_get_relayer_info(
         &self,
         request: Request,
-        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &web::ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<Response, PluginError>;
 }
 
@@ -122,10 +126,11 @@ where
 pub struct RelayerApi;
 
 impl RelayerApi {
-    pub async fn handle_request<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    #[instrument(name = "Plugin::handle_request", skip_all, fields(method = %request.method, relayer_id = %request.relayer_id, plugin_req_id = %request.request_id))]
+    pub async fn handle_request<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Response
     where
         J: JobProducerTrait + 'static,
@@ -140,7 +145,13 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
+        // Restore original HTTP request id onto this span if provided
+        if let Some(http_rid) = request.http_request_id.clone() {
+            set_request_id(http_rid);
+        }
+
         match self.process_request(request.clone(), state).await {
             Ok(response) => response,
             Err(e) => Response {
@@ -151,10 +162,10 @@ impl RelayerApi {
         }
     }
 
-    async fn process_request<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    async fn process_request<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError>
     where
         J: JobProducerTrait + 'static,
@@ -169,6 +180,7 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
         match request.method {
             PluginMethod::SendTransaction => self.handle_send_transaction(request, state).await,
@@ -179,10 +191,10 @@ impl RelayerApi {
         }
     }
 
-    async fn handle_send_transaction<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    async fn handle_send_transaction<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError>
     where
         J: JobProducerTrait + 'static,
@@ -197,6 +209,7 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
         let relayer_repo_model = get_relayer_by_id(request.relayer_id.clone(), state)
             .await
@@ -236,10 +249,10 @@ impl RelayerApi {
         })
     }
 
-    async fn handle_get_transaction<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    async fn handle_get_transaction<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError>
     where
         J: JobProducerTrait + 'static,
@@ -254,6 +267,7 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
         // validation purpose only, checks if relayer exists
         get_relayer_by_id(request.relayer_id.clone(), state)
@@ -280,10 +294,10 @@ impl RelayerApi {
         })
     }
 
-    async fn handle_get_relayer_status<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    async fn handle_get_relayer_status<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError>
     where
         J: JobProducerTrait + 'static,
@@ -298,6 +312,7 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
         let network_relayer = get_network_relayer(request.relayer_id.clone(), state)
             .await
@@ -318,10 +333,10 @@ impl RelayerApi {
         })
     }
 
-    async fn handle_sign_transaction<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    async fn handle_sign_transaction<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError>
     where
         J: JobProducerTrait + 'static,
@@ -336,6 +351,7 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
         let sign_request: SignTransactionRequest = serde_json::from_value(request.payload)
             .map_err(|e| PluginError::InvalidPayload(e.to_string()))?;
@@ -359,10 +375,10 @@ impl RelayerApi {
         })
     }
 
-    async fn handle_get_relayer_info<J, RR, TR, NR, NFR, SR, TCR, PR>(
+    async fn handle_get_relayer_info<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError>
     where
         J: JobProducerTrait + 'static,
@@ -377,6 +393,7 @@ impl RelayerApi {
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     {
         let relayer = get_relayer_by_id(request.relayer_id.clone(), state)
             .await
@@ -393,7 +410,7 @@ impl RelayerApi {
 }
 
 #[async_trait]
-impl<J, RR, TR, NR, NFR, SR, TCR, PR> RelayerApiTrait<J, RR, TR, NR, NFR, SR, TCR, PR>
+impl<J, RR, TR, NR, NFR, SR, TCR, PR, AKR> RelayerApiTrait<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>
     for RelayerApi
 where
     J: JobProducerTrait + 'static,
@@ -404,11 +421,12 @@ where
     SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
     TCR: TransactionCounterTrait + Send + Sync + 'static,
     PR: PluginRepositoryTrait + Send + Sync + 'static,
+    AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
 {
     async fn handle_request(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Response {
         self.handle_request(request, state).await
     }
@@ -416,7 +434,7 @@ where
     async fn process_request(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError> {
         self.process_request(request, state).await
     }
@@ -424,7 +442,7 @@ where
     async fn handle_send_transaction(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError> {
         self.handle_send_transaction(request, state).await
     }
@@ -432,7 +450,7 @@ where
     async fn handle_get_transaction(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError> {
         self.handle_get_transaction(request, state).await
     }
@@ -440,7 +458,7 @@ where
     async fn handle_get_relayer_status(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError> {
         self.handle_get_relayer_status(request, state).await
     }
@@ -448,7 +466,7 @@ where
     async fn handle_sign_transaction(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError> {
         self.handle_sign_transaction(request, state).await
     }
@@ -456,7 +474,7 @@ where
     async fn handle_get_relayer_info(
         &self,
         request: Request,
-        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR>,
+        state: &ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>,
     ) -> Result<Response, PluginError> {
         self.handle_get_relayer_info(request, state).await
     }
@@ -483,6 +501,7 @@ mod tests {
     async fn test_handle_request() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -496,6 +515,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::SendTransaction,
             payload: serde_json::json!(create_mock_evm_transaction_request()),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -512,6 +532,7 @@ mod tests {
         setup_test_env();
         let paused = true;
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), paused)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -525,6 +546,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::SendTransaction,
             payload: serde_json::json!(create_mock_evm_transaction_request()),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -541,6 +563,7 @@ mod tests {
     async fn test_handle_request_using_trait() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -554,6 +577,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::SendTransaction,
             payload: serde_json::json!(create_mock_evm_transaction_request()),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -580,6 +604,7 @@ mod tests {
     async fn test_handle_get_transaction() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -595,6 +620,7 @@ mod tests {
             payload: serde_json::json!(GetTransactionRequest {
                 transaction_id: "test".to_string(),
             }),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -611,6 +637,7 @@ mod tests {
         setup_test_env();
         let state = create_mock_app_state(
             None,
+            None,
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
             None,
@@ -625,6 +652,7 @@ mod tests {
             payload: serde_json::json!(GetTransactionRequest {
                 transaction_id: "test".to_string(),
             }),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -641,6 +669,7 @@ mod tests {
     async fn test_handle_get_transaction_error_transaction_not_found() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -656,6 +685,7 @@ mod tests {
             payload: serde_json::json!(GetTransactionRequest {
                 transaction_id: "test".to_string(),
             }),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -673,6 +703,7 @@ mod tests {
         setup_test_env();
         let state = create_mock_app_state(
             None,
+            None,
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
             None,
@@ -685,6 +716,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::GetRelayerStatus,
             payload: serde_json::json!({}),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -701,6 +733,7 @@ mod tests {
     async fn test_handle_sign_transaction_evm_not_supported() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -716,6 +749,7 @@ mod tests {
             payload: serde_json::json!({
                 "unsigned_xdr": "test_xdr"
             }),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -732,6 +766,7 @@ mod tests {
     async fn test_handle_sign_transaction_invalid_payload() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -745,6 +780,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::SignTransaction,
             payload: serde_json::json!({"invalid": "payload"}),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -762,6 +798,7 @@ mod tests {
         setup_test_env();
         let state = create_mock_app_state(
             None,
+            None,
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
             None,
@@ -776,6 +813,7 @@ mod tests {
             payload: serde_json::json!({
                 "unsigned_xdr": "test_xdr"
             }),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -792,6 +830,7 @@ mod tests {
     async fn test_handle_get_relayer_info_success() {
         setup_test_env();
         let state = create_mock_app_state(
+            None,
             Some(vec![create_mock_relayer("test".to_string(), false)]),
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
@@ -805,6 +844,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::GetRelayer,
             payload: serde_json::json!({}),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
@@ -827,6 +867,7 @@ mod tests {
         setup_test_env();
         let state = create_mock_app_state(
             None,
+            None,
             Some(vec![create_mock_signer()]),
             Some(vec![create_mock_network()]),
             None,
@@ -839,6 +880,7 @@ mod tests {
             relayer_id: "test".to_string(),
             method: PluginMethod::GetRelayer,
             payload: serde_json::json!({}),
+            http_request_id: None,
         };
 
         let relayer_api = RelayerApi;
