@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
 
     process_config_file(config_file, server_config.clone(), &app_state).await?;
 
-    info!("Initializing relayers");
+    info!("Initializing relayers......");
     // Initialize relayers: sync and validate relayers
     initialize_relayers(app_state.clone()).await?;
 
