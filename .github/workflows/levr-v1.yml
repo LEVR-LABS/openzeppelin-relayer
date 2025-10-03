@@ -1,139 +1,136 @@
 name: Openzeppelin Relayer CI/CD Pipeline
 on:
-    push:
-        branches: [main, devops]
-        # paths:
-        #     - "oracle/core/**"
+  push:
+    branches: [main, devops]
+    # paths:
+    #     - "oracle/core/**"
 
 # Global environment variables
 env:
-    ECR_REPOSITORY_APP: levr-v1-openzeppelin-relayer
-    APP_DIR: "${{ github.workspace }}"
-    BUCKET_NAME: levr-v1-openzeppelin-relayers-config
-    LAMBDA_FUNCTION_NAME: upload_to_efs
-    ECS_CLUSTER: levr-v1-cluster
-    ECS_SERVICE: openzeppeline
-    ECS_TASK_DEFINITION_FAMILY: openzeppeline
-    CONTAINER_NAME: openzeppeline
+  ECR_REPOSITORY_APP: levr-v1-openzeppelin-relayer
+  APP_DIR: "${{ github.workspace }}"
+  BUCKET_NAME: levr-v1-openzeppelin-relayers-config
+  LAMBDA_FUNCTION_NAME: upload_to_efs
+  ECS_CLUSTER: levr-v1-cluster
+  ECS_SERVICE: openzeppeline
+  ECS_TASK_DEFINITION_FAMILY: openzeppeline
+  CONTAINER_NAME: openzeppeline
 jobs:
-    build-and-push-ecr:
-        runs-on: ubuntu-latest
+  build-and-push-ecr:
+    runs-on: ubuntu-latest
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
 
-            - name: Set unique Docker image tag
-              id: set-tag
-              run: echo "::set-output name=TAG::$(date '+%Y%m%d%H%M%S')-${{ github.run_id }}"
+      - name: Set unique Docker image tag
+        id: set-tag
+        run: echo "::set-output name=TAG::$(date '+%Y%m%d%H%M%S')-${{ github.run_id }}"
 
-            - name: Configure AWS credentials
-              uses: aws-actions/configure-aws-credentials@v2
-              with:
-                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-                  aws-region: ${{ secrets.AWS_REGION }}
-            - name: Login to Amazon ECR
-              id: login-ecr
-              uses: aws-actions/amazon-ecr-login@v1
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
 
-            - name: Generate config file
-              id: generate-config
-              run: |
-                  mv ${APP_DIR}/config/config.levr.json ${APP_DIR}/config/config.json
-                  ls -al ${APP_DIR}/config
-                  sed -i "s|MONAD_TESTNET_RPC_URL_1|${{ secrets.MONAD_TESTNET_RPC_URL_1 }}|g" ${APP_DIR}/config/config.json
-                  cat ${APP_DIR}/config/config.json
-                  echo "PAYLOAD=$(jq -c . ${APP_DIR}/config/config.json)" >> $GITHUB_OUTPUT
+      - name: Generate config file
+        id: generate-config
+        run: |
+          mv ${APP_DIR}/config/config.levr.json ${APP_DIR}/config/config.json
+          ls -al ${APP_DIR}/config
+          sed -i "s|MONAD_TESTNET_RPC_URL_1|https://rpc.ankr.com/monad_testnet|g" ${APP_DIR}/config/config.json
+          cat ${APP_DIR}/config/config.json
+          echo "PAYLOAD=$(jq -c . ${APP_DIR}/config/config.json)" >> $GITHUB_OUTPUT
 
+      - name: Upload to EFS via Lambda
+        run: |
+          aws lambda invoke \
+            --function-name upload_to_efs \
+            --cli-binary-format raw-in-base64-out \
+            --payload '${{ steps.generate-config.outputs.PAYLOAD }}' \
+            response.json
+            
+          echo "Response:"
+          cat response.json
 
-            - name: Upload to EFS via Lambda
-              run: | 
-                aws lambda invoke \
-                  --function-name upload_to_efs \
-                  --cli-binary-format raw-in-base64-out \
-                  --payload '${{ steps.generate-config.outputs.PAYLOAD }}' \
-                  response.json
-                  
-                echo "Response:"
+          # Check response
+          if grep -q '"statusCode": 200' response.json; then
+            echo "✅ Config uploaded successfully to EFS"
+          else
+            echo "❌ Upload failed"
+            cat response.json
+            exit 1
+          fi
+
+      - name: Upload networks folder files to EFS via Lambda
+        run: |
+          NETWORKS_DIR="${APP_DIR}/config/networks"
+
+          ls -al "$NETWORKS_DIR"
+
+          if [ -d "$NETWORKS_DIR" ] && [ "$(ls -A "$NETWORKS_DIR")" ]; then
+            for file in "$NETWORKS_DIR"/*; do
+              filename=$(basename "$file")
+              filepath="networks/$filename"
+
+              echo "📤 Uploading $filepath"
+
+              # Read file content safely
+              content=$(cat "$file")
+
+              # Wrap into a JSON payload
+              PAYLOAD=$(jq -n \
+                --arg filename "$filepath" \
+                --argjson payload "$content" \
+                '{filename: $filename, payload: $payload}')
+
+              aws lambda invoke \
+                --function-name upload_to_efs \
+                --cli-binary-format raw-in-base64-out \
+                --payload "$PAYLOAD" \
+                response.json
+
+              echo "Response for $filepath:"
+              cat response.json
+
+              if grep -q '"statusCode": 200' response.json; then
+                echo "✅ $filepath uploaded successfully to EFS"
+              else
+                echo "❌ Upload failed for $filepath"
                 cat response.json
-                
-                # Check response
-                if grep -q '"statusCode": 200' response.json; then
-                  echo "✅ Config uploaded successfully to EFS"
-                else
-                  echo "❌ Upload failed"
-                  cat response.json
-                  exit 1
-                fi
+                exit 1
+              fi
+            done
+          else
+            echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
+          fi
 
-            - name: Upload networks folder files to EFS via Lambda
-              run: |
-                NETWORKS_DIR="${APP_DIR}/config/networks"
+      - name: Build and Push Docker Image to ECR (main)
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile.production
+          push: true
+          tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
 
-                ls -al "$NETWORKS_DIR"
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          # task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          # task-definition-arn: task-definition-arn
+          task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
 
-                if [ -d "$NETWORKS_DIR" ] && [ "$(ls -A "$NETWORKS_DIR")" ]; then
-                  for file in "$NETWORKS_DIR"/*; do
-                    filename=$(basename "$file")
-                    filepath="networks/$filename"
-
-                    echo "📤 Uploading $filepath"
-
-                    # Read file content safely
-                    content=$(cat "$file")
-
-                    # Wrap into a JSON payload
-                    PAYLOAD=$(jq -n \
-                      --arg filename "$filepath" \
-                      --argjson payload "$content" \
-                      '{filename: $filename, payload: $payload}')
-
-                    aws lambda invoke \
-                      --function-name upload_to_efs \
-                      --cli-binary-format raw-in-base64-out \
-                      --payload "$PAYLOAD" \
-                      response.json
-
-                    echo "Response for $filepath:"
-                    cat response.json
-
-                    if grep -q '"statusCode": 200' response.json; then
-                      echo "✅ $filepath uploaded successfully to EFS"
-                    else
-                      echo "❌ Upload failed for $filepath"
-                      cat response.json
-                      exit 1
-                    fi
-                  done
-                else
-                  echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
-                fi
-
-            - name: Build and Push Docker Image to ECR (main)
-              uses: docker/build-push-action@v2
-              with:
-                  context: .
-                  file: ./Dockerfile.production
-                  push: true
-                  tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
-
-            - name: Fill in the new image ID in the Amazon ECS task definition
-              id: task-def
-              uses: aws-actions/amazon-ecs-render-task-definition@v1
-              with:
-                  # task-definition: ${{ env.ECS_TASK_DEFINITION }}
-                  # task-definition-arn: task-definition-arn
-                  task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
-                  container-name: ${{ env.CONTAINER_NAME }}
-                  image: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
-
-            - name: Deploy Amazon ECS task definition
-              uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-              with:
-                  task-definition: ${{ steps.task-def.outputs.task-definition }}
-                  service: ${{ env.ECS_SERVICE }}
-                  cluster: ${{ env.ECS_CLUSTER }}
-                  # wait-for-service-stability: true
-
-
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          # wait-for-service-stability: true
