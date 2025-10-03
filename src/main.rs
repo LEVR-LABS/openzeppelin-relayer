@@ -65,9 +65,6 @@ fn load_config_file(config_file_path: &str) -> Result<Config> {
 
 #[actix_web::main]
 async fn main() -> Result<()> {
-    // Initialize error reporting with eyre
-    color_eyre::install().wrap_err("Failed to initialize error reporting")?;
-
     dotenv().ok();
 
     // Setup logging first so ErrorLayer is available
@@ -92,7 +89,7 @@ async fn main() -> Result<()> {
 
     process_config_file(config_file, server_config.clone(), &app_state).await?;
 
-    info!("Initializing relayers......");
+    info!("Initializing relayers");
     // Initialize relayers: sync and validate relayers
     initialize_relayers(app_state.clone()).await?;
 
