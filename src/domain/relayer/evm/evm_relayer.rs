@@ -48,7 +48,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use eyre::Result;
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     create_error_response, create_success_response, map_provider_error, EvmTransactionValidator,
@@ -152,7 +152,7 @@ where
             self.relayer.id, on_chain_nonce, transaction_counter_nonce
         );
 
-        info!("Setting nonce: {} for relayer: {}", nonce, self.relayer.id);
+        debug!(nonce = %nonce, "setting nonce for relayer");
 
         self.transaction_counter_service.set(nonce).await?;
 
@@ -395,8 +395,11 @@ where
 
         let total_processed = cancelled_transaction_ids.len() + failed_transaction_ids.len();
 
-        info!("Completed processing pending transactions for relayer {}: {} queued for cancellation, {} failed to queue",
-              self.relayer.id, cancelled_transaction_ids.len(), failed_transaction_ids.len());
+        debug!(
+            queued_for_cancellation = %cancelled_transaction_ids.len(),
+            failed_to_queue = %failed_transaction_ids.len(),
+            "completed processing pending transactions for relayer"
+        );
 
         Ok(DeletePendingTransactionsResponse {
             queued_for_cancellation_transaction_ids: cancelled_transaction_ids,
@@ -510,7 +513,7 @@ where
     ///
     /// A `Result` indicating success or a `RelayerError` if any initialization step fails.
     async fn initialize_relayer(&self) -> Result<(), RelayerError> {
-        info!("Initializing relayer: {}", self.relayer.id);
+        info!("initializing relayer");
         let nonce_sync_result = self.sync_nonce().await;
         let validate_rpc_result = self.validate_rpc().await;
         let validate_min_balance_result = self.validate_min_balance().await;
@@ -536,7 +539,7 @@ where
             .collect::<Vec<String>>()
             .join(", ");
 
-            warn!("Disabling relayer: {} due to: {}", self.relayer.id, reason);
+            warn!(reason = %reason, "disabling relayer");
             let updated_relayer = self
                 .relayer_repository
                 .disable_relayer(self.relayer.id.clone())
@@ -553,6 +556,11 @@ where
                     )
                     .await?;
             }
+        } else if self.relayer.system_disabled {
+            // enable relayer if it was disabled previously and all checks passed
+            self.relayer_repository
+                .enable_relayer(self.relayer.id.clone())
+                .await?;
         }
         Ok(())
     }
@@ -2345,5 +2353,298 @@ mod tests {
             assert!(result.get("hash").is_some());
             assert!(result.get("gasUsed").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_relayer_disables_when_validation_fails() {
+        let (
+            mut provider,
+            mut relayer_repo,
+            network_repo,
+            tx_repo,
+            mut job_producer,
+            signer,
+            mut counter,
+        ) = setup_mocks();
+        let mut relayer_model = create_test_relayer();
+        relayer_model.system_disabled = false; // Start as enabled
+        relayer_model.notification_id = Some("test-notification-id".to_string());
+
+        // Mock validation failures - nonce sync fails
+        provider
+            .expect_get_transaction_count()
+            .returning(|_| Box::pin(ready(Err(ProviderError::Other("RPC error".to_string())))));
+
+        counter
+            .expect_get()
+            .returning(|| Box::pin(ready(Ok(Some(0u64)))));
+
+        // Mock other validation methods that might be called
+        provider
+            .expect_get_balance()
+            .returning(|_| Box::pin(ready(Ok(U256::from(200000000000000000u64)))));
+
+        provider
+            .expect_health_check()
+            .returning(|| Box::pin(ready(Ok(true))));
+
+        // Mock disable_relayer call
+        let mut disabled_relayer = relayer_model.clone();
+        disabled_relayer.system_disabled = true;
+        relayer_repo
+            .expect_disable_relayer()
+            .with(eq("test-relayer-id".to_string()))
+            .returning(move |_| Ok(disabled_relayer.clone()));
+
+        // Mock notification job production
+        job_producer
+            .expect_produce_send_notification_job()
+            .returning(|_, _| Box::pin(ready(Ok(()))));
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.initialize_relayer().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_relayer_enables_when_validation_passes_and_was_disabled() {
+        let (
+            mut provider,
+            mut relayer_repo,
+            network_repo,
+            tx_repo,
+            job_producer,
+            signer,
+            mut counter,
+        ) = setup_mocks();
+        let mut relayer_model = create_test_relayer();
+        relayer_model.system_disabled = true; // Start as disabled
+
+        // Mock successful validations
+        provider
+            .expect_get_transaction_count()
+            .returning(|_| Box::pin(ready(Ok(42u64))));
+
+        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
+
+        counter
+            .expect_get()
+            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+
+        provider
+            .expect_get_balance()
+            .returning(|_| Box::pin(ready(Ok(U256::from(200000000000000000u64))))); // Sufficient balance
+
+        provider
+            .expect_health_check()
+            .returning(|| Box::pin(ready(Ok(true))));
+
+        // Mock enable_relayer call
+        let mut enabled_relayer = relayer_model.clone();
+        enabled_relayer.system_disabled = false;
+        relayer_repo
+            .expect_enable_relayer()
+            .with(eq("test-relayer-id".to_string()))
+            .returning(move |_| Ok(enabled_relayer.clone()));
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.initialize_relayer().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_relayer_no_action_when_enabled_and_validation_passes() {
+        let (mut provider, relayer_repo, network_repo, tx_repo, job_producer, signer, mut counter) =
+            setup_mocks();
+        let mut relayer_model = create_test_relayer();
+        relayer_model.system_disabled = false; // Start as enabled
+
+        // Mock successful validations
+        provider
+            .expect_get_transaction_count()
+            .returning(|_| Box::pin(ready(Ok(42u64))));
+
+        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
+
+        counter
+            .expect_get()
+            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+
+        provider
+            .expect_get_balance()
+            .returning(|_| Box::pin(ready(Ok(U256::from(200000000000000000u64))))); // Sufficient balance
+
+        provider
+            .expect_health_check()
+            .returning(|| Box::pin(ready(Ok(true))));
+
+        // No repository calls should be made since relayer is already enabled
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.initialize_relayer().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_relayer_sends_notification_when_disabled() {
+        let (
+            mut provider,
+            mut relayer_repo,
+            network_repo,
+            tx_repo,
+            mut job_producer,
+            signer,
+            mut counter,
+        ) = setup_mocks();
+        let mut relayer_model = create_test_relayer();
+        relayer_model.system_disabled = false; // Start as enabled
+        relayer_model.notification_id = Some("test-notification-id".to_string());
+
+        // Mock validation failure - RPC validation fails
+        provider
+            .expect_get_transaction_count()
+            .returning(|_| Box::pin(ready(Ok(42u64))));
+
+        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
+
+        counter
+            .expect_get()
+            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+
+        provider
+            .expect_get_balance()
+            .returning(|_| Box::pin(ready(Ok(U256::from(200000000000000000u64))))); // Sufficient balance
+
+        provider.expect_health_check().returning(|| {
+            Box::pin(ready(Err(ProviderError::Other(
+                "RPC validation failed".to_string(),
+            ))))
+        });
+
+        // Mock disable_relayer call
+        let mut disabled_relayer = relayer_model.clone();
+        disabled_relayer.system_disabled = true;
+        relayer_repo
+            .expect_disable_relayer()
+            .with(eq("test-relayer-id".to_string()))
+            .returning(move |_| Ok(disabled_relayer.clone()));
+
+        // Mock notification job production - verify it's called with correct parameters
+        job_producer
+            .expect_produce_send_notification_job()
+            .returning(|_, _| Box::pin(ready(Ok(()))));
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.initialize_relayer().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_relayer_no_notification_when_no_notification_id() {
+        let (
+            mut provider,
+            mut relayer_repo,
+            network_repo,
+            tx_repo,
+            job_producer,
+            signer,
+            mut counter,
+        ) = setup_mocks();
+        let mut relayer_model = create_test_relayer();
+        relayer_model.system_disabled = false; // Start as enabled
+        relayer_model.notification_id = None; // No notification ID
+
+        // Mock validation failure - balance check fails
+        provider
+            .expect_get_transaction_count()
+            .returning(|_| Box::pin(ready(Ok(42u64))));
+
+        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
+
+        counter
+            .expect_get()
+            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+
+        provider
+            .expect_get_balance()
+            .returning(|_| Box::pin(ready(Ok(U256::from(50000000000000000u64))))); // Insufficient balance
+
+        provider
+            .expect_health_check()
+            .returning(|| Box::pin(ready(Ok(true))));
+
+        // Mock disable_relayer call
+        let mut disabled_relayer = relayer_model.clone();
+        disabled_relayer.system_disabled = true;
+        relayer_repo
+            .expect_disable_relayer()
+            .with(eq("test-relayer-id".to_string()))
+            .returning(move |_| Ok(disabled_relayer.clone()));
+
+        // No notification job should be produced since notification_id is None
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.initialize_relayer().await;
+        assert!(result.is_ok());
     }
 }
