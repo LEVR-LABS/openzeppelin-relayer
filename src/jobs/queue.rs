@@ -6,19 +6,20 @@
 //! - Transaction status checks
 //! - Notifications
 //! - Solana swap requests
-use std::sync::Arc;
+//! - Relayer health checks
+use std::{env, sync::Arc};
 
 use apalis_redis::{Config, ConnectionManager, RedisStorage};
 use color_eyre::{eyre, Result};
-use log::error;
 use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
+use tracing::error;
 
 use crate::config::ServerConfig;
 
 use super::{
-    Job, NotificationSend, SolanaTokenSwapRequest, TransactionRequest, TransactionSend,
-    TransactionStatusCheck,
+    Job, NotificationSend, RelayerHealthCheck, SolanaTokenSwapRequest, TransactionRequest,
+    TransactionSend, TransactionStatusCheck,
 };
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,7 @@ pub struct Queue {
     pub transaction_status_queue: RedisStorage<Job<TransactionStatusCheck>>,
     pub notification_queue: RedisStorage<Job<NotificationSend>>,
     pub solana_token_swap_request_queue: RedisStorage<Job<SolanaTokenSwapRequest>>,
+    pub relayer_health_check_queue: RedisStorage<Job<RelayerHealthCheck>>,
 }
 
 impl Queue {
@@ -35,7 +37,9 @@ impl Queue {
         namespace: &str,
         shared: Arc<ConnectionManager>,
     ) -> Result<RedisStorage<T>> {
-        let config = Config::default().set_namespace(namespace);
+        let config = Config::default()
+            .set_namespace(namespace)
+            .set_enqueue_scheduled(Duration::from_secs(1)); // Sets the polling interval for scheduled jobs from default 30 seconds
 
         Ok(RedisStorage::new_with_config((*shared).clone(), config))
     }
@@ -46,29 +50,50 @@ impl Queue {
         let redis_connection_timeout_ms = config.redis_connection_timeout_ms;
         let conn = match timeout(Duration::from_millis(redis_connection_timeout_ms), apalis_redis::connect(redis_url.clone())).await {
             Ok(result) => result.map_err(|e| {
-                error!("Failed to connect to Redis at {}: {}", redis_url, e);
+                error!(redis_url = %redis_url, error = %e, "failed to connect to redis");
                 eyre::eyre!("Failed to connect to Redis. Please ensure Redis is running and accessible at {}. Error: {}", redis_url, e)
             })?,
             Err(_) => {
-                error!("Timeout connecting to Redis at {}", redis_url);
+                error!(redis_url = %redis_url, "timeout connecting to redis");
                 return Err(eyre::eyre!("Timed out after {} milliseconds while connecting to Redis at {}", redis_connection_timeout_ms, redis_url));
             }
         };
 
         let shared = Arc::new(conn);
+        // use REDIS_KEY_PREFIX only if set, otherwise do not use it
+        let redis_key_prefix = env::var("REDIS_KEY_PREFIX")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|value| format!("{value}:queue:"))
+            .unwrap_or_default();
         Ok(Self {
-            transaction_request_queue: Self::storage("transaction_request_queue", shared.clone())
-                .await?,
-            transaction_submission_queue: Self::storage(
-                "transaction_submission_queue",
+            transaction_request_queue: Self::storage(
+                &format!("{}transaction_request_queue", redis_key_prefix),
                 shared.clone(),
             )
             .await?,
-            transaction_status_queue: Self::storage("transaction_status_queue", shared.clone())
-                .await?,
-            notification_queue: Self::storage("notification_queue", shared.clone()).await?,
+            transaction_submission_queue: Self::storage(
+                &format!("{}transaction_submission_queue", redis_key_prefix),
+                shared.clone(),
+            )
+            .await?,
+            transaction_status_queue: Self::storage(
+                &format!("{}transaction_status_queue", redis_key_prefix),
+                shared.clone(),
+            )
+            .await?,
+            notification_queue: Self::storage(
+                &format!("{}notification_queue", redis_key_prefix),
+                shared.clone(),
+            )
+            .await?,
             solana_token_swap_request_queue: Self::storage(
-                "solana_token_swap_request_queue",
+                &format!("{}solana_token_swap_request_queue", redis_key_prefix),
+                shared.clone(),
+            )
+            .await?,
+            relayer_health_check_queue: Self::storage(
+                &format!("{}relayer_health_check_queue", redis_key_prefix),
                 shared.clone(),
             )
             .await?,
@@ -97,6 +122,7 @@ mod tests {
         pub namespace_transaction_status: String,
         pub namespace_notification: String,
         pub namespace_solana_token_swap_request_queue: String,
+        pub namespace_relayer_health_check_queue: String,
     }
 
     impl MockQueue {
@@ -108,6 +134,7 @@ mod tests {
                 namespace_notification: "notification_queue".to_string(),
                 namespace_solana_token_swap_request_queue: "solana_token_swap_request_queue"
                     .to_string(),
+                namespace_relayer_health_check_queue: "relayer_health_check_queue".to_string(),
             }
         }
     }
@@ -132,6 +159,10 @@ mod tests {
         assert_eq!(
             mock_queue.namespace_solana_token_swap_request_queue,
             "solana_token_swap_request_queue"
+        );
+        assert_eq!(
+            mock_queue.namespace_relayer_health_check_queue,
+            "relayer_health_check_queue"
         );
     }
 }

@@ -26,8 +26,8 @@ use crate::{
         StellarNetwork, TransactionError, TransactionRepoModel,
     },
     repositories::{
-        NetworkRepository, PluginRepositoryTrait, RelayerRepository, Repository,
-        TransactionCounterTrait, TransactionRepository,
+        ApiKeyRepositoryTrait, NetworkRepository, PluginRepositoryTrait, RelayerRepository,
+        Repository, TransactionCounterTrait, TransactionRepository,
     },
     services::{
         get_network_provider, EvmSignerFactory, StellarSignerFactory, TransactionCounterService,
@@ -51,6 +51,7 @@ pub use util::*;
 /// in the system. Implementors of this trait are responsible for handling
 /// transaction requests, managing balances, and interacting with the network.
 #[async_trait]
+#[cfg_attr(test, automock)]
 #[allow(dead_code)]
 pub trait Relayer {
     /// Processes a transaction request and returns the result.
@@ -143,6 +144,17 @@ pub trait Relayer {
     /// A `Result` indicating success, or a `RelayerError` on failure.
     async fn initialize_relayer(&self) -> Result<(), RelayerError>;
 
+    /// Runs health checks on the relayer without side effects.
+    ///
+    /// This method performs all necessary health checks (RPC validation, balance checks, etc.)
+    /// and returns the results without updating any state or sending notifications.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All health checks passed
+    /// * `Err(Vec<HealthCheckFailure>)` - One or more health checks failed with specific reasons
+    async fn check_health(&self) -> Result<(), Vec<crate::models::HealthCheckFailure>>;
+
     /// Validates that the relayer's balance meets the minimum required.
     ///
     /// # Returns
@@ -207,6 +219,14 @@ pub trait SolanaRelayerTrait {
         &self,
         request: JsonRpcRequest<NetworkRpcRequest>,
     ) -> Result<JsonRpcResponse<NetworkRpcResult>, RelayerError>;
+
+    /// Runs health checks on the relayer without side effects.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All health checks passed
+    /// * `Err(Vec<HealthCheckFailure>)` - One or more health checks failed
+    async fn check_health(&self) -> Result<(), Vec<crate::models::HealthCheckFailure>>;
 
     /// Initializes the relayer.
     ///
@@ -329,6 +349,14 @@ impl<
         }
     }
 
+    async fn check_health(&self) -> Result<(), Vec<crate::models::HealthCheckFailure>> {
+        match self {
+            NetworkRelayer::Evm(relayer) => relayer.check_health().await,
+            NetworkRelayer::Solana(relayer) => relayer.check_health().await,
+            NetworkRelayer::Stellar(relayer) => relayer.check_health().await,
+        }
+    }
+
     async fn sign_transaction(
         &self,
         request: &SignTransactionRequest,
@@ -355,12 +383,13 @@ pub trait RelayerFactoryTrait<
     SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
     TCR: TransactionCounterTrait + Send + Sync + 'static,
     PR: PluginRepositoryTrait + Send + Sync + 'static,
+    AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
 >
 {
     async fn create_relayer(
         relayer: RelayerRepoModel,
         signer: SignerRepoModel,
-        state: &ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<NetworkRelayer<J, TR, RR, NR, TCR>, RelayerError>;
 }
 
@@ -376,12 +405,13 @@ impl<
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
-    > RelayerFactoryTrait<J, RR, TR, NR, NFR, SR, TCR, PR> for RelayerFactory
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
+    > RelayerFactoryTrait<J, RR, TR, NR, NFR, SR, TCR, PR, AKR> for RelayerFactory
 {
     async fn create_relayer(
         relayer: RelayerRepoModel,
         signer: SignerRepoModel,
-        state: &ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>,
+        state: &ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<NetworkRelayer<J, TR, RR, NR, TCR>, RelayerError> {
         match relayer.network_type {
             NetworkType::Evm => {

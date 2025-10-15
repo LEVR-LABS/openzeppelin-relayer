@@ -24,7 +24,6 @@ use std::str::FromStr;
 use alloy::primitives::keccak256;
 use async_trait::async_trait;
 use chrono;
-use log::{debug, info};
 use p256::{
     ecdsa::{signature::Signer, Signature as P256Signature, SigningKey},
     FieldBytes,
@@ -33,6 +32,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction};
 use thiserror::Error;
+use tracing::{debug, info};
 
 use crate::models::{Address, SecretString, TurnkeySignerConfig};
 use crate::utils::base64_url_encode;
@@ -305,7 +305,7 @@ impl TurnkeyService {
         // Create the authentication stamp
         let x_stamp = self.stamp(&body)?;
 
-        debug!("Sending request to Turnkey API: {}", endpoint);
+        debug!(endpoint = %endpoint, "sending request to turnkey api");
         let response = self
             .client
             .post(format!("{}/public/v1/submit/{}", self.base_url, endpoint))
@@ -375,7 +375,7 @@ impl TurnkeyService {
         let result = self
             .sign_raw_payload(bytes, "HASH_FUNCTION_NO_OP", true)
             .await?;
-        debug!("EVM signature length: {}", result.len());
+        debug!(signature_length = %result.len(), "evm signature length");
         Ok(result)
     }
 
@@ -438,13 +438,13 @@ impl TurnkeyService {
                     // For error responses, try to get the body text first
                     match res.text().await {
                         Ok(body_text) => {
-                            debug!("Error response ({}): {}", status, body_text);
+                            debug!(status = %status, body_text = %body_text, "error response");
 
                             if content_type.contains("application/json") {
                                 match serde_json::from_str::<TurnkeyResponseError>(&body_text) {
                                     Ok(error) => Err(TurnkeyError::MethodError(error)),
                                     Err(e) => {
-                                        debug!("Failed to parse error response as JSON: {}", e);
+                                        debug!(error = %e, "failed to parse error response as json");
                                         Err(TurnkeyError::HttpError(format!(
                                             "HTTP {} error: {}",
                                             status, body_text
@@ -459,7 +459,7 @@ impl TurnkeyService {
                             }
                         }
                         Err(e) => {
-                            info!("Failed to read error response body: {}", e);
+                            info!(error = %e, "failed to read error response body");
                             Err(TurnkeyError::HttpError(format!(
                                 "HTTP {} error (failed to read body): {}",
                                 status, e
@@ -469,7 +469,7 @@ impl TurnkeyService {
                 }
             }
             Err(e) => {
-                debug!("Turnkey API request error: {:?}", e);
+                debug!(error = ?e, "turnkey api request error");
                 // On a reqwest error, convert it into a TurnkeyError::HttpError
                 Err(TurnkeyError::HttpError(e.to_string()))
             }
@@ -537,9 +537,8 @@ impl TurnkeyServiceTrait for TurnkeyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito;
     use serde_json::json;
-    use wiremock::matchers::{header, header_exists, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn create_solana_test_config() -> TurnkeySignerConfig {
         TurnkeySignerConfig {
@@ -633,12 +632,14 @@ mod tests {
     }
 
     // Setup mock for signing raw payload
-    async fn setup_mock_sign_raw_payload(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/public/v1/submit/sign_raw_payload"))
-            .and(header("Content-Type", "application/json"))
-            .and(header_exists("X-Stamp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+    async fn setup_mock_sign_raw_payload(mock_server: &mut mockito::ServerGuard) -> mockito::Mock {
+        mock_server
+            .mock("POST", "/public/v1/submit/sign_raw_payload")
+            .match_header("Content-Type", "application/json")
+            .match_header("X-Stamp", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&json!({
                 "activity": {
                     "id": "test-activity-id",
                     "status": "ACTIVITY_STATUS_COMPLETE",
@@ -650,46 +651,61 @@ mod tests {
                         }
                     }
                 }
-            })))
-            .mount(mock_server)
-            .await;
+            })).unwrap())
+            .expect(1)
+            .create_async()
+            .await
     }
 
     // Setup mock for signing EVM transaction
-    async fn setup_mock_sign_evm_transaction(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/public/v1/submit/sign_transaction"))
-            .and(header("Content-Type", "application/json"))
-            .and(header_exists("X-Stamp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "activity": {
-                    "id": "test-activity-id",
-                    "status": "ACTIVITY_STATUS_COMPLETE",
-                    "result": {
-                        "signTransactionResult": {
-                            "signedTransaction": "02f1010203050607080910" // Example signed transaction hex
+    async fn setup_mock_sign_evm_transaction(
+        mock_server: &mut mockito::ServerGuard,
+    ) -> mockito::Mock {
+        mock_server
+            .mock("POST", "/public/v1/submit/sign_transaction")
+            .match_header("Content-Type", "application/json")
+            .match_header("X-Stamp", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&json!({
+                    "activity": {
+                        "id": "test-activity-id",
+                        "status": "ACTIVITY_STATUS_COMPLETE",
+                        "result": {
+                            "signTransactionResult": {
+                                "signedTransaction": "02f1010203050607080910" // Example signed transaction hex
+                            }
                         }
                     }
-                }
-            })))
-            .mount(mock_server)
-            .await;
+                }))
+                .unwrap(),
+            )
+            .expect(1)
+            .create_async()
+            .await
     }
 
     // Setup mock for error response
-    async fn setup_mock_error_response(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/public/v1/submit/sign_raw_payload"))
-            .and(header("Content-Type", "application/json"))
-            .and(header_exists("X-Stamp"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "code": 400,
-                    "message": "Invalid payload format"
-                }
-            })))
-            .mount(mock_server)
-            .await;
+    async fn setup_mock_error_response(mock_server: &mut mockito::ServerGuard) -> mockito::Mock {
+        mock_server
+            .mock("POST", "/public/v1/submit/sign_raw_payload")
+            .match_header("Content-Type", "application/json")
+            .match_header("X-Stamp", mockito::Matcher::Any)
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&json!({
+                    "error": {
+                        "code": 400,
+                        "message": "Invalid payload format"
+                    }
+                }))
+                .unwrap(),
+            )
+            .expect(1)
+            .create_async()
+            .await
     }
 
     // Helper function to create a modified client for testing
@@ -702,8 +718,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_solana() {
-        let mock_server = MockServer::start().await;
-        setup_mock_sign_raw_payload(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_sign_raw_payload(&mut mock_server).await;
 
         let config = create_solana_test_config();
 
@@ -713,7 +729,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 
@@ -725,8 +741,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_evm() {
-        let mock_server = MockServer::start().await;
-        setup_mock_sign_raw_payload(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_sign_raw_payload(&mut mock_server).await;
 
         let config = create_evm_test_config();
         let service = TurnkeyService {
@@ -735,7 +751,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 
@@ -747,8 +763,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_evm_transaction() {
-        let mock_server = MockServer::start().await;
-        setup_mock_sign_evm_transaction(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_sign_evm_transaction(&mut mock_server).await;
 
         let config = create_evm_test_config();
         let service = TurnkeyService {
@@ -757,7 +773,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 
@@ -772,8 +788,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_handling() {
-        let mock_server = MockServer::start().await;
-        setup_mock_error_response(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_error_response(&mut mock_server).await;
 
         let config = create_solana_test_config();
         let service = TurnkeyService {
@@ -782,7 +798,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 

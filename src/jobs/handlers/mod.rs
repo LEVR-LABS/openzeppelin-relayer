@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use apalis::prelude::{Attempt, Error};
 use eyre::Report;
+use tracing::{error, info, warn};
 
 mod transaction_request_handler;
-use log::info;
 pub use transaction_request_handler::*;
 
 mod transaction_submission_handler;
@@ -22,6 +22,9 @@ pub use solana_swap_request_handler::*;
 mod transaction_cleanup_handler;
 pub use transaction_cleanup_handler::*;
 
+mod relayer_health_check_handler;
+pub use relayer_health_check_handler::*;
+
 pub fn handle_result(
     result: Result<(), Report>,
     attempt: Attempt,
@@ -29,13 +32,28 @@ pub fn handle_result(
     max_attempts: usize,
 ) -> Result<(), Error> {
     if result.is_ok() {
-        info!("{} request handled successfully", job_type);
+        info!(
+            job_type = %job_type,
+            "request handled successfully"
+        );
         return Ok(());
     }
-    info!("{} request failed: {:?}", job_type, result);
+
+    let err = result.as_ref().unwrap_err();
+    warn!(
+        job_type = %job_type,
+        error = %err,
+        attempt = %attempt.current(),
+        max_attempts = %max_attempts,
+        "request failed"
+    );
 
     if attempt.current() >= max_attempts {
-        info!("Max attempts ({}) reached, failing job", max_attempts);
+        error!(
+            job_type = %job_type,
+            max_attempts = %max_attempts,
+            "max attempts reached, failing job"
+        );
         Err(Error::Abort(Arc::new("Failed to handle request".into())))?
     }
 

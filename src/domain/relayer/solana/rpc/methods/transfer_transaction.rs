@@ -26,8 +26,8 @@
 
 use std::str::FromStr;
 
-use log::info;
 use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction};
+use tracing::info;
 
 use crate::{
     domain::relayer::solana::rpc::methods::utils::FeeQuote,
@@ -99,7 +99,7 @@ where
         )
         .await
         .map_err(|e| {
-            error!("Insufficient funds: {}", e);
+            error!(error = %e, "insufficient funds");
             SolanaRpcError::InsufficientFunds(e.to_string())
         })?;
 
@@ -127,7 +127,7 @@ where
                 .await;
 
             if let Err(e) = webhook_result {
-                error!("Failed to produce notification job: {}", e);
+                error!(error = %e, "failed to produce notification job");
             }
         }
 
@@ -792,6 +792,7 @@ mod tests {
             notification_id: None,
             system_disabled: false,
             custom_rpc_urls: None,
+            ..Default::default()
         };
         // Create token account with low balance
         let token_account = spl_token::state::Account {

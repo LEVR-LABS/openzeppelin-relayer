@@ -12,7 +12,7 @@
       "name": "AGPL-3.0 license",
       "url": "https://github.com/OpenZeppelin/openzeppelin-relayer/blob/main/LICENSE"
     },
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "paths": {
     "/api/v1/notifications": {
@@ -510,7 +510,8 @@
         "tags": [
           "Plugins"
         ],
-        "summary": "Calls a plugin method.",
+        "summary": "Execute a plugin and receive the sanitized result",
+        "description": "Logs and traces are only returned when the plugin is configured with `emit_logs` / `emit_traces`.\nPlugin-provided errors are normalized into a consistent payload (`code`, `details`) and a derived\nmessage so downstream clients receive a stable shape regardless of how the handler threw.",
         "operationId": "callPlugin",
         "parameters": [
           {
@@ -539,21 +540,54 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiResponse_PluginCallResponse"
+                  "$ref": "#/components/schemas/ApiResponse_Value"
+                },
+                "example": {
+                  "data": "done!",
+                  "error": null,
+                  "metadata": {
+                    "logs": [
+                      {
+                        "level": "info",
+                        "message": "Plugin started..."
+                      }
+                    ],
+                    "traces": [
+                      {
+                        "method": "sendTransaction",
+                        "relayerId": "sepolia-example",
+                        "requestId": "6c1f336f-3030-4f90-bd99-ada190a1235b"
+                      }
+                    ]
+                  },
+                  "success": true
                 }
               }
             }
           },
           "400": {
-            "description": "BadRequest",
+            "description": "BadRequest (plugin-provided)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiResponse_String"
+                  "$ref": "#/components/schemas/ApiResponse_PluginHandlerError"
                 },
                 "example": {
-                  "data": null,
-                  "message": "Bad Request",
+                  "data": {
+                    "code": "VALIDATION_FAILED",
+                    "details": {
+                      "field": "email"
+                    }
+                  },
+                  "error": "Validation failed",
+                  "metadata": {
+                    "logs": [
+                      {
+                        "level": "error",
+                        "message": "Validation failed for field: email"
+                      }
+                    ]
+                  },
                   "success": false
                 }
               }
@@ -568,7 +602,7 @@
                 },
                 "example": {
                   "data": null,
-                  "message": "Unauthorized",
+                  "error": "Unauthorized",
                   "success": false
                 }
               }
@@ -583,7 +617,7 @@
                 },
                 "example": {
                   "data": null,
-                  "message": "Plugin with ID plugin_id not found",
+                  "error": "Plugin with ID plugin_id not found",
                   "success": false
                 }
               }
@@ -598,7 +632,7 @@
                 },
                 "example": {
                   "data": null,
-                  "message": "Too Many Requests",
+                  "error": "Too Many Requests",
                   "success": false
                 }
               }
@@ -613,7 +647,7 @@
                 },
                 "example": {
                   "data": null,
-                  "message": "Internal Server Error",
+                  "error": "Internal Server Error",
                   "success": false
                 }
               }
@@ -3393,6 +3427,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -3438,6 +3475,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -3480,6 +3520,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -3488,7 +3531,7 @@
           }
         }
       },
-      "ApiResponse_PluginCallResponse": {
+      "ApiResponse_PluginHandlerError": {
         "type": "object",
         "required": [
           "success"
@@ -3496,41 +3539,21 @@
         "properties": {
           "data": {
             "type": "object",
-            "required": [
-              "success",
-              "return_value",
-              "message",
-              "logs",
-              "error",
-              "traces"
-            ],
             "properties": {
-              "error": {
-                "type": "string"
+              "code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "logs": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/LogEntry"
-                }
-              },
-              "message": {
-                "type": "string"
-              },
-              "return_value": {
-                "type": "string"
-              },
-              "success": {
-                "type": "boolean"
-              },
-              "traces": {
-                "type": "array",
-                "items": {}
-              }
+              "details": {}
             }
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -3567,6 +3590,9 @@
                   "$ref": "#/components/schemas/RpcConfig"
                 }
               },
+              "disabled_reason": {
+                "$ref": "#/components/schemas/DisabledReason"
+              },
               "id": {
                 "type": "string"
               },
@@ -3599,6 +3625,9 @@
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -3744,6 +3773,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -3771,6 +3803,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -3788,82 +3823,31 @@
           "data": {
             "oneOf": [
               {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/SignTransactionResponseStellar"
-                  },
-                  {
-                    "type": "object",
-                    "required": [
-                      "network"
-                    ],
-                    "properties": {
-                      "network": {
-                        "type": "string",
-                        "enum": [
-                          "stellar"
-                        ]
-                      }
-                    }
-                  }
-                ]
+                "$ref": "#/components/schemas/SignTransactionResponseStellar"
               },
               {
-                "allOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "integer",
-                      "format": "int32",
-                      "minimum": 0
-                    }
-                  },
-                  {
-                    "type": "object",
-                    "required": [
-                      "network"
-                    ],
-                    "properties": {
-                      "network": {
-                        "type": "string",
-                        "enum": [
-                          "evm"
-                        ]
-                      }
-                    }
-                  }
-                ]
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
               },
               {
-                "allOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "integer",
-                      "format": "int32",
-                      "minimum": 0
-                    }
-                  },
-                  {
-                    "type": "object",
-                    "required": [
-                      "network"
-                    ],
-                    "properties": {
-                      "network": {
-                        "type": "string",
-                        "enum": [
-                          "solana"
-                        ]
-                      }
-                    }
-                  }
-                ]
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
               }
             ]
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -3904,6 +3888,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -3923,6 +3910,9 @@
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -3953,6 +3943,30 @@
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PaginationMeta"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ApiResponse_Value": {
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "properties": {
+          "data": {},
+          "error": {
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -3999,6 +4013,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -4036,6 +4053,9 @@
                     "$ref": "#/components/schemas/RpcConfig"
                   }
                 },
+                "disabled_reason": {
+                  "$ref": "#/components/schemas/DisabledReason"
+                },
                 "id": {
                   "type": "string"
                 },
@@ -4069,6 +4089,9 @@
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -4112,6 +4135,9 @@
           "error": {
             "type": "string"
           },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
+          },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
           },
@@ -4144,6 +4170,9 @@
           },
           "error": {
             "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PluginMetadata"
           },
           "pagination": {
             "$ref": "#/components/schemas/PaginationMeta"
@@ -4328,6 +4357,31 @@
           }
         }
       },
+      "CdpSignerRequestConfig": {
+        "type": "object",
+        "description": "CDP signer configuration for API requests",
+        "required": [
+          "api_key_id",
+          "api_key_secret",
+          "wallet_secret",
+          "account_address"
+        ],
+        "properties": {
+          "account_address": {
+            "type": "string"
+          },
+          "api_key_id": {
+            "type": "string"
+          },
+          "api_key_secret": {
+            "type": "string"
+          },
+          "wallet_secret": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "ContractSource": {
         "oneOf": [
           {
@@ -4479,6 +4533,114 @@
             "minimum": 0
           }
         }
+      },
+      "DisabledReason": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Nonce synchronization failed during initialization",
+            "required": [
+              "details",
+              "type"
+            ],
+            "properties": {
+              "details": {
+                "type": "string",
+                "description": "Nonce synchronization failed during initialization"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "NonceSyncFailed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "RPC endpoint validation failed",
+            "required": [
+              "details",
+              "type"
+            ],
+            "properties": {
+              "details": {
+                "type": "string",
+                "description": "RPC endpoint validation failed"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "RpcValidationFailed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Balance check failed (below minimum threshold)",
+            "required": [
+              "details",
+              "type"
+            ],
+            "properties": {
+              "details": {
+                "type": "string",
+                "description": "Balance check failed (below minimum threshold)"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "BalanceCheckFailed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Sequence number synchronization failed (Stellar)",
+            "required": [
+              "details",
+              "type"
+            ],
+            "properties": {
+              "details": {
+                "type": "string",
+                "description": "Sequence number synchronization failed (Stellar)"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "SequenceSyncFailed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Multiple failures occurred simultaneously",
+            "required": [
+              "details",
+              "type"
+            ],
+            "properties": {
+              "details": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Multiple failures occurred simultaneously"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Multiple"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Reason for a relayer being disabled by the system\nThis represents persistent state, converted from HealthCheckFailure when disabling"
       },
       "EncodedSerializedTransaction": {
         "type": "string"
@@ -4655,8 +4817,7 @@
             "minimum": 0
           },
           "gas_price": {
-            "type": "integer",
-            "minimum": 0
+            "type": "string"
           },
           "hash": {
             "type": "string"
@@ -4665,12 +4826,10 @@
             "type": "string"
           },
           "max_fee_per_gas": {
-            "type": "integer",
-            "minimum": 0
+            "type": "string"
           },
           "max_priority_fee_per_gas": {
-            "type": "integer",
-            "minimum": 0
+            "type": "string"
           },
           "nonce": {
             "type": "integer",
@@ -5535,37 +5694,35 @@
           }
         }
       },
-      "PluginCallResponse": {
+      "PluginHandlerError": {
         "type": "object",
-        "required": [
-          "success",
-          "return_value",
-          "message",
-          "logs",
-          "error",
-          "traces"
-        ],
         "properties": {
-          "error": {
-            "type": "string"
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
+          "details": {}
+        }
+      },
+      "PluginMetadata": {
+        "type": "object",
+        "properties": {
           "logs": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "$ref": "#/components/schemas/LogEntry"
             }
           },
-          "message": {
-            "type": "string"
-          },
-          "return_value": {
-            "type": "string"
-          },
-          "success": {
-            "type": "boolean"
-          },
           "traces": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {}
           }
         }
@@ -5774,6 +5931,9 @@
             "items": {
               "$ref": "#/components/schemas/RpcConfig"
             }
+          },
+          "disabled_reason": {
+            "$ref": "#/components/schemas/DisabledReason"
           },
           "id": {
             "type": "string"
@@ -6063,6 +6223,12 @@
         "type": "object",
         "description": "Stellar-specific relayer policy configuration",
         "properties": {
+          "concurrent_transactions": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "max_fee": {
             "type": [
               "integer",
@@ -6125,9 +6291,13 @@
         "type": "object",
         "required": [
           "transaction",
-          "signature"
+          "signature",
+          "id"
         ],
         "properties": {
+          "id": {
+            "type": "string"
+          },
           "signature": {
             "type": "string"
           },
@@ -6246,77 +6416,23 @@
       "SignTransactionResponse": {
         "oneOf": [
           {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/SignTransactionResponseStellar"
-              },
-              {
-                "type": "object",
-                "required": [
-                  "network"
-                ],
-                "properties": {
-                  "network": {
-                    "type": "string",
-                    "enum": [
-                      "stellar"
-                    ]
-                  }
-                }
-              }
-            ]
+            "$ref": "#/components/schemas/SignTransactionResponseStellar"
           },
           {
-            "allOf": [
-              {
-                "type": "array",
-                "items": {
-                  "type": "integer",
-                  "format": "int32",
-                  "minimum": 0
-                }
-              },
-              {
-                "type": "object",
-                "required": [
-                  "network"
-                ],
-                "properties": {
-                  "network": {
-                    "type": "string",
-                    "enum": [
-                      "evm"
-                    ]
-                  }
-                }
-              }
-            ]
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
           },
           {
-            "allOf": [
-              {
-                "type": "array",
-                "items": {
-                  "type": "integer",
-                  "format": "int32",
-                  "minimum": 0
-                }
-              },
-              {
-                "type": "object",
-                "required": [
-                  "network"
-                ],
-                "properties": {
-                  "network": {
-                    "type": "string",
-                    "enum": [
-                      "solana"
-                    ]
-                  }
-                }
-              }
-            ]
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
           }
         ]
       },
@@ -6381,6 +6497,9 @@
           },
           {
             "$ref": "#/components/schemas/TurnkeySignerRequestConfig"
+          },
+          {
+            "$ref": "#/components/schemas/CdpSignerRequestConfig"
           },
           {
             "$ref": "#/components/schemas/GoogleCloudKmsSignerRequestConfig"
@@ -6491,6 +6610,21 @@
           {
             "type": "object",
             "required": [
+              "api_key_id",
+              "account_address"
+            ],
+            "properties": {
+              "account_address": {
+                "type": "string"
+              },
+              "api_key_id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "service_account",
               "key"
             ],
@@ -6563,7 +6697,8 @@
           "google_cloud_kms",
           "vault",
           "vault_transit",
-          "turnkey"
+          "turnkey",
+          "cdp"
         ]
       },
       "SignerTypeRequest": {
@@ -6575,6 +6710,7 @@
           "vault",
           "vault_transit",
           "turnkey",
+          "cdp",
           "google_cloud_kms"
         ]
       },
@@ -6851,25 +6987,151 @@
       "SolanaRpcResult": {
         "oneOf": [
           {
-            "$ref": "#/components/schemas/FeeEstimateResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FeeEstimateResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "feeEstimate"
+                    ]
+                  }
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/TransferTransactionResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TransferTransactionResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "transferTransaction"
+                    ]
+                  }
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/PrepareTransactionResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PrepareTransactionResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "prepareTransaction"
+                    ]
+                  }
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/SignTransactionResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignTransactionResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "signTransaction"
+                    ]
+                  }
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/SignAndSendTransactionResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignAndSendTransactionResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "signAndSendTransaction"
+                    ]
+                  }
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/GetSupportedTokensResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GetSupportedTokensResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "getSupportedTokens"
+                    ]
+                  }
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/GetFeaturesEnabledResult"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GetFeaturesEnabledResult"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "getFeaturesEnabled"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         ]
       },
@@ -6885,18 +7147,11 @@
       "SolanaTransactionRequest": {
         "type": "object",
         "required": [
-          "fee_payer",
-          "instructions"
+          "transaction"
         ],
         "properties": {
-          "fee_payer": {
-            "type": "string"
-          },
-          "instructions": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
+          "transaction": {
+            "$ref": "#/components/schemas/EncodedSerializedTransaction"
           }
         }
       },
@@ -6906,8 +7161,7 @@
           "id",
           "status",
           "created_at",
-          "recent_blockhash",
-          "fee_payer"
+          "transaction"
         ],
         "properties": {
           "confirmed_at": {
@@ -6916,19 +7170,13 @@
           "created_at": {
             "type": "string"
           },
-          "fee_payer": {
-            "type": "string"
-          },
-          "hash": {
-            "type": "string"
-          },
           "id": {
             "type": "string"
           },
-          "recent_blockhash": {
+          "sent_at": {
             "type": "string"
           },
-          "sent_at": {
+          "signature": {
             "type": "string"
           },
           "status": {
@@ -6939,6 +7187,9 @@
               "string",
               "null"
             ]
+          },
+          "transaction": {
+            "type": "string"
           }
         }
       },
@@ -6955,6 +7206,9 @@
         "type": "object",
         "description": "Stellar policy response model for OpenAPI documentation",
         "properties": {
+          "concurrent_transactions": {
+            "type": "boolean"
+          },
           "max_fee": {
             "type": "integer",
             "format": "int32",
@@ -7074,7 +7328,8 @@
           "created_at",
           "source_account",
           "fee",
-          "sequence_number"
+          "sequence_number",
+          "relayer_id"
         ],
         "properties": {
           "confirmed_at": {
@@ -7092,6 +7347,9 @@
             "type": "string"
           },
           "id": {
+            "type": "string"
+          },
+          "relayer_id": {
             "type": "string"
           },
           "sent_at": {
