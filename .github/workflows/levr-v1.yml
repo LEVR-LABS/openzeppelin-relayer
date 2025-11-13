@@ -48,91 +48,91 @@ jobs:
           cat ${APP_DIR}/config/config.json
           echo "PAYLOAD=$(jq -c . ${APP_DIR}/config/config.json)" >> $GITHUB_OUTPUT
 
-      # - name: Upload to EFS via Lambda
-      #   run: |
-      #     aws lambda invoke \
-      #       --function-name upload_to_efs \
-      #       --cli-binary-format raw-in-base64-out \
-      #       --payload '${{ steps.generate-config.outputs.PAYLOAD }}' \
-      #       response.json
+      - name: Upload to EFS via Lambda
+        run: |
+          aws lambda invoke \
+            --function-name upload_to_efs \
+            --cli-binary-format raw-in-base64-out \
+            --payload '${{ steps.generate-config.outputs.PAYLOAD }}' \
+            response.json
 
-      #     echo "Response:"
-      #     cat response.json
+          echo "Response:"
+          cat response.json
 
-      #     # Check response
-      #     if grep -q '"statusCode": 200' response.json; then
-      #       echo "✅ Config uploaded successfully to EFS"
-      #     else
-      #       echo "❌ Upload failed"
-      #       cat response.json
-      #       exit 1
-      #     fi
+          # Check response
+          if grep -q '"statusCode": 200' response.json; then
+            echo "✅ Config uploaded successfully to EFS"
+          else
+            echo "❌ Upload failed"
+            cat response.json
+            exit 1
+          fi
 
-      # - name: Upload networks folder files to EFS via Lambda
-      #   run: |
-      #     NETWORKS_DIR="${APP_DIR}/config/networks"
+      - name: Upload networks folder files to EFS via Lambda
+        run: |
+          NETWORKS_DIR="${APP_DIR}/config/networks"
 
-      #     ls -al "$NETWORKS_DIR"
+          ls -al "$NETWORKS_DIR"
 
-      #     if [ -d "$NETWORKS_DIR" ] && [ "$(ls -A "$NETWORKS_DIR")" ]; then
-      #       for file in "$NETWORKS_DIR"/*; do
-      #         filename=$(basename "$file")
-      #         filepath="networks/$filename"
+          if [ -d "$NETWORKS_DIR" ] && [ "$(ls -A "$NETWORKS_DIR")" ]; then
+            for file in "$NETWORKS_DIR"/*; do
+              filename=$(basename "$file")
+              filepath="networks/$filename"
 
-      #         echo "📤 Uploading $filepath"
+              echo "📤 Uploading $filepath"
 
-      #         # Read file content safely
-      #         content=$(cat "$file")
+              # Read file content safely
+              content=$(cat "$file")
 
-      #         # Wrap into a JSON payload
-      #         PAYLOAD=$(jq -n \
-      #           --arg filename "$filepath" \
-      #           --argjson payload "$content" \
-      #           '{filename: $filename, payload: $payload}')
+              # Wrap into a JSON payload
+              PAYLOAD=$(jq -n \
+                --arg filename "$filepath" \
+                --argjson payload "$content" \
+                '{filename: $filename, payload: $payload}')
 
-      #         aws lambda invoke \
-      #           --function-name upload_to_efs \
-      #           --cli-binary-format raw-in-base64-out \
-      #           --payload "$PAYLOAD" \
-      #           response.json
+              aws lambda invoke \
+                --function-name upload_to_efs \
+                --cli-binary-format raw-in-base64-out \
+                --payload "$PAYLOAD" \
+                response.json
 
-      #         echo "Response for $filepath:"
-      #         cat response.json
+              echo "Response for $filepath:"
+              cat response.json
 
-      #         if grep -q '"statusCode": 200' response.json; then
-      #           echo "✅ $filepath uploaded successfully to EFS"
-      #         else
-      #           echo "❌ Upload failed for $filepath"
-      #           cat response.json
-      #           exit 1
-      #         fi
-      #       done
-      #     else
-      #       echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
-      #     fi
+              if grep -q '"statusCode": 200' response.json; then
+                echo "✅ $filepath uploaded successfully to EFS"
+              else
+                echo "❌ Upload failed for $filepath"
+                cat response.json
+                exit 1
+              fi
+            done
+          else
+            echo "⚠️ No files found in $NETWORKS_DIR, skipping upload."
+          fi
 
-      # - name: Build and Push Docker Image to ECR (main)
-      #   uses: docker/build-push-action@v2
-      #   with:
-      #     context: .
-      #     file: ./Dockerfile.production
-      #     push: true
-      #     tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
+      - name: Build and Push Docker Image to ECR (main)
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile.production
+          push: true
+          tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
 
-      # - name: Fill in the new image ID in the Amazon ECS task definition
-      #   id: task-def
-      #   uses: aws-actions/amazon-ecs-render-task-definition@v1
-      #   with:
-      #     # task-definition: ${{ env.ECS_TASK_DEFINITION }}
-      #     # task-definition-arn: task-definition-arn
-      #     task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
-      #     container-name: ${{ env.CONTAINER_NAME }}
-      #     image: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          # task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          # task-definition-arn: task-definition-arn
+          task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
 
-      # - name: Deploy Amazon ECS task definition
-      #   uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-      #   with:
-      #     task-definition: ${{ steps.task-def.outputs.task-definition }}
-      #     service: ${{ env.ECS_SERVICE }}
-      #     cluster: ${{ env.ECS_CLUSTER }}
-      #     # wait-for-service-stability: true
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          # wait-for-service-stability: true
