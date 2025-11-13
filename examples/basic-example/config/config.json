@@ -1,8 +1,8 @@
 {
   "relayers": [
     {
-      "id": "sepolia-example",
-      "name": "Sepolia Example",
+      "id": "sepolia-example1",
+      "name": "Sepolia Example1",
       "network": "sepolia",
       "paused": false,
       "notification_id": "notification-example",

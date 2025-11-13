@@ -16,8 +16,8 @@ use crate::{
     },
 };
 use eyre::Result;
-use log::info;
 use std::sync::Arc;
+use tracing::debug;
 
 pub type SolanaRpcHandlerType<SP, S, JS, J, TR> =
     Arc<SolanaRpcHandler<SolanaRpcMethodsImpl<SP, S, JS, J, TR>>>;
@@ -66,7 +66,7 @@ impl<T: SolanaRpcMethods> SolanaRpcHandler<T> {
         &self,
         request: JsonRpcRequest<NetworkRpcRequest>,
     ) -> Result<JsonRpcResponse<NetworkRpcResult>, SolanaRpcError> {
-        info!("Received request params: {:?}", request.params);
+        debug!(params = ?request.params, "received request params");
         // Extract Solana request or return error
         let solana_request = match request.params {
             NetworkRpcRequest::Solana(solana_params) => solana_params,
@@ -105,6 +105,11 @@ impl<T: SolanaRpcMethods> SolanaRpcHandler<T> {
             SolanaRpcRequest::GetFeaturesEnabled(params) => {
                 let res = self.rpc_methods.get_features_enabled(params).await?;
                 SolanaRpcResult::GetFeaturesEnabled(res)
+            }
+            _ => {
+                return Err(SolanaRpcError::Internal(
+                    "Unsupported Solana RPC Paymaster method".to_string(),
+                ))
             }
         };
 

@@ -4,23 +4,27 @@
 /// managing notifications for transactions. The module leverages various
 /// services and repositories to perform these operations asynchronously.
 use crate::{
+    constants::DEFAULT_STELLAR_CONCURRENT_TRANSACTIONS,
     domain::transaction::{stellar::fetch_next_sequence_from_chain, Transaction},
     jobs::{JobProducer, JobProducerTrait, TransactionRequest},
     models::{
         produce_transaction_update_notification_payload, NetworkTransactionRequest,
-        RelayerRepoModel, TransactionError, TransactionRepoModel, TransactionStatus,
-        TransactionUpdateRequest,
+        RelayerNetworkPolicy, RelayerRepoModel, TransactionError, TransactionRepoModel,
+        TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{
         RelayerRepositoryStorage, Repository, TransactionCounterRepositoryStorage,
         TransactionCounterTrait, TransactionRepository, TransactionRepositoryStorage,
     },
-    services::{Signer, StellarProvider, StellarProviderTrait, StellarSigner},
+    services::{
+        provider::{StellarProvider, StellarProviderTrait},
+        signer::{Signer, StellarSigner},
+    },
+    utils::calculate_scheduled_timestamp,
 };
 use async_trait::async_trait;
-use eyre::Result;
-use log::info;
 use std::sync::Arc;
+use tracing::{error, info};
 
 use super::lane_gate;
 
@@ -113,6 +117,16 @@ where
         &self.transaction_counter_service
     }
 
+    pub fn concurrent_transactions_enabled(&self) -> bool {
+        if let RelayerNetworkPolicy::Stellar(policy) = &self.relayer().policies {
+            policy
+                .concurrent_transactions
+                .unwrap_or(DEFAULT_STELLAR_CONCURRENT_TRANSACTIONS)
+        } else {
+            DEFAULT_STELLAR_CONCURRENT_TRANSACTIONS
+        }
+    }
+
     /// Send a transaction-request job for the given transaction.
     pub async fn send_transaction_request_job(
         &self,
@@ -120,29 +134,30 @@ where
         delay_seconds: Option<i64>,
     ) -> Result<(), TransactionError> {
         let job = TransactionRequest::new(tx.id.clone(), tx.relayer_id.clone());
+        let scheduled_on = delay_seconds.map(calculate_scheduled_timestamp);
         self.job_producer()
-            .produce_transaction_request_job(job, delay_seconds)
+            .produce_transaction_request_job(job, scheduled_on)
             .await?;
         Ok(())
     }
 
     /// Sends a transaction update notification if a notification ID is configured.
-    pub(super) async fn send_transaction_update_notification(
-        &self,
-        tx: &TransactionRepoModel,
-    ) -> Result<(), TransactionError> {
+    ///
+    /// This is a best-effort operation that logs errors but does not propagate them,
+    /// as notification failures should not affect the transaction lifecycle.
+    pub(super) async fn send_transaction_update_notification(&self, tx: &TransactionRepoModel) {
         if let Some(notification_id) = &self.relayer().notification_id {
-            self.job_producer()
+            if let Err(e) = self
+                .job_producer()
                 .produce_send_notification_job(
                     produce_transaction_update_notification_payload(notification_id, tx),
                     None,
                 )
                 .await
-                .map_err(|e| {
-                    TransactionError::UnexpectedError(format!("Failed to send notification: {}", e))
-                })?;
+            {
+                error!(error = %e, "failed to produce notification job");
+            }
         }
-        Ok(())
     }
 
     /// Helper function to update transaction status, save it, and send a notification.
@@ -156,8 +171,7 @@ where
             .partial_update(tx_id, update_req)
             .await?;
 
-        self.send_transaction_update_notification(&updated_tx)
-            .await?;
+        self.send_transaction_update_notification(&updated_tx).await;
         Ok(updated_tx)
     }
 
@@ -165,17 +179,19 @@ where
         &self,
         finished_tx_id: &str,
     ) -> Result<(), TransactionError> {
-        if let Some(next) = self
-            .find_oldest_pending_for_relayer(&self.relayer().id)
-            .await?
-        {
-            // Atomic hand-over while still owning the lane
-            info!("Handing over lane from {} to {}", finished_tx_id, next.id);
-            lane_gate::pass_to(&self.relayer().id, finished_tx_id, &next.id);
-            self.send_transaction_request_job(&next, None).await?;
-        } else {
-            info!("Releasing relayer lane after {}", finished_tx_id);
-            lane_gate::free(&self.relayer().id, finished_tx_id);
+        if !self.concurrent_transactions_enabled() {
+            if let Some(next) = self
+                .find_oldest_pending_for_relayer(&self.relayer().id)
+                .await?
+            {
+                // Atomic hand-over while still owning the lane
+                info!(to_tx_id = %next.id, finished_tx_id = %finished_tx_id, "handing over lane");
+                lane_gate::pass_to(&self.relayer().id, finished_tx_id, &next.id);
+                self.send_transaction_request_job(&next, None).await?;
+            } else {
+                info!(finished_tx_id = %finished_tx_id, "releasing relayer lane");
+                lane_gate::free(&self.relayer().id, finished_tx_id);
+            }
         }
         Ok(())
     }
@@ -200,10 +216,7 @@ where
         &self,
         relayer_address: &str,
     ) -> Result<(), TransactionError> {
-        info!(
-            "Syncing sequence number from chain for address: {}",
-            relayer_address
-        );
+        info!(address = %relayer_address, "syncing sequence number from chain");
 
         // Use the shared helper to fetch the next sequence
         let next_usable_seq = fetch_next_sequence_from_chain(self.provider(), relayer_address)
@@ -215,13 +228,10 @@ where
             .set(&self.relayer().id, relayer_address, next_usable_seq)
             .await
             .map_err(|e| {
-                TransactionError::UnexpectedError(format!(
-                    "Failed to update sequence counter: {}",
-                    e
-                ))
+                TransactionError::UnexpectedError(format!("Failed to update sequence counter: {e}"))
             })?;
 
-        info!("Updated local sequence counter to {}", next_usable_seq);
+        info!(sequence = %next_usable_seq, "updated local sequence counter");
         Ok(())
     }
 
@@ -231,7 +241,7 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        info!("Resetting transaction {} for retry through pipeline", tx.id);
+        info!("resetting transaction for retry through pipeline");
 
         // Use the model's built-in reset method
         let update_req = tx.create_reset_update_request()?;
@@ -242,10 +252,7 @@ where
             .partial_update(tx.id.clone(), update_req)
             .await?;
 
-        info!(
-            "Transaction {} reset successfully to pre-prepare state",
-            reset_tx.id
-        );
+        info!("transaction reset successfully to pre-prepare state");
         Ok(reset_tx)
     }
 }
@@ -330,7 +337,10 @@ pub type DefaultStellarTransaction = StellarRelayerTransaction<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NetworkTransactionData, RepositoryError};
+    use crate::{
+        models::{NetworkTransactionData, RepositoryError},
+        services::provider::ProviderError,
+    };
     use std::sync::Arc;
 
     use crate::domain::transaction::stellar::test_helpers::*;
@@ -399,7 +409,10 @@ mod tests {
             .job_producer
             .expect_produce_transaction_request_job()
             .withf(|job, delay| {
-                job.transaction_id == "tx-1" && job.relayer_id == "relayer-1" && delay == &Some(60)
+                job.transaction_id == "tx-1"
+                    && job.relayer_id == "relayer-1"
+                    && delay.is_some()
+                    && delay.unwrap() > chrono::Utc::now().timestamp()
             })
             .times(1)
             .returning(|_, _| Box::pin(async { Ok(()) }));
@@ -582,11 +595,9 @@ mod tests {
         let mut mocks = default_test_mocks();
 
         // Mock provider to fail
-        mocks
-            .provider
-            .expect_get_account()
-            .times(1)
-            .returning(|_| Box::pin(async { Err(eyre::eyre!("Account not found")) }));
+        mocks.provider.expect_get_account().times(1).returning(|_| {
+            Box::pin(async { Err(ProviderError::Other("Account not found".to_string())) })
+        });
 
         let handler = make_stellar_tx_handler(relayer.clone(), mocks);
 
@@ -652,6 +663,62 @@ mod tests {
             }
             _ => panic!("Expected UnexpectedError"),
         }
+    }
+
+    #[test]
+    fn test_concurrent_transactions_enabled() {
+        // Test with concurrent transactions explicitly enabled
+        let mut relayer = create_test_relayer();
+        if let RelayerNetworkPolicy::Stellar(ref mut policy) = relayer.policies {
+            policy.concurrent_transactions = Some(true);
+        }
+        let mocks = default_test_mocks();
+        let handler = make_stellar_tx_handler(relayer, mocks);
+        assert!(handler.concurrent_transactions_enabled());
+
+        // Test with concurrent transactions explicitly disabled
+        let mut relayer = create_test_relayer();
+        if let RelayerNetworkPolicy::Stellar(ref mut policy) = relayer.policies {
+            policy.concurrent_transactions = Some(false);
+        }
+        let mocks = default_test_mocks();
+        let handler = make_stellar_tx_handler(relayer, mocks);
+        assert!(!handler.concurrent_transactions_enabled());
+
+        // Test with default (None) - should use DEFAULT_STELLAR_CONCURRENT_TRANSACTIONS
+        let relayer = create_test_relayer();
+        let mocks = default_test_mocks();
+        let handler = make_stellar_tx_handler(relayer, mocks);
+        assert_eq!(
+            handler.concurrent_transactions_enabled(),
+            DEFAULT_STELLAR_CONCURRENT_TRANSACTIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_next_pending_transaction_with_concurrency_enabled() {
+        // With concurrent transactions enabled, lane management should be skipped
+        let mut relayer = create_test_relayer();
+        if let RelayerNetworkPolicy::Stellar(ref mut policy) = relayer.policies {
+            policy.concurrent_transactions = Some(true);
+        }
+        let mut mocks = default_test_mocks();
+
+        // Should NOT look for pending transactions when concurrency is enabled
+        mocks.tx_repo.expect_find_by_status().times(0); // Expect zero calls
+
+        // Should NOT produce any job when concurrency is enabled
+        mocks
+            .job_producer
+            .expect_produce_transaction_request_job()
+            .times(0); // Expect zero calls
+
+        let handler = make_stellar_tx_handler(relayer, mocks);
+
+        let result = handler
+            .enqueue_next_pending_transaction("finished-tx")
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

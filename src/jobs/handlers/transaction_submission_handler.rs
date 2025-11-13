@@ -8,30 +8,66 @@
 use actix_web::web::ThinData;
 use apalis::prelude::{Attempt, Data, *};
 use eyre::Result;
-use log::info;
+use tracing::{debug, info, instrument};
 
 use crate::{
-    constants::WORKER_DEFAULT_MAXIMUM_RETRIES,
+    constants::{
+        WORKER_TRANSACTION_CANCEL_RETRIES, WORKER_TRANSACTION_RESEND_RETRIES,
+        WORKER_TRANSACTION_RESUBMIT_RETRIES, WORKER_TRANSACTION_SUBMIT_RETRIES,
+    },
     domain::{get_relayer_transaction, get_transaction_by_id, Transaction},
     jobs::{handle_result, Job, TransactionCommand, TransactionSend},
     models::DefaultAppState,
+    observability::request_id::set_request_id,
 };
 
+#[instrument(
+    level = "info",
+    skip(job, state),
+    fields(
+        request_id = ?job.request_id,
+        job_id = %job.message_id,
+        job_type = %job.job_type.to_string(),
+        attempt = %attempt.current(),
+        tx_id = %job.data.transaction_id,
+        relayer_id = %job.data.relayer_id,
+        command = ?job.data.command,
+    )
+)]
 pub async fn transaction_submission_handler(
     job: Job<TransactionSend>,
     state: Data<ThinData<DefaultAppState>>,
     attempt: Attempt,
 ) -> Result<(), Error> {
-    info!("handling transaction submission: {:?}", job.data);
+    if let Some(request_id) = job.request_id.clone() {
+        set_request_id(request_id);
+    }
 
-    let result = handle_request(job.data, state).await;
+    debug!(
+        "handling transaction submission {}",
+        job.data.transaction_id
+    );
 
+    let command = job.data.command.clone();
+    let result = handle_request(job.data, state.clone()).await;
+
+    // Handle result with command-specific retry logic
     handle_result(
         result,
         attempt,
-        "Transaction Sender",
-        WORKER_DEFAULT_MAXIMUM_RETRIES,
+        "Transaction Submission",
+        get_max_retries(&command),
     )
+}
+
+/// Get max retry count based on command type
+fn get_max_retries(command: &TransactionCommand) -> usize {
+    match command {
+        TransactionCommand::Submit => WORKER_TRANSACTION_SUBMIT_RETRIES,
+        TransactionCommand::Resubmit => WORKER_TRANSACTION_RESUBMIT_RETRIES,
+        TransactionCommand::Cancel { .. } => WORKER_TRANSACTION_CANCEL_RETRIES,
+        TransactionCommand::Resend => WORKER_TRANSACTION_RESEND_RETRIES,
+    }
 }
 
 async fn handle_request(
@@ -48,22 +84,28 @@ async fn handle_request(
             relayer_transaction.submit_transaction(transaction).await?;
         }
         TransactionCommand::Cancel { reason } => {
-            info!("Cancelling transaction: {:?}", reason);
+            info!(
+                reason = %reason,
+                "cancelling transaction {}", transaction.id
+            );
             relayer_transaction.submit_transaction(transaction).await?;
         }
         TransactionCommand::Resubmit => {
-            info!("Resubmitting transaction with updated parameters");
+            debug!(
+                "resubmitting transaction with updated parameters {}",
+                transaction.id
+            );
             relayer_transaction
                 .resubmit_transaction(transaction)
                 .await?;
         }
         TransactionCommand::Resend => {
-            info!("Resending transaction");
+            debug!("resending transaction {}", transaction.id);
             relayer_transaction.submit_transaction(transaction).await?;
         }
     };
 
-    info!("Transaction handled successfully");
+    debug!("transaction handled successfully");
 
     Ok(())
 }
@@ -116,6 +158,53 @@ mod tests {
         assert_eq!(job_metadata.get("gas_price").unwrap(), "20000000000");
     }
 
-    // Note: As with the transaction_request_handler tests, full testing of the
-    // handler functionality would require dependency injection or integration tests.
+    mod get_max_retries_tests {
+        use super::*;
+
+        #[test]
+        fn test_submit_command_retries() {
+            let command = TransactionCommand::Submit;
+            let retries = get_max_retries(&command);
+
+            assert_eq!(
+                retries, WORKER_TRANSACTION_SUBMIT_RETRIES,
+                "Submit command should use WORKER_TRANSACTION_SUBMIT_RETRIES"
+            );
+        }
+
+        #[test]
+        fn test_resubmit_command_retries() {
+            let command = TransactionCommand::Resubmit;
+            let retries = get_max_retries(&command);
+
+            assert_eq!(
+                retries, WORKER_TRANSACTION_RESUBMIT_RETRIES,
+                "Resubmit command should use WORKER_TRANSACTION_RESUBMIT_RETRIES"
+            );
+        }
+
+        #[test]
+        fn test_cancel_command_retries() {
+            let command = TransactionCommand::Cancel {
+                reason: "test cancel".to_string(),
+            };
+            let retries = get_max_retries(&command);
+
+            assert_eq!(
+                retries, WORKER_TRANSACTION_CANCEL_RETRIES,
+                "Cancel command should use WORKER_TRANSACTION_CANCEL_RETRIES"
+            );
+        }
+
+        #[test]
+        fn test_resend_command_retries() {
+            let command = TransactionCommand::Resend;
+            let retries = get_max_retries(&command);
+
+            assert_eq!(
+                retries, WORKER_TRANSACTION_RESEND_RETRIES,
+                "Resend command should use WORKER_TRANSACTION_RESEND_RETRIES"
+            );
+        }
+    }
 }

@@ -1,7 +1,7 @@
 use crate::{
     models::{
-        evm::Speed, EvmTransactionDataSignature, NetworkTransactionData, TransactionRepoModel,
-        TransactionStatus, U256,
+        evm::Speed, EvmTransactionDataSignature, NetworkTransactionData, SolanaInstructionSpec,
+        TransactionRepoModel, TransactionStatus, U256,
     },
     utils::{deserialize_optional_u128, deserialize_optional_u64, serialize_optional_u128},
 };
@@ -33,7 +33,7 @@ pub struct EvmTransactionResponse {
         deserialize_with = "deserialize_optional_u128",
         default
     )]
-    #[schema(nullable = false)]
+    #[schema(nullable = false, value_type = String)]
     pub gas_price: Option<u128>,
     #[serde(deserialize_with = "deserialize_optional_u64", default)]
     pub gas_limit: Option<u64>,
@@ -53,14 +53,14 @@ pub struct EvmTransactionResponse {
         deserialize_with = "deserialize_optional_u128",
         default
     )]
-    #[schema(nullable = false)]
+    #[schema(nullable = false, value_type = String)]
     pub max_fee_per_gas: Option<u128>,
     #[serde(
         serialize_with = "serialize_optional_u128",
         deserialize_with = "deserialize_optional_u128",
         default
     )]
-    #[schema(nullable = false)]
+    #[schema(nullable = false, value_type = String)]
     pub max_priority_fee_per_gas: Option<u128>,
     pub signature: Option<EvmTransactionDataSignature>,
     pub speed: Option<Speed>,
@@ -69,17 +69,24 @@ pub struct EvmTransactionResponse {
 #[derive(Debug, Serialize, Clone, PartialEq, Deserialize, ToSchema)]
 pub struct SolanaTransactionResponse {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub signature: Option<String>,
     pub status: TransactionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub status_reason: Option<String>,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub sent_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub confirmed_at: Option<String>,
-    #[schema(nullable = false)]
     pub transaction: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub instructions: Option<Vec<SolanaInstructionSpec>>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Deserialize, ToSchema)]
@@ -97,6 +104,7 @@ pub struct StellarTransactionResponse {
     pub source_account: String,
     pub fee: u32,
     pub sequence_number: i64,
+    pub relayer_id: String,
 }
 
 impl From<TransactionRepoModel> for TransactionResponse {
@@ -128,13 +136,14 @@ impl From<TransactionRepoModel> for TransactionResponse {
             NetworkTransactionData::Solana(solana_data) => {
                 TransactionResponse::Solana(Box::new(SolanaTransactionResponse {
                     id: model.id,
-                    transaction: solana_data.transaction,
+                    transaction: solana_data.transaction.unwrap_or_default(),
                     status: model.status,
                     status_reason: model.status_reason,
                     created_at: model.created_at,
                     sent_at: model.sent_at,
                     confirmed_at: model.confirmed_at,
                     signature: solana_data.signature,
+                    instructions: solana_data.instructions,
                 }))
             }
             NetworkTransactionData::Stellar(stellar_data) => {
@@ -149,6 +158,7 @@ impl From<TransactionRepoModel> for TransactionResponse {
                     source_account: stellar_data.source_account,
                     fee: stellar_data.fee.unwrap_or(0),
                     sequence_number: stellar_data.sequence_number.unwrap_or(0),
+                    relayer_id: model.relayer_id,
                 }))
             }
         }
@@ -236,7 +246,8 @@ mod tests {
             priced_at: None,
             hashes: vec![],
             network_data: NetworkTransactionData::Solana(SolanaTransactionData {
-                transaction: "transaction_123".to_string(),
+                transaction: Some("transaction_123".to_string()),
+                instructions: None,
                 signature: Some("signature_123".to_string()),
             }),
             valid_until: None,
@@ -308,6 +319,7 @@ mod tests {
                 assert_eq!(stellar.source_account, "source_account_id");
                 assert_eq!(stellar.fee, 100);
                 assert_eq!(stellar.sequence_number, 12345);
+                assert_eq!(stellar.relayer_id, "relayer3");
             }
             _ => panic!("Expected StellarTransactionResponse"),
         }
@@ -362,6 +374,7 @@ mod tests {
                 assert_eq!(stellar.source_account, "fee_source_account");
                 assert_eq!(stellar.fee, 200);
                 assert_eq!(stellar.sequence_number, 54321);
+                assert_eq!(stellar.relayer_id, "relayer3");
             }
             _ => panic!("Expected StellarTransactionResponse"),
         }
@@ -381,7 +394,8 @@ mod tests {
             priced_at: None,
             hashes: vec![],
             network_data: NetworkTransactionData::Solana(SolanaTransactionData {
-                transaction: "transaction_123".to_string(),
+                transaction: Some("transaction_123".to_string()),
+                instructions: None,
                 signature: None,
             }),
             valid_until: None,

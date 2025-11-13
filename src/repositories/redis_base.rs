@@ -4,9 +4,9 @@
 //! implementations to reduce code duplication and ensure consistency.
 
 use crate::models::RepositoryError;
-use log::{error, warn};
 use redis::RedisError;
 use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
 
 /// Base trait for Redis repositories providing common functionality
 pub trait RedisRepository {
@@ -22,11 +22,8 @@ pub trait RedisRepository {
     {
         serde_json::to_string(entity).map_err(|e| {
             let id = id_extractor(entity);
-            error!("Serialization failed for {} {}: {}", entity_type, id, e);
-            RepositoryError::InvalidData(format!(
-                "Failed to serialize {} {}: {}",
-                entity_type, id, e
-            ))
+            error!(entity_type = %entity_type, id = %id, error = %e, "serialization failed");
+            RepositoryError::InvalidData(format!("Failed to serialize {entity_type} {id}: {e}"))
         })
     }
 
@@ -42,10 +39,7 @@ pub trait RedisRepository {
         T: for<'de> Deserialize<'de>,
     {
         serde_json::from_str(json).map_err(|e| {
-            error!(
-                "Deserialization failed for {} {}: {}",
-                entity_type, entity_id, e
-            );
+            error!(entity_type = %entity_type, entity_id = %entity_id, error = %e, "deserialization failed");
             RepositoryError::InvalidData(format!(
                 "Failed to deserialize {} {}: {} (JSON length: {})",
                 entity_type,
@@ -58,38 +52,32 @@ pub trait RedisRepository {
 
     /// Convert Redis errors to appropriate RepositoryError types
     fn map_redis_error(&self, error: RedisError, context: &str) -> RepositoryError {
-        warn!("Redis operation failed in context '{}': {}", context, error);
+        warn!(context = %context, error = %error, "redis operation failed");
 
         match error.kind() {
             redis::ErrorKind::TypeError => RepositoryError::InvalidData(format!(
-                "Redis data type error in operation '{}': {}",
-                context, error
+                "Redis data type error in operation '{context}': {error}"
             )),
             redis::ErrorKind::AuthenticationFailed => {
                 RepositoryError::InvalidData("Redis authentication failed".to_string())
             }
             redis::ErrorKind::NoScriptError => RepositoryError::InvalidData(format!(
-                "Redis script error in operation '{}': {}",
-                context, error
+                "Redis script error in operation '{context}': {error}"
             )),
             redis::ErrorKind::ReadOnly => RepositoryError::InvalidData(format!(
-                "Redis is read-only in operation '{}': {}",
-                context, error
+                "Redis is read-only in operation '{context}': {error}"
             )),
             redis::ErrorKind::ExecAbortError => RepositoryError::InvalidData(format!(
-                "Redis transaction aborted in operation '{}': {}",
-                context, error
+                "Redis transaction aborted in operation '{context}': {error}"
             )),
             redis::ErrorKind::BusyLoadingError => RepositoryError::InvalidData(format!(
-                "Redis is busy in operation '{}': {}",
-                context, error
+                "Redis is busy in operation '{context}': {error}"
             )),
             redis::ErrorKind::ExtensionError => RepositoryError::InvalidData(format!(
-                "Redis extension error in operation '{}': {}",
-                context, error
+                "Redis extension error in operation '{context}': {error}"
             )),
             // Default to Other for connection errors and other issues
-            _ => RepositoryError::Other(format!("Redis operation '{}' failed: {}", context, error)),
+            _ => RepositoryError::Other(format!("Redis operation '{context}' failed: {error}")),
         }
     }
 }

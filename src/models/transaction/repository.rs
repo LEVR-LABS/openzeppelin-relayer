@@ -14,6 +14,7 @@ use crate::{
     models::{
         transaction::{
             request::{evm::EvmTransactionRequest, stellar::StellarTransactionRequest},
+            solana::SolanaInstructionSpec,
             stellar::{DecoratedSignature, MemoSpec, OperationSpec},
         },
         AddressError, EvmNetwork, NetworkRepoModel, NetworkTransactionRequest, NetworkType,
@@ -436,10 +437,23 @@ impl EvmTransactionDataTrait for EvmTransactionData {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SolanaTransactionData {
-    pub transaction: String,
+    /// Pre-built serialized transaction (base64) - mutually exclusive with instructions
+    pub transaction: Option<String>,
+    /// Instructions to build transaction from - mutually exclusive with transaction
+    pub instructions: Option<Vec<SolanaInstructionSpec>>,
+    /// Transaction signature after submission
     pub signature: Option<String>,
+}
+
+impl SolanaTransactionData {
+    /// Creates a new `SolanaTransactionData` with an updated signature.
+    /// Moves the data to avoid unnecessary cloning.
+    pub fn with_signature(mut self, signature: String) -> Self {
+        self.signature = Some(signature);
+        self
+    }
 }
 
 /// Represents different input types for Stellar transactions
@@ -534,14 +548,10 @@ pub struct StellarTransactionData {
     pub memo: Option<MemoSpec>,
     pub valid_until: Option<String>,
     pub network_passphrase: String,
-    #[serde(skip_serializing, skip_deserializing)]
     pub signatures: Vec<DecoratedSignature>,
     pub hash: Option<String>,
-    #[serde(skip_serializing, skip_deserializing)]
     pub simulation_transaction_data: Option<String>,
-    #[serde(skip)]
     pub transaction_input: TransactionInput,
-    #[serde(skip_serializing, skip_deserializing)]
     pub signed_envelope_xdr: Option<String>,
 }
 
@@ -693,7 +703,7 @@ impl StellarTransactionData {
     fn parse_xdr_envelope(&self, xdr: &str) -> Result<TransactionEnvelope, SignerError> {
         use soroban_rs::xdr::{Limits, ReadXdr};
         TransactionEnvelope::from_xdr_base64(xdr, Limits::none())
-            .map_err(|e| SignerError::ConversionError(format!("Invalid XDR: {}", e)))
+            .map_err(|e| SignerError::ConversionError(format!("Invalid XDR: {e}")))
     }
 
     // Helper method to attach signatures to an envelope
@@ -705,13 +715,11 @@ impl StellarTransactionData {
 
         // Serialize and re-parse to get a mutable version
         let envelope_xdr = envelope.to_xdr_base64(Limits::none()).map_err(|e| {
-            SignerError::ConversionError(format!("Failed to serialize envelope: {}", e))
+            SignerError::ConversionError(format!("Failed to serialize envelope: {e}"))
         })?;
 
         let mut envelope = TransactionEnvelope::from_xdr_base64(&envelope_xdr, Limits::none())
-            .map_err(|e| {
-                SignerError::ConversionError(format!("Failed to parse envelope: {}", e))
-            })?;
+            .map_err(|e| SignerError::ConversionError(format!("Failed to parse envelope: {e}")))?;
 
         let sigs = VecM::try_from(self.signatures.clone())
             .map_err(|_| SignerError::ConversionError("too many signatures".into()))?;
@@ -759,7 +767,7 @@ impl StellarTransactionData {
         sim_response: soroban_rs::stellar_rpc_client::SimulateTransactionResponse,
         operations_count: u64,
     ) -> Result<Self, SignerError> {
-        use log::info;
+        use tracing::info;
 
         // Update fee based on simulation (using soroban-helpers formula)
         let inclusion_fee = operations_count * STELLAR_DEFAULT_TRANSACTION_FEE as u64;
@@ -843,11 +851,12 @@ impl
                 created_at: now,
                 sent_at: None,
                 confirmed_at: None,
-                valid_until: None,
+                valid_until: solana_request.valid_until.clone(),
                 delete_at: None,
                 network_type: NetworkType::Solana,
                 network_data: NetworkTransactionData::Solana(SolanaTransactionData {
-                    transaction: solana_request.transaction.clone().into_inner(),
+                    transaction: solana_request.transaction.clone().map(|t| t.into_inner()),
+                    instructions: solana_request.instructions.clone(),
                     signature: None,
                 }),
                 priced_at: None,
@@ -907,7 +916,7 @@ impl EvmTransactionData {
     pub fn to_address(&self) -> Result<Option<AlloyAddress>, SignerError> {
         Ok(match self.to.as_deref().filter(|s| !s.is_empty()) {
             Some(addr_str) => Some(AlloyAddress::from_str(addr_str).map_err(|e| {
-                AddressError::ConversionError(format!("Invalid 'to' address: {}", e))
+                AddressError::ConversionError(format!("Invalid 'to' address: {e}"))
             })?),
             None => None,
         })
@@ -920,7 +929,7 @@ impl EvmTransactionData {
     /// * `Err(SignerError)` if the hex string is invalid
     pub fn data_to_bytes(&self) -> Result<Bytes, SignerError> {
         Bytes::from_str(self.data.as_deref().unwrap_or(""))
-            .map_err(|e| SignerError::SigningError(format!("Invalid transaction data: {}", e)))
+            .map_err(|e| SignerError::SigningError(format!("Invalid transaction data: {e}")))
     }
 }
 
@@ -1393,8 +1402,8 @@ mod tests {
 
         // Should fail for non-EVM data
         let solana_data = NetworkTransactionData::Solana(SolanaTransactionData {
-            transaction: "transaction_123".to_string(),
-            signature: None,
+            transaction: Some("transaction_123".to_string()),
+            ..Default::default()
         });
         assert!(solana_data.get_evm_transaction_data().is_err());
     }
@@ -1402,8 +1411,8 @@ mod tests {
     #[test]
     fn test_network_tx_data_get_solana_transaction_data() {
         let solana_tx_data = SolanaTransactionData {
-            transaction: "transaction_123".to_string(),
-            signature: None,
+            transaction: Some("transaction_123".to_string()),
+            ..Default::default()
         };
         let network_data = NetworkTransactionData::Solana(solana_tx_data.clone());
 
@@ -1474,8 +1483,8 @@ mod tests {
 
         // Should fail for non-EVM data
         let solana_data = NetworkTransactionData::Solana(SolanaTransactionData {
-            transaction: "transaction_123".to_string(),
-            signature: None,
+            transaction: Some("transaction_123".to_string()),
+            ..Default::default()
         });
         assert!(TxLegacy::try_from(solana_data).is_err());
     }
@@ -1660,6 +1669,7 @@ mod tests {
             notification_id: None,
             system_disabled: false,
             custom_rpc_urls: None,
+            ..Default::default()
         };
 
         let network_model = NetworkRepoModel {
@@ -1680,6 +1690,7 @@ mod tests {
                 required_confirmations: Some(12),
                 features: None,
                 symbol: Some("ETH".to_string()),
+                gas_price_cache: None,
             }),
         };
 
@@ -1720,7 +1731,11 @@ mod tests {
 
         let solana_request = NetworkTransactionRequest::Solana(
             crate::models::transaction::request::solana::SolanaTransactionRequest {
-                transaction: EncodedSerializedTransaction::new("transaction_123".to_string()),
+                transaction: Some(EncodedSerializedTransaction::new(
+                    "transaction_123".to_string(),
+                )),
+                instructions: None,
+                valid_until: None,
             },
         );
 
@@ -1736,6 +1751,7 @@ mod tests {
             notification_id: None,
             system_disabled: false,
             custom_rpc_urls: None,
+            ..Default::default()
         };
 
         let network_model = NetworkRepoModel {
@@ -1766,7 +1782,7 @@ mod tests {
         assert_eq!(transaction.valid_until, None);
 
         if let NetworkTransactionData::Solana(solana_data) = transaction.network_data {
-            assert_eq!(solana_data.transaction, "transaction_123".to_string());
+            assert_eq!(solana_data.transaction, Some("transaction_123".to_string()));
             assert_eq!(solana_data.signature, None);
         } else {
             panic!("Expected Solana transaction data");
@@ -1811,6 +1827,7 @@ mod tests {
             notification_id: None,
             system_disabled: false,
             custom_rpc_urls: None,
+            ..Default::default()
         };
 
         let network_model = NetworkRepoModel {
@@ -1916,8 +1933,8 @@ mod tests {
 
         // Should fail for non-EVM data
         let solana_data = NetworkTransactionData::Solana(SolanaTransactionData {
-            transaction: "transaction_123".to_string(),
-            signature: None,
+            transaction: Some("transaction_123".to_string()),
+            ..Default::default()
         });
         assert!(TxEip1559::try_from(solana_data).is_err());
     }
@@ -2107,14 +2124,101 @@ mod tests {
                 max_fee: None,
                 timeout_seconds: None,
                 min_balance: Some(DEFAULT_STELLAR_MIN_BALANCE),
+                concurrent_transactions: None,
             }),
             address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
             notification_id: None,
             system_disabled: false,
             custom_rpc_urls: None,
+            ..Default::default()
         };
 
         (network_model, relayer_model)
+    }
+
+    #[test]
+    fn test_stellar_transaction_data_serialization_roundtrip() {
+        use crate::models::transaction::stellar::asset::AssetSpec;
+        use crate::models::transaction::stellar::operation::OperationSpec;
+        use soroban_rs::xdr::{BytesM, Signature, SignatureHint};
+
+        // Create a dummy signature
+        let hint = SignatureHint([1, 2, 3, 4]);
+        let sig_bytes: Vec<u8> = vec![5u8; 64];
+        let sig_bytes_m: BytesM<64> = sig_bytes.try_into().unwrap();
+        let dummy_signature = DecoratedSignature {
+            hint,
+            signature: Signature(sig_bytes_m),
+        };
+
+        // Create a StellarTransactionData with operations, signatures, and other fields
+        let original_data = StellarTransactionData {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
+            fee: Some(100),
+            sequence_number: Some(12345),
+            memo: None,
+            valid_until: None,
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            signatures: vec![dummy_signature.clone()],
+            hash: Some("test-hash".to_string()),
+            simulation_transaction_data: Some("simulation-data".to_string()),
+            transaction_input: TransactionInput::Operations(vec![OperationSpec::Payment {
+                destination: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
+                amount: 1000,
+                asset: AssetSpec::Native,
+            }]),
+            signed_envelope_xdr: Some("signed-xdr-data".to_string()),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&original_data).expect("Failed to serialize");
+
+        // Deserialize from JSON
+        let deserialized_data: StellarTransactionData =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        // Verify that transaction_input is preserved
+        match (
+            &original_data.transaction_input,
+            &deserialized_data.transaction_input,
+        ) {
+            (TransactionInput::Operations(orig_ops), TransactionInput::Operations(deser_ops)) => {
+                assert_eq!(orig_ops.len(), deser_ops.len());
+                assert_eq!(orig_ops, deser_ops);
+            }
+            _ => panic!("Transaction input type mismatch"),
+        }
+
+        // Verify signatures are preserved
+        assert_eq!(
+            original_data.signatures.len(),
+            deserialized_data.signatures.len()
+        );
+        assert_eq!(original_data.signatures, deserialized_data.signatures);
+
+        // Verify other fields are preserved
+        assert_eq!(
+            original_data.source_account,
+            deserialized_data.source_account
+        );
+        assert_eq!(original_data.fee, deserialized_data.fee);
+        assert_eq!(
+            original_data.sequence_number,
+            deserialized_data.sequence_number
+        );
+        assert_eq!(
+            original_data.network_passphrase,
+            deserialized_data.network_passphrase
+        );
+        assert_eq!(original_data.hash, deserialized_data.hash);
+        assert_eq!(
+            original_data.simulation_transaction_data,
+            deserialized_data.simulation_transaction_data
+        );
+        assert_eq!(
+            original_data.signed_envelope_xdr,
+            deserialized_data.signed_envelope_xdr
+        );
     }
 
     #[test]

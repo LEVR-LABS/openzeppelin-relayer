@@ -142,18 +142,18 @@ pub fn deserialize_policy_for_network_type(
     match network_type {
         RelayerNetworkType::Evm => {
             let evm_policy: RelayerEvmPolicy = serde_json::from_value(policies_value.clone())
-                .map_err(|e| ApiError::BadRequest(format!("Invalid EVM policy: {}", e)))?;
+                .map_err(|e| ApiError::BadRequest(format!("Invalid EVM policy: {e}")))?;
             Ok(RelayerNetworkPolicy::Evm(evm_policy))
         }
         RelayerNetworkType::Solana => {
             let solana_policy: RelayerSolanaPolicy = serde_json::from_value(policies_value.clone())
-                .map_err(|e| ApiError::BadRequest(format!("Invalid Solana policy: {}", e)))?;
+                .map_err(|e| ApiError::BadRequest(format!("Invalid Solana policy: {e}")))?;
             Ok(RelayerNetworkPolicy::Solana(solana_policy))
         }
         RelayerNetworkType::Stellar => {
             let stellar_policy: RelayerStellarPolicy =
                 serde_json::from_value(policies_value.clone())
-                    .map_err(|e| ApiError::BadRequest(format!("Invalid Stellar policy: {}", e)))?;
+                    .map_err(|e| ApiError::BadRequest(format!("Invalid Stellar policy: {e}")))?;
             Ok(RelayerNetworkPolicy::Stellar(stellar_policy))
         }
     }
@@ -167,8 +167,10 @@ pub struct UpdateRelayerRequest {
     pub paused: Option<bool>,
     /// Raw policy JSON - will be validated against relayer's network type during application
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub policies: Option<CreateRelayerPolicyRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub notification_id: Option<String>,
     pub custom_rpc_urls: Option<Vec<RpcConfig>>,
 }
@@ -299,6 +301,7 @@ mod tests {
                 min_balance: Some(20000000),
                 max_fee: Some(100000),
                 timeout_seconds: Some(30),
+                concurrent_transactions: None,
             })),
             signer_id: "test-signer".to_string(),
             notification_id: None,
@@ -446,6 +449,7 @@ mod tests {
                 min_balance: Some(50000000),
                 max_fee: Some(150000),
                 timeout_seconds: Some(60),
+                concurrent_transactions: None,
             })),
             signer_id: "test-signer".to_string(),
             notification_id: None,

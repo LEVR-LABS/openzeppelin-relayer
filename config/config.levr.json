@@ -1,38 +1,169 @@
 {
   "relayers": [
     {
-      "id": "game-admin-10143-1",
+      "id": "game_admin_10143_1",
       "name": "Game Admin 10143 1",
       "network": "monad-testnet",
       "paused": false,
-      "signer_id": "game-admin-1",
+      "signer_id": "game_admin_1",
       "network_type": "evm",
       "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
-        "whitelist_receivers": [
-          "0xF3A0c019336b489C01091B3B99DE0e8b0d1670a6",
-          "0xd8e37a089959e53f80cA2A8E9406CAE9950670dC"
-        ],
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
     },
     {
-      "id": "game-admin-10143-2",
+      "id": "game_admin_10143_2",
       "name": "Game Admin 10143 2",
       "network": "monad-testnet",
       "paused": false,
-      "signer_id": "game-admin-2",
+      "signer_id": "game_admin_2",
       "network_type": "evm",
       "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
-        "min_balance": 0,
-        "whitelist_receivers": [
-          "0xF3A0c019336b489C01091B3B99DE0e8b0d1670a6",
-          "0xd8e37a089959e53f80cA2A8E9406CAE9950670dC"
-        ],
+        "min_balance": 1000000000000000000,
         "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "game_admin_10143_3",
+      "name": "Game Admin 10143 3",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "game_admin_3",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "liquidator_10143_1",
+      "name": "Liquidator 10143 1",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "liquidator_1",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "liquidator_10143_2",
+      "name": "Liquidator 10143 2",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "liquidator_2",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "liquidator_10143_3",
+      "name": "Liquidator 10143 3",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "liquidator_3",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "feed_provider_10143_1",
+      "name": "Feed Provider 10143 1",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "feed_provider_1",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "feed_provider_10143_2",
+      "name": "Feed Provider 10143 2",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "feed_provider_2",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "feed_provider_10143_3",
+      "name": "Feed Provider 10143 3",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "feed_provider_3",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "match_maker_10143_1",
+      "name": "Match Maker 10143 1",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "match_maker_1",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "match_maker_10143_2",
+      "name": "Match Maker 10143 2",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "match_maker_2",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "match_maker_10143_3",
+      "name": "Match Maker 10143 3",
+      "network": "monad-testnet",
+      "paused": false,
+      "signer_id": "match_maker_3",
+      "network_type": "evm",
+      "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
+      "policies": {
+        "min_balance": 1000000000000000000,
         "gas_limit_estimation": true
       }
     }
@@ -40,7 +171,7 @@
   "notifications": [],
   "signers": [
     {
-      "id": "game-admin-1",
+      "id": "game_admin_1",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
@@ -48,11 +179,91 @@
       }
     },
     {
-      "id": "game-admin-2",
+      "id": "game_admin_2",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
         "key_id": "23b4e79f-9342-4952-b3e5-6ddbaeb1a484"
+      }
+    },
+    {
+      "id": "game_admin_3",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "63784cda-5cac-48c4-ac78-7b00aa6c7957"
+      }
+    },
+    {
+      "id": "liquidator_1",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "1e497ebd-67fc-4aa0-809f-df01e8cbb604"
+      }
+    },
+    {
+      "id": "liquidator_2",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "52504ba9-b75a-44c3-bb66-56bf3c65b249"
+      }
+    },
+    {
+      "id": "liquidator_3",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "d31b511e-7090-40cd-9cff-4c774a6f27b2"
+      }
+    },
+    {
+      "id": "feed_provider_1",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "18f32426-66a4-4a94-ae1c-8260cc346ea7"
+      }
+    },
+    {
+      "id": "feed_provider_2",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "a44a49a1-4ba5-4110-9e32-b091dc6ba87e"
+      }
+    },
+    {
+      "id": "feed_provider_3",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "33b1741a-a84e-4078-999f-c441aaca6d2f"
+      }
+    },
+    {
+      "id": "match_maker_1",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "2b30751d-03ba-459a-b826-89930699f114"
+      }
+    },
+    {
+      "id": "match_maker_2",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "19feb3ab-a156-49aa-9070-6b77205ee00f"
+      }
+    },
+    {
+      "id": "match_maker_3",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "4cc939bb-c67e-4b45-b162-29693a2fad3c"
       }
     }
   ],

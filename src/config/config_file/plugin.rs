@@ -14,6 +14,10 @@ pub struct PluginFileConfig {
     pub id: String,
     pub path: String,
     pub timeout: Option<u64>,
+    #[serde(default)]
+    pub emit_logs: bool,
+    #[serde(default)]
+    pub emit_traces: bool,
 }
 
 pub struct PluginsFileConfig {
@@ -49,8 +53,7 @@ impl PluginsFileConfig {
 
             if !plugin.path.ends_with(PLUGIN_FILE_TYPE) {
                 return Err(ConfigFileError::InvalidFormat(format!(
-                    "Plugin path must be a {} file (ends with '{}')",
-                    PLUGIN_LANG, PLUGIN_FILE_TYPE
+                    "Plugin path must be a {PLUGIN_LANG} file (ends with '{PLUGIN_FILE_TYPE}')"
                 )));
             }
         }

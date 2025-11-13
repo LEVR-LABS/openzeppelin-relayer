@@ -40,8 +40,8 @@ pub use plugin::*;
 
 pub mod network;
 pub use network::{
-    EvmNetworkConfig, NetworkConfigCommon, NetworkFileConfig, NetworksFileConfig,
-    SolanaNetworkConfig, StellarNetworkConfig,
+    EvmNetworkConfig, GasPriceCacheConfig, NetworkConfigCommon, NetworkFileConfig,
+    NetworksFileConfig, SolanaNetworkConfig, StellarNetworkConfig,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
@@ -234,12 +234,15 @@ mod tests {
                 required_confirmations: Some(1),
                 features: None,
                 symbol: Some("ETH".to_string()),
+                gas_price_cache: None,
             })])
             .expect("Failed to create NetworksFileConfig for test"),
             plugins: Some(vec![PluginFileConfig {
                 id: "test-1".to_string(),
                 path: "/app/plugins/test-plugin.ts".to_string(),
                 timeout: None,
+                emit_logs: false,
+                emit_traces: false,
             }]),
         }
     }
@@ -270,6 +273,7 @@ mod tests {
                 required_confirmations: Some(1),
                 features: None,
                 symbol: Some("ETH".to_string()),
+                gas_price_cache: None,
             })])
             .unwrap(),
             plugins: Some(vec![]),
@@ -297,6 +301,7 @@ mod tests {
                 required_confirmations: Some(1),
                 features: None,
                 symbol: Some("ETH".to_string()),
+                gas_price_cache: None,
             })])
             .unwrap(),
             plugins: Some(vec![]),
@@ -862,6 +867,7 @@ mod tests {
             required_confirmations: Some(1),
             features: None,
             symbol: Some("ETH".to_string()),
+            gas_price_cache: None,
         })];
 
         let config = NetworksFileConfig::new(networks).unwrap();
@@ -1141,6 +1147,8 @@ mod tests {
                 id: "id".to_string(),
                 path: "/app/plugins/test-plugin.js".to_string(),
                 timeout: None,
+                emit_logs: false,
+                emit_traces: false,
             }]),
         };
         let result = config.validate_plugins();
@@ -1208,6 +1216,7 @@ mod tests {
                 required_confirmations: Some(1),
                 features: None,
                 symbol: Some("ETH".to_string()),
+                gas_price_cache: None,
             })])
             .unwrap(),
             plugins: Some(vec![]),
@@ -1242,6 +1251,7 @@ mod tests {
                 required_confirmations: Some(1),
                 features: None,
                 symbol: Some("ETH".to_string()),
+                gas_price_cache: None,
             })])
             .unwrap(),
             plugins: Some(vec![]),

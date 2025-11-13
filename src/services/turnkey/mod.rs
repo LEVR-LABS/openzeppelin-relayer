@@ -24,7 +24,6 @@ use std::str::FromStr;
 use alloy::primitives::keccak256;
 use async_trait::async_trait;
 use chrono;
-use log::{debug, info};
 use p256::{
     ecdsa::{signature::Signer, Signature as P256Signature, SigningKey},
     FieldBytes,
@@ -32,7 +31,9 @@ use p256::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction};
+use stellar_strkey;
 use thiserror::Error;
+use tracing::{debug, info};
 
 use crate::models::{Address, SecretString, TurnkeySignerConfig};
 use crate::utils::base64_url_encode;
@@ -183,11 +184,17 @@ pub trait TurnkeyServiceTrait: Send + Sync {
     /// Returns the EVM address derived from the configured public key
     fn address_evm(&self) -> Result<Address, TurnkeyError>;
 
+    /// Returns the Stellar address derived from the configured public key
+    fn address_stellar(&self) -> Result<Address, TurnkeyError>;
+
     /// Signs a message using the Solana signing scheme
     async fn sign_solana(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError>;
 
     /// Signs a message using the EVM signing scheme
     async fn sign_evm(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError>;
+
+    /// Signs a message using the Stellar signing scheme (Ed25519)
+    async fn sign_stellar(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError>;
 
     /// Signs an EVM transaction using the Turnkey API
     async fn sign_evm_transaction(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError>;
@@ -199,7 +206,7 @@ pub trait TurnkeyServiceTrait: Send + Sync {
     ) -> TurnkeyResult<(Transaction, Signature)>;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TurnkeyService {
     pub api_public_key: String,
     pub api_private_key: SecretString,
@@ -223,14 +230,14 @@ impl TurnkeyService {
         })
     }
 
-    /// Converts the public key to an Solana address
+    /// Converts the public key to a Solana address
     pub fn address_solana(&self) -> Result<Address, TurnkeyError> {
         if self.public_key.is_empty() {
             return Err(TurnkeyError::ConfigError("Public key is empty".to_string()));
         }
 
         let raw_pubkey = hex::decode(&self.public_key)
-            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {}", e)))?;
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {e}")))?;
 
         let pubkey_bs58 = bs58::encode(&raw_pubkey).into_string();
 
@@ -240,7 +247,7 @@ impl TurnkeyService {
     /// Converts the public key to an EVM address
     pub fn address_evm(&self) -> Result<Address, TurnkeyError> {
         let public_key = hex::decode(&self.public_key)
-            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {}", e)))?;
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {e}")))?;
 
         // Remove the first byte (0x04 prefix)
         let pub_key_no_prefix = &public_key[1..];
@@ -264,16 +271,35 @@ impl TurnkeyService {
         Ok(Address::Evm(array))
     }
 
+    /// Converts the public key to a Stellar address
+    pub fn address_stellar(&self) -> Result<Address, TurnkeyError> {
+        if self.public_key.is_empty() {
+            return Err(TurnkeyError::ConfigError("Public key is empty".to_string()));
+        }
+
+        // For Stellar, we expect Ed25519 public key in hex format
+        let raw_pubkey = hex::decode(&self.public_key)
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {e}")))?;
+
+        // Stellar uses StrKey encoding with 'G' prefix for account addresses
+        let stellar_address = stellar_strkey::ed25519::PublicKey::from_payload(&raw_pubkey)
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid Ed25519 public key: {e}")))?
+            .to_string();
+
+        Ok(Address::Stellar(stellar_address))
+    }
+
     /// Creates a digital stamp for API authentication
     fn stamp(&self, message: &str) -> TurnkeyResult<String> {
-        let private_api_key_bytes =
-            hex::decode(self.api_private_key.to_str().as_str()).map_err(|e| {
-                TurnkeyError::ConfigError(format!("Failed to decode private key: {}", e))
-            })?;
+        let private_api_key_bytes = hex::decode(self.api_private_key.to_str().as_str())
+            .map_err(|e| TurnkeyError::ConfigError(format!("Failed to decode private key: {e}")))?;
 
-        let signing_key: SigningKey =
-            SigningKey::from_bytes(FieldBytes::from_slice(&private_api_key_bytes))
-                .map_err(|e| TurnkeyError::SigningError(format!("Turnkey stamp error: {}", e)))?;
+        let key_array: [u8; 32] = private_api_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| TurnkeyError::ConfigError("Invalid private key length".to_string()))?;
+        let signing_key: SigningKey = SigningKey::from_bytes(&FieldBytes::from(key_array))
+            .map_err(|e| TurnkeyError::SigningError(format!("Turnkey stamp error: {e}")))?;
 
         let signature: P256Signature = signing_key.sign(message.as_bytes());
 
@@ -284,7 +310,7 @@ impl TurnkeyService {
         };
 
         let json_stamp = serde_json::to_string(&stamp).map_err(|e| {
-            TurnkeyError::SerializationError(format!("Serialization stamp error: {}", e))
+            TurnkeyError::SerializationError(format!("Serialization stamp error: {e}"))
         })?;
         let encoded_stamp = base64_url_encode(json_stamp.as_bytes());
 
@@ -299,13 +325,13 @@ impl TurnkeyService {
     {
         // Serialize the request body
         let body = serde_json::to_string(request_body).map_err(|e| {
-            TurnkeyError::SerializationError(format!("Request serialization error: {}", e))
+            TurnkeyError::SerializationError(format!("Request serialization error: {e}"))
         })?;
 
         // Create the authentication stamp
         let x_stamp = self.stamp(&body)?;
 
-        debug!("Sending request to Turnkey API: {}", endpoint);
+        debug!(endpoint = %endpoint, "sending request to turnkey api");
         let response = self
             .client
             .post(format!("{}/public/v1/submit/{}", self.base_url, endpoint))
@@ -352,7 +378,7 @@ impl TurnkeyService {
                 };
 
                 let signature_bytes = hex::decode(&concatenated_hex).map_err(|e| {
-                    TurnkeyError::SigningError(format!("Turnkey signing error {}", e))
+                    TurnkeyError::SigningError(format!("Turnkey signing error {e}"))
                 })?;
 
                 return Ok(signature_bytes);
@@ -375,12 +401,21 @@ impl TurnkeyService {
         let result = self
             .sign_raw_payload(bytes, "HASH_FUNCTION_NO_OP", true)
             .await?;
-        debug!("EVM signature length: {}", result.len());
+        debug!(signature_length = %result.len(), "evm signature length");
         Ok(result)
     }
 
+    /// Signs raw bytes using the Turnkey API (for Stellar)
+    async fn sign_bytes_stellar(&self, bytes: &[u8]) -> TurnkeyResult<Vec<u8>> {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(bytes);
+
+        self.sign_raw_payload(&hash, "HASH_FUNCTION_NOT_APPLICABLE", false)
+            .await
+    }
+
     /// Signs an EVM transaction using the Turnkey API
-    async fn sign_evm_transaction(&self, bytes: &[u8]) -> TurnkeyResult<Vec<u8>> {
+    async fn sign_evm_transaction_impl(&self, bytes: &[u8]) -> TurnkeyResult<Vec<u8>> {
         let encoded_bytes = hex::encode(bytes);
 
         // Create the request body
@@ -407,9 +442,7 @@ impl TurnkeyService {
             .and_then(|result| result.sign_transaction_result)
             .map(|tx_result| hex::decode(&tx_result.signed_transaction))
             .transpose()
-            .map_err(|e| {
-                TurnkeyError::SigningError(format!("Failed to decode transaction: {}", e))
-            })?
+            .map_err(|e| TurnkeyError::SigningError(format!("Failed to decode transaction: {e}")))?
             .ok_or_else(|| TurnkeyError::OtherError("Missing transaction result".into()))
     }
 
@@ -438,38 +471,35 @@ impl TurnkeyService {
                     // For error responses, try to get the body text first
                     match res.text().await {
                         Ok(body_text) => {
-                            debug!("Error response ({}): {}", status, body_text);
+                            debug!(status = %status, body_text = %body_text, "error response");
 
                             if content_type.contains("application/json") {
                                 match serde_json::from_str::<TurnkeyResponseError>(&body_text) {
                                     Ok(error) => Err(TurnkeyError::MethodError(error)),
                                     Err(e) => {
-                                        debug!("Failed to parse error response as JSON: {}", e);
+                                        debug!(error = %e, "failed to parse error response as json");
                                         Err(TurnkeyError::HttpError(format!(
-                                            "HTTP {} error: {}",
-                                            status, body_text
+                                            "HTTP {status} error: {body_text}"
                                         )))
                                     }
                                 }
                             } else {
                                 Err(TurnkeyError::HttpError(format!(
-                                    "HTTP {} error: {}",
-                                    status, body_text
+                                    "HTTP {status} error: {body_text}"
                                 )))
                             }
                         }
                         Err(e) => {
-                            info!("Failed to read error response body: {}", e);
+                            info!(error = %e, "failed to read error response body");
                             Err(TurnkeyError::HttpError(format!(
-                                "HTTP {} error (failed to read body): {}",
-                                status, e
+                                "HTTP {status} error (failed to read body): {e}"
                             )))
                         }
                     }
                 }
             }
             Err(e) => {
-                debug!("Turnkey API request error: {:?}", e);
+                debug!(error = ?e, "turnkey api request error");
                 // On a reqwest error, convert it into a TurnkeyError::HttpError
                 Err(TurnkeyError::HttpError(e.to_string()))
             }
@@ -480,11 +510,46 @@ impl TurnkeyService {
 #[async_trait]
 impl TurnkeyServiceTrait for TurnkeyService {
     fn address_solana(&self) -> Result<Address, TurnkeyError> {
-        self.address_solana()
+        if self.public_key.is_empty() {
+            return Err(TurnkeyError::ConfigError("Public key is empty".to_string()));
+        }
+
+        let raw_pubkey = hex::decode(&self.public_key)
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {e}")))?;
+
+        let pubkey_bs58 = bs58::encode(&raw_pubkey).into_string();
+
+        Ok(Address::Solana(pubkey_bs58))
     }
 
     fn address_evm(&self) -> Result<Address, TurnkeyError> {
-        self.address_evm()
+        let public_key = hex::decode(&self.public_key)
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid public key hex: {e}")))?;
+
+        // Remove the first byte (0x04 prefix)
+        let pub_key_no_prefix = &public_key[1..];
+
+        let hash = keccak256(pub_key_no_prefix);
+
+        // Ethereum addresses are the last 20 bytes of the Keccak-256 hash.
+        // Since the hash is 32 bytes, the address is bytes 12..32.
+        let address_bytes = &hash[12..];
+
+        if address_bytes.len() != 20 {
+            return Err(TurnkeyError::ConfigError(format!(
+                "EVM address should be 20 bytes, got {} bytes",
+                address_bytes.len()
+            )));
+        }
+
+        let mut array = [0u8; 20];
+        array.copy_from_slice(address_bytes);
+
+        Ok(Address::Evm(array))
+    }
+
+    fn address_stellar(&self) -> Result<Address, TurnkeyError> {
+        self.address_stellar()
     }
 
     async fn sign_solana(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError> {
@@ -497,9 +562,13 @@ impl TurnkeyServiceTrait for TurnkeyService {
         Ok(signature_bytes)
     }
 
-    async fn sign_evm_transaction(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError> {
-        let signature_bytes = self.sign_evm_transaction(message).await?;
+    async fn sign_stellar(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError> {
+        let signature_bytes = self.sign_bytes_stellar(message).await?;
         Ok(signature_bytes)
+    }
+
+    async fn sign_evm_transaction(&self, message: &[u8]) -> Result<Vec<u8>, TurnkeyError> {
+        self.sign_evm_transaction_impl(message).await
     }
 
     async fn sign_solana_transaction(
@@ -509,12 +578,12 @@ impl TurnkeyServiceTrait for TurnkeyService {
         let serialized_message = transaction.message_data();
 
         let public_key = Pubkey::from_str(&self.address_solana()?.to_string())
-            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid pubkey: {}", e)))?;
+            .map_err(|e| TurnkeyError::ConfigError(format!("Invalid pubkey: {e}")))?;
 
         let signature_bytes = self.sign_bytes_solana(&serialized_message).await?;
 
         let signature = Signature::try_from(signature_bytes.as_slice())
-            .map_err(|e| TurnkeyError::SignatureError(format!("Invalid signature: {}", e)))?;
+            .map_err(|e| TurnkeyError::SignatureError(format!("Invalid signature: {e}")))?;
 
         let index = transaction
             .message
@@ -537,9 +606,8 @@ impl TurnkeyServiceTrait for TurnkeyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito;
     use serde_json::json;
-    use wiremock::matchers::{header, header_exists, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn create_solana_test_config() -> TurnkeySignerConfig {
         TurnkeySignerConfig {
@@ -633,12 +701,14 @@ mod tests {
     }
 
     // Setup mock for signing raw payload
-    async fn setup_mock_sign_raw_payload(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/public/v1/submit/sign_raw_payload"))
-            .and(header("Content-Type", "application/json"))
-            .and(header_exists("X-Stamp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+    async fn setup_mock_sign_raw_payload(mock_server: &mut mockito::ServerGuard) -> mockito::Mock {
+        mock_server
+            .mock("POST", "/public/v1/submit/sign_raw_payload")
+            .match_header("Content-Type", "application/json")
+            .match_header("X-Stamp", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&json!({
                 "activity": {
                     "id": "test-activity-id",
                     "status": "ACTIVITY_STATUS_COMPLETE",
@@ -650,46 +720,61 @@ mod tests {
                         }
                     }
                 }
-            })))
-            .mount(mock_server)
-            .await;
+            })).unwrap())
+            .expect(1)
+            .create_async()
+            .await
     }
 
     // Setup mock for signing EVM transaction
-    async fn setup_mock_sign_evm_transaction(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/public/v1/submit/sign_transaction"))
-            .and(header("Content-Type", "application/json"))
-            .and(header_exists("X-Stamp"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "activity": {
-                    "id": "test-activity-id",
-                    "status": "ACTIVITY_STATUS_COMPLETE",
-                    "result": {
-                        "signTransactionResult": {
-                            "signedTransaction": "02f1010203050607080910" // Example signed transaction hex
+    async fn setup_mock_sign_evm_transaction(
+        mock_server: &mut mockito::ServerGuard,
+    ) -> mockito::Mock {
+        mock_server
+            .mock("POST", "/public/v1/submit/sign_transaction")
+            .match_header("Content-Type", "application/json")
+            .match_header("X-Stamp", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&json!({
+                    "activity": {
+                        "id": "test-activity-id",
+                        "status": "ACTIVITY_STATUS_COMPLETE",
+                        "result": {
+                            "signTransactionResult": {
+                                "signedTransaction": "02f1010203050607080910" // Example signed transaction hex
+                            }
                         }
                     }
-                }
-            })))
-            .mount(mock_server)
-            .await;
+                }))
+                .unwrap(),
+            )
+            .expect(1)
+            .create_async()
+            .await
     }
 
     // Setup mock for error response
-    async fn setup_mock_error_response(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/public/v1/submit/sign_raw_payload"))
-            .and(header("Content-Type", "application/json"))
-            .and(header_exists("X-Stamp"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "code": 400,
-                    "message": "Invalid payload format"
-                }
-            })))
-            .mount(mock_server)
-            .await;
+    async fn setup_mock_error_response(mock_server: &mut mockito::ServerGuard) -> mockito::Mock {
+        mock_server
+            .mock("POST", "/public/v1/submit/sign_raw_payload")
+            .match_header("Content-Type", "application/json")
+            .match_header("X-Stamp", mockito::Matcher::Any)
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::to_string(&json!({
+                    "error": {
+                        "code": 400,
+                        "message": "Invalid payload format"
+                    }
+                }))
+                .unwrap(),
+            )
+            .expect(1)
+            .create_async()
+            .await
     }
 
     // Helper function to create a modified client for testing
@@ -702,8 +787,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_solana() {
-        let mock_server = MockServer::start().await;
-        setup_mock_sign_raw_payload(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_sign_raw_payload(&mut mock_server).await;
 
         let config = create_solana_test_config();
 
@@ -713,7 +798,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 
@@ -725,8 +810,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_evm() {
-        let mock_server = MockServer::start().await;
-        setup_mock_sign_raw_payload(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_sign_raw_payload(&mut mock_server).await;
 
         let config = create_evm_test_config();
         let service = TurnkeyService {
@@ -735,7 +820,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 
@@ -747,8 +832,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_evm_transaction() {
-        let mock_server = MockServer::start().await;
-        setup_mock_sign_evm_transaction(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_sign_evm_transaction(&mut mock_server).await;
 
         let config = create_evm_test_config();
         let service = TurnkeyService {
@@ -757,7 +842,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 
@@ -772,8 +857,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_handling() {
-        let mock_server = MockServer::start().await;
-        setup_mock_error_response(&mock_server).await;
+        let mut mock_server = mockito::Server::new_async().await;
+        let _mock = setup_mock_error_response(&mut mock_server).await;
 
         let config = create_solana_test_config();
         let service = TurnkeyService {
@@ -782,7 +867,7 @@ mod tests {
             organization_id: config.organization_id,
             private_key_id: config.private_key_id,
             public_key: config.public_key,
-            base_url: mock_server.uri(),
+            base_url: mock_server.url(),
             client: create_test_client(),
         };
 

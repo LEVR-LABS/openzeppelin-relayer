@@ -85,8 +85,7 @@ impl Repository<NetworkRepoModel, String> for InMemoryNetworkRepository {
         match store.get(&id) {
             Some(network) => Ok(network.clone()),
             None => Err(RepositoryError::NotFound(format!(
-                "Network with ID {} not found",
-                id
+                "Network with ID {id} not found"
             ))),
         }
     }
@@ -194,6 +193,7 @@ mod tests {
                     required_confirmations: Some(1),
                     features: None,
                     symbol: Some("ETH".to_string()),
+                    gas_price_cache: None,
                 };
                 NetworkRepoModel::new_evm(evm_config)
             }

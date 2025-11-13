@@ -9,9 +9,9 @@ pub mod operations;
 pub mod unsigned_xdr;
 
 use eyre::Result;
-use log::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::{lane_gate, StellarRelayerTransaction};
+use super::{is_final_state, lane_gate, StellarRelayerTransaction};
 use crate::models::RelayerRepoModel;
 use crate::{
     jobs::JobProducerTrait,
@@ -20,7 +20,7 @@ use crate::{
         TransactionUpdateRequest,
     },
     repositories::{Repository, TransactionCounterTrait, TransactionRepository},
-    services::{Signer, StellarProviderTrait},
+    services::{provider::StellarProviderTrait, signer::Signer},
 };
 
 use common::{sign_and_finalize_transaction, update_and_notify_transaction};
@@ -39,16 +39,35 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        if !lane_gate::claim(&self.relayer().id, &tx.id) {
-            info!(
-                "Relayer {} already has a transaction in flight – {} must wait.",
-                self.relayer().id,
-                tx.id
+        debug!(status = ?tx.status, "preparing stellar transaction");
+
+        // Defensive check: if transaction is in a final state or unexpected state, don't retry
+        if is_final_state(&tx.status) {
+            warn!(
+                tx_id = %tx.id,
+                status = ?tx.status,
+                "transaction already in final state, skipping preparation"
             );
             return Ok(tx);
         }
 
-        info!("Preparing transaction: {:?}", tx.id);
+        if tx.status != TransactionStatus::Pending {
+            debug!(
+                tx_id = %tx.id,
+                status = ?tx.status,
+                expected_status = ?TransactionStatus::Pending,
+                "transaction in unexpected state for preparation, skipping"
+            );
+            return Ok(tx);
+        }
+
+        if !self.concurrent_transactions_enabled() && !lane_gate::claim(&self.relayer().id, &tx.id)
+        {
+            info!("relayer already has a transaction in flight, must wait");
+            return Ok(tx);
+        }
+
+        debug!("preparing transaction {}", tx.id);
 
         // Call core preparation logic with error handling
         match self.prepare_core(tx.clone()).await {
@@ -70,7 +89,7 @@ where
         // Simple dispatch to appropriate processing function based on input type
         match &stellar_data.transaction_input {
             TransactionInput::Operations(_) => {
-                info!("Preparing operations-based transaction {}", tx.id);
+                debug!("preparing operations-based transaction {}", tx.id);
                 let stellar_data_with_sim = operations::process_operations(
                     self.transaction_counter_service(),
                     &self.relayer().id,
@@ -85,7 +104,7 @@ where
                     .await
             }
             TransactionInput::UnsignedXdr(_) => {
-                info!("Preparing unsigned XDR transaction {}", tx.id);
+                debug!("preparing unsigned xdr transaction {}", tx.id);
                 let stellar_data_with_sim = unsigned_xdr::process_unsigned_xdr(
                     self.transaction_counter_service(),
                     &self.relayer().id,
@@ -99,7 +118,7 @@ where
                     .await
             }
             TransactionInput::SignedXdr { .. } => {
-                info!("Preparing fee-bump transaction {}", tx.id);
+                debug!("preparing fee-bump transaction {}", tx.id);
                 let stellar_data_with_fee_bump = fee_bump::process_fee_bump(
                     &self.relayer().address,
                     stellar_data,
@@ -144,32 +163,23 @@ where
         tx: TransactionRepoModel,
         error: TransactionError,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        let error_reason = format!("Preparation failed: {}", error);
+        let error_reason = format!("Preparation failed: {error}");
         let tx_id = tx.id.clone(); // Clone the ID before moving tx
-        warn!("Transaction {} preparation failed: {}", tx_id, error_reason);
+        warn!(reason = %error_reason, "transaction preparation failed");
 
         // Step 1: Sync sequence from chain to recover from any potential sequence drift
         if let Ok(stellar_data) = tx.network_data.get_stellar_transaction_data() {
-            info!(
-                "Syncing sequence from chain after failed transaction {} preparation",
-                tx_id
-            );
+            info!("syncing sequence from chain after failed transaction preparation");
             // Always sync from chain on preparation failure to ensure correct sequence state
             match self
                 .sync_sequence_from_chain(&stellar_data.source_account)
                 .await
             {
                 Ok(()) => {
-                    info!(
-                        "Successfully synced sequence from chain for transaction {}",
-                        tx_id
-                    );
+                    info!("successfully synced sequence from chain");
                 }
                 Err(sync_error) => {
-                    warn!(
-                        "Failed to sync sequence from chain for transaction {}: {}",
-                        tx_id, sync_error
-                    );
+                    warn!(error = %sync_error, "failed to sync sequence from chain");
                 }
             }
         }
@@ -186,30 +196,24 @@ where
         {
             Ok(updated_tx) => updated_tx,
             Err(finalize_error) => {
-                warn!(
-                    "Failed to mark transaction {} as failed: {}. Proceeding with lane cleanup.",
-                    tx_id, finalize_error
-                );
+                warn!(error = %finalize_error, "failed to mark transaction as failed, proceeding with lane cleanup");
                 // Continue with cleanup even if we can't update the transaction
                 tx
             }
         };
 
-        // Step 3: Attempt to enqueue next pending transaction or release lane
-        if let Err(enqueue_error) = self.enqueue_next_pending_transaction(&tx_id).await {
-            warn!(
-                "Failed to enqueue next pending transaction after {} failure: {}. Releasing lane directly.",
-                tx_id, enqueue_error
-            );
-            // Fallback: release lane directly if we can't hand it over
-            lane_gate::free(&self.relayer().id, &tx_id);
+        // Step 3: Handle lane cleanup (only needed in sequential mode)
+        if !self.concurrent_transactions_enabled() {
+            // In sequential mode, attempt to hand off to next transaction or release lane
+            if let Err(enqueue_error) = self.enqueue_next_pending_transaction(&tx_id).await {
+                warn!(error = %enqueue_error, "failed to enqueue next pending transaction after failure, releasing lane directly");
+                // Fallback: release lane directly if we can't hand it over
+                lane_gate::free(&self.relayer().id, &tx_id);
+            }
         }
 
         // Step 4: Log failure for monitoring (prepare_fail_total metric would go here)
-        info!(
-            "Transaction {} preparation failure handled. Lane cleaned up. Error: {}",
-            tx_id, error_reason
-        );
+        info!(error = %error_reason, "transaction preparation failure handled, lane cleaned up");
 
         // Step 5: Return original error to maintain API compatibility
         Err(error)
@@ -224,6 +228,7 @@ mod prepare_transaction_tests {
     use crate::{
         domain::SignTransactionResponse,
         models::{NetworkTransactionData, OperationSpec, RepositoryError, TransactionStatus},
+        services::provider::ProviderError,
     };
     use soroban_rs::xdr::{Limits, ReadXdr, TransactionEnvelope};
 
@@ -731,7 +736,11 @@ mod prepare_transaction_tests {
             .expect_simulate_transaction_envelope()
             .times(1)
             .returning(|_| {
-                Box::pin(async { Err(eyre::eyre!("Simulation failed: insufficient resources")) })
+                Box::pin(async {
+                    Err(ProviderError::Other(
+                        "Simulation failed: insufficient resources".to_string(),
+                    ))
+                })
             });
 
         // Mock transaction update for failure
@@ -876,10 +885,142 @@ mod prepare_transaction_tests {
 mod refactoring_tests {
     use crate::domain::transaction::stellar::prepare::common::update_and_notify_transaction;
     use crate::domain::transaction::stellar::test_helpers::*;
+    use crate::domain::{stellar::lane_gate, SignTransactionResponse};
     use crate::models::{
         NetworkTransactionData, RepositoryError, StellarTransactionData, TransactionInput,
         TransactionStatus,
     };
+    use std::future::ready;
+
+    #[tokio::test]
+    async fn test_prepare_with_concurrent_mode_no_lane_claiming() {
+        // With concurrent transactions enabled, prepare should NOT claim lanes
+        let mut relayer = create_test_relayer();
+        if let crate::models::RelayerNetworkPolicy::Stellar(ref mut policy) = relayer.policies {
+            policy.concurrent_transactions = Some(true);
+        }
+        let mut mocks = default_test_mocks();
+
+        // Setup mocks for successful prepare
+        mocks
+            .counter
+            .expect_get_and_increment()
+            .returning(|_, _| Box::pin(ready(Ok(1))));
+
+        mocks.signer.expect_sign_transaction().returning(|_| {
+            Box::pin(async {
+                Ok(SignTransactionResponse::Stellar(
+                    crate::domain::SignTransactionResponseStellar {
+                        signature: dummy_signature(),
+                    },
+                ))
+            })
+        });
+
+        mocks.tx_repo.expect_partial_update().returning(|id, upd| {
+            let mut tx = create_test_transaction("relayer-1");
+            tx.id = id;
+            tx.status = upd.status.unwrap();
+            tx.network_data = upd.network_data.unwrap();
+            Ok::<_, RepositoryError>(tx)
+        });
+
+        mocks
+            .job_producer
+            .expect_produce_submit_transaction_job()
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        mocks
+            .job_producer
+            .expect_produce_send_notification_job()
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+        let tx = create_test_transaction(&relayer.id);
+
+        // In concurrent mode, another transaction should be able to claim the lane
+        // even while this one is being processed
+        let other_tx_id = "concurrent-tx";
+        assert!(lane_gate::claim(&relayer.id, other_tx_id));
+
+        // Prepare should succeed without claiming the lane
+        let result = handler.prepare_transaction_impl(tx).await;
+        assert!(result.is_ok());
+
+        // Cleanup
+        lane_gate::free(&relayer.id, other_tx_id);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_failure_with_concurrent_mode_no_lane_cleanup() {
+        // With concurrent transactions enabled, prepare failure should NOT manage lanes
+        let mut relayer = create_test_relayer();
+        if let crate::models::RelayerNetworkPolicy::Stellar(ref mut policy) = relayer.policies {
+            policy.concurrent_transactions = Some(true);
+        }
+        let mut mocks = default_test_mocks();
+
+        // Mock sequence counter to fail
+        mocks.counter.expect_get_and_increment().returning(|_, _| {
+            Box::pin(ready(Err(RepositoryError::Unknown(
+                "Counter error".to_string(),
+            ))))
+        });
+
+        // Mock sync_sequence_from_chain for error recovery
+        mocks.provider.expect_get_account().returning(|_| {
+            Box::pin(async {
+                use soroban_rs::xdr::{
+                    AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, String32,
+                    Thresholds, Uint256,
+                };
+                use stellar_strkey::ed25519;
+
+                let pk = ed25519::PublicKey::from_string(TEST_PK).unwrap();
+                let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
+
+                Ok(AccountEntry {
+                    account_id,
+                    balance: 1000000,
+                    seq_num: SequenceNumber(0),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 1, 1, 1]),
+                    signers: Default::default(),
+                    ext: AccountEntryExt::V0,
+                })
+            })
+        });
+
+        mocks
+            .counter
+            .expect_set()
+            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+
+        // Mock finalize_transaction_state for failure
+        mocks.tx_repo.expect_partial_update().returning(|id, upd| {
+            let mut tx = create_test_transaction("relayer-1");
+            tx.id = id;
+            tx.status = upd.status.unwrap();
+            Ok::<_, RepositoryError>(tx)
+        });
+
+        mocks
+            .job_producer
+            .expect_produce_send_notification_job()
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        // In concurrent mode, should NOT look for pending transactions
+        mocks.tx_repo.expect_find_by_status().times(0); // Should not be called
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+        let tx = create_test_transaction(&relayer.id);
+
+        let result = handler.prepare_transaction_impl(tx).await;
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn test_update_and_notify_transaction_consistency() {

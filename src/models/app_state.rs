@@ -12,17 +12,17 @@ use crate::{
         TransactionRepoModel,
     },
     repositories::{
-        NetworkRepository, NetworkRepositoryStorage, NotificationRepositoryStorage,
-        PluginRepositoryStorage, PluginRepositoryTrait, RelayerRepository,
-        RelayerRepositoryStorage, Repository, SignerRepositoryStorage,
-        TransactionCounterRepositoryStorage, TransactionCounterTrait, TransactionRepository,
-        TransactionRepositoryStorage,
+        ApiKeyRepositoryStorage, ApiKeyRepositoryTrait, NetworkRepository,
+        NetworkRepositoryStorage, NotificationRepositoryStorage, PluginRepositoryStorage,
+        PluginRepositoryTrait, RelayerRepository, RelayerRepositoryStorage, Repository,
+        SignerRepositoryStorage, TransactionCounterRepositoryStorage, TransactionCounterTrait,
+        TransactionRepository, TransactionRepositoryStorage,
     },
 };
 
 /// Represents the application state, holding various repositories and services
 /// required for the application's operation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AppState<
     J: JobProducerTrait + Send + Sync + 'static,
     RR: RelayerRepository + Repository<RelayerRepoModel, String> + Send + Sync + 'static,
@@ -32,6 +32,7 @@ pub struct AppState<
     SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
     TCR: TransactionCounterTrait + Send + Sync + 'static,
     PR: PluginRepositoryTrait + Send + Sync + 'static,
+    AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
 > {
     /// Repository for managing relayer data.
     pub relayer_repository: Arc<RR>,
@@ -49,11 +50,41 @@ pub struct AppState<
     pub job_producer: Arc<J>,
     /// Repository for managing plugins.
     pub plugin_repository: Arc<PR>,
+    /// Repository for managing api keys.
+    pub api_key_repository: Arc<AKR>,
+}
+
+// Manual Clone implementation since all fields are Arc (cheap to clone)
+impl<J, RR, TR, NR, NFR, SR, TCR, PR, AKR> Clone for AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>
+where
+    J: JobProducerTrait + Send + Sync + 'static,
+    RR: RelayerRepository + Repository<RelayerRepoModel, String> + Send + Sync + 'static,
+    TR: TransactionRepository + Repository<TransactionRepoModel, String> + Send + Sync + 'static,
+    NR: NetworkRepository + Repository<NetworkRepoModel, String> + Send + Sync + 'static,
+    NFR: Repository<NotificationRepoModel, String> + Send + Sync + 'static,
+    SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
+    TCR: TransactionCounterTrait + Send + Sync + 'static,
+    PR: PluginRepositoryTrait + Send + Sync + 'static,
+    AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            job_producer: Arc::clone(&self.job_producer),
+            relayer_repository: Arc::clone(&self.relayer_repository),
+            transaction_repository: Arc::clone(&self.transaction_repository),
+            signer_repository: Arc::clone(&self.signer_repository),
+            notification_repository: Arc::clone(&self.notification_repository),
+            network_repository: Arc::clone(&self.network_repository),
+            transaction_counter_store: Arc::clone(&self.transaction_counter_store),
+            plugin_repository: Arc::clone(&self.plugin_repository),
+            api_key_repository: Arc::clone(&self.api_key_repository),
+        }
+    }
 }
 
 /// type alias for the app state wrapped in a ThinData to avoid clippy warnings
-pub type ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR> =
-    ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR>>;
+pub type ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR> =
+    ThinData<AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>;
 
 pub type DefaultAppState = AppState<
     JobProducer,
@@ -64,6 +95,7 @@ pub type DefaultAppState = AppState<
     SignerRepositoryStorage,
     TransactionCounterRepositoryStorage,
     PluginRepositoryStorage,
+    ApiKeyRepositoryStorage,
 >;
 
 impl<
@@ -75,7 +107,8 @@ impl<
         SR: Repository<SignerRepoModel, String> + Send + Sync + 'static,
         TCR: TransactionCounterTrait + Send + Sync + 'static,
         PR: PluginRepositoryTrait + Send + Sync + 'static,
-    > AppState<J, RR, TR, NR, NFR, SR, TCR, PR>
+        AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
+    > AppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>
 {
     /// Returns a clone of the relayer repository.
     ///
@@ -148,6 +181,15 @@ impl<
     pub fn plugin_repository(&self) -> Arc<PR> {
         Arc::clone(&self.plugin_repository)
     }
+
+    /// Returns a clone of the api key repository.
+    ///
+    /// # Returns
+    ///
+    /// An `Arc` pointing to the `InMemoryApiKeyRepository`.
+    pub fn api_key_repository(&self) -> Arc<AKR> {
+        Arc::clone(&self.api_key_repository)
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +208,7 @@ mod tests {
         SignerRepositoryStorage,
         TransactionCounterRepositoryStorage,
         PluginRepositoryStorage,
+        ApiKeyRepositoryStorage,
     > {
         // Create a mock job producer
         let mut mock_job_producer = MockJobProducerTrait::new();
@@ -198,6 +241,7 @@ mod tests {
             ),
             job_producer: Arc::new(mock_job_producer),
             plugin_repository: Arc::new(PluginRepositoryStorage::new_in_memory()),
+            api_key_repository: Arc::new(ApiKeyRepositoryStorage::new_in_memory()),
         }
     }
 
@@ -270,5 +314,15 @@ mod tests {
 
         assert!(Arc::ptr_eq(&store1, &store2));
         assert!(Arc::ptr_eq(&store1, &app_state.plugin_repository));
+    }
+
+    #[test]
+    fn test_api_key_repository_getter() {
+        let app_state = create_test_app_state();
+        let repo1 = app_state.api_key_repository();
+        let repo2 = app_state.api_key_repository();
+
+        assert!(Arc::ptr_eq(&repo1, &repo2));
+        assert!(Arc::ptr_eq(&repo1, &app_state.api_key_repository));
     }
 }

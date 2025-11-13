@@ -75,7 +75,7 @@ fn parse_destination_address(destination: &str) -> Result<XdrMuxedAccount, Signe
     } else {
         // fall-back to plain G... public key
         let pk = PublicKey::from_string(destination)
-            .map_err(|e| SignerError::ConversionError(format!("Invalid destination: {}", e)))?;
+            .map_err(|e| SignerError::ConversionError(format!("Invalid destination: {e}")))?;
         Ok(XdrMuxedAccount::Ed25519(Uint256(pk.0)))
     }
 }
@@ -103,7 +103,7 @@ fn decode_xdr_auth_entries(
         .iter()
         .map(|xdr_str| {
             SorobanAuthorizationEntry::from_xdr_base64(xdr_str, Limits::none())
-                .map_err(|e| SignerError::ConversionError(format!("Invalid auth XDR: {}", e)))
+                .map_err(|e| SignerError::ConversionError(format!("Invalid auth XDR: {e}")))
         })
         .collect()
 }
@@ -153,9 +153,9 @@ fn build_auth_vector(
         None => generate_default_auth_entries(host_function)?,
     };
 
-    auth_entries.try_into().map_err(|e| {
-        SignerError::ConversionError(format!("Failed to convert auth entries: {:?}", e))
-    })
+    auth_entries
+        .try_into()
+        .map_err(|e| SignerError::ConversionError(format!("Failed to convert auth entries: {e:?}")))
 }
 
 /// Converts Payment operation spec to Operation
@@ -301,8 +301,9 @@ mod tests {
     use super::*;
     use crate::models::transaction::stellar::host_function::ContractSource;
     use soroban_rs::xdr::{
-        AccountId, ContractExecutable, ContractIdPreimage, ContractIdPreimageFromAddress,
-        CreateContractArgs, CreateContractArgsV2, Hash, PublicKey as XdrPublicKey, ScAddress,
+        AccountId, ContractExecutable, ContractId, ContractIdPreimage,
+        ContractIdPreimageFromAddress, CreateContractArgs, CreateContractArgsV2, Hash,
+        PublicKey as XdrPublicKey, ScAddress,
     };
 
     const TEST_PK: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -425,7 +426,7 @@ mod tests {
         #[test]
         fn test_invoke_contract() {
             let host_function = HostFunction::InvokeContract(soroban_rs::xdr::InvokeContractArgs {
-                contract_address: ScAddress::Contract(Hash([0u8; 32])),
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
                 function_name: soroban_rs::xdr::ScSymbol::try_from(b"test".to_vec()).unwrap(),
                 args: VecM::default(),
             });
@@ -509,7 +510,7 @@ mod tests {
         #[test]
         fn test_none_default_invoke_contract() {
             let host_function = HostFunction::InvokeContract(soroban_rs::xdr::InvokeContractArgs {
-                contract_address: ScAddress::Contract(Hash([0u8; 32])),
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
                 function_name: soroban_rs::xdr::ScSymbol::try_from(b"test".to_vec()).unwrap(),
                 args: VecM::default(),
             });

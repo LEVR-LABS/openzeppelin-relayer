@@ -34,7 +34,10 @@ use crate::{
 use apalis_cron::Schedule;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
 use utoipa::ToSchema;
 use validator::Validate;
 
@@ -47,8 +50,8 @@ pub enum RelayerNetworkType {
     Stellar,
 }
 
-impl std::fmt::Display for RelayerNetworkType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for RelayerNetworkType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             RelayerNetworkType::Evm => write!(f, "evm"),
             RelayerNetworkType::Solana => write!(f, "solana"),
@@ -74,6 +77,213 @@ impl From<RelayerNetworkType> for ConfigFileNetworkType {
             RelayerNetworkType::Solana => ConfigFileNetworkType::Solana,
             RelayerNetworkType::Stellar => ConfigFileNetworkType::Stellar,
         }
+    }
+}
+
+/// Health check failure type
+/// Represents transient validation failures during health checks
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(tag = "type", content = "details")]
+pub enum HealthCheckFailure {
+    /// Nonce synchronization failed during health check
+    NonceSyncFailed(String),
+    /// RPC endpoint validation failed
+    RpcValidationFailed(String),
+    /// Balance check failed (below minimum threshold)
+    BalanceCheckFailed(String),
+    /// Sequence number synchronization failed (Stellar)
+    SequenceSyncFailed(String),
+}
+
+impl Display for HealthCheckFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HealthCheckFailure::NonceSyncFailed(msg) => write!(f, "Nonce sync failed: {msg}"),
+            HealthCheckFailure::RpcValidationFailed(msg) => {
+                write!(f, "RPC validation failed: {msg}")
+            }
+            HealthCheckFailure::BalanceCheckFailed(msg) => {
+                write!(f, "Balance check failed: {msg}")
+            }
+            HealthCheckFailure::SequenceSyncFailed(msg) => {
+                write!(f, "Sequence sync failed: {msg}")
+            }
+        }
+    }
+}
+
+/// Reason for a relayer being disabled by the system
+/// This represents persistent state, converted from HealthCheckFailure when disabling
+#[derive(Debug, Clone, Deserialize, PartialEq, ToSchema)]
+#[serde(tag = "type", content = "details")]
+pub enum DisabledReason {
+    /// Nonce synchronization failed during initialization
+    NonceSyncFailed(String),
+    /// RPC endpoint validation failed
+    RpcValidationFailed(String),
+    /// Balance check failed (below minimum threshold)
+    BalanceCheckFailed(String),
+    /// Sequence number synchronization failed (Stellar)
+    SequenceSyncFailed(String),
+    /// Multiple failures occurred simultaneously
+    #[schema(value_type = Vec<String>)]
+    Multiple(Vec<DisabledReason>),
+}
+
+// Custom serialization that sanitizes error details for external exposure
+impl Serialize for DisabledReason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("DisabledReason", 2)?;
+
+        match self {
+            DisabledReason::NonceSyncFailed(_) => {
+                state.serialize_field("type", "NonceSyncFailed")?;
+                state.serialize_field("details", "Nonce synchronization failed")?;
+            }
+            DisabledReason::RpcValidationFailed(_) => {
+                state.serialize_field("type", "RpcValidationFailed")?;
+                state.serialize_field("details", "RPC endpoint validation failed")?;
+            }
+            DisabledReason::BalanceCheckFailed(_) => {
+                state.serialize_field("type", "BalanceCheckFailed")?;
+                state.serialize_field("details", "Insufficient balance")?;
+            }
+            DisabledReason::SequenceSyncFailed(_) => {
+                state.serialize_field("type", "SequenceSyncFailed")?;
+                state.serialize_field("details", "Sequence synchronization failed")?;
+            }
+            DisabledReason::Multiple(reasons) => {
+                state.serialize_field("type", "Multiple")?;
+                state.serialize_field("details", reasons)?;
+            }
+        }
+
+        state.end()
+    }
+}
+
+impl DisabledReason {
+    /// Convert from HealthCheckFailure to DisabledReason
+    pub fn from_health_failure(failure: HealthCheckFailure) -> Self {
+        match failure {
+            HealthCheckFailure::NonceSyncFailed(msg) => DisabledReason::NonceSyncFailed(msg),
+            HealthCheckFailure::RpcValidationFailed(msg) => {
+                DisabledReason::RpcValidationFailed(msg)
+            }
+            HealthCheckFailure::BalanceCheckFailed(msg) => DisabledReason::BalanceCheckFailed(msg),
+            HealthCheckFailure::SequenceSyncFailed(msg) => DisabledReason::SequenceSyncFailed(msg),
+        }
+    }
+
+    /// Create a DisabledReason from multiple health check failures
+    ///
+    /// Returns:
+    /// - None if the failures vector is empty
+    /// - Single variant if only one failure
+    /// - Multiple variant if there are multiple failures
+    pub fn from_health_failures(failures: Vec<HealthCheckFailure>) -> Option<Self> {
+        match failures.len() {
+            0 => None,
+            1 => Some(Self::from_health_failure(
+                failures.into_iter().next().unwrap(),
+            )),
+            _ => Some(DisabledReason::Multiple(
+                failures
+                    .into_iter()
+                    .map(Self::from_health_failure)
+                    .collect(),
+            )),
+        }
+    }
+
+    /// Create a reason from multiple DisabledReasons (for internal use)
+    ///
+    /// Returns:
+    /// - None if the failures vector is empty
+    /// - Single variant if only one failure
+    /// - Multiple variant if there are multiple failures
+    pub fn from_failures(failures: Vec<DisabledReason>) -> Option<Self> {
+        match failures.len() {
+            0 => None,
+            1 => Some(failures.into_iter().next().unwrap()),
+            _ => Some(DisabledReason::Multiple(failures)),
+        }
+    }
+
+    /// Get a human-readable description of the disabled reason
+    pub fn description(&self) -> String {
+        match self {
+            DisabledReason::NonceSyncFailed(e) => format!("Nonce sync failed: {e}"),
+            DisabledReason::RpcValidationFailed(e) => format!("RPC validation failed: {e}"),
+            DisabledReason::BalanceCheckFailed(e) => format!("Balance check failed: {e}"),
+            DisabledReason::SequenceSyncFailed(e) => format!("Sequence sync failed: {e}"),
+            DisabledReason::Multiple(reasons) => reasons
+                .iter()
+                .map(|r| r.description())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    /// Get a sanitized description safe for external exposure (API/webhooks)
+    /// Removes potentially sensitive information like URLs, keys, and detailed error messages
+    pub fn safe_description(&self) -> String {
+        match self {
+            DisabledReason::NonceSyncFailed(_) => "Nonce synchronization failed".to_string(),
+            DisabledReason::RpcValidationFailed(_) => "RPC endpoint validation failed".to_string(),
+            DisabledReason::BalanceCheckFailed(_) => "Insufficient balance".to_string(),
+            DisabledReason::SequenceSyncFailed(_) => "Sequence synchronization failed".to_string(),
+            DisabledReason::Multiple(reasons) => reasons
+                .iter()
+                .map(|r| r.safe_description())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    /// Check if two DisabledReason instances are the same variant type,
+    /// ignoring the error message details.
+    pub fn same_variant(&self, other: &Self) -> bool {
+        use std::mem::discriminant;
+
+        match (self, other) {
+            (DisabledReason::Multiple(a), DisabledReason::Multiple(b)) => {
+                // For Multiple, check if they have the same variant types in the same order
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.same_variant(y))
+            }
+            _ => discriminant(self) == discriminant(other),
+        }
+    }
+
+    /// Create a DisabledReason from an error string, attempting to categorize it
+    ///
+    /// This provides backward compatibility when converting from plain strings
+    pub fn from_error_string(error: String) -> Self {
+        let error_lower = error.to_lowercase();
+
+        if error_lower.contains("nonce") {
+            DisabledReason::NonceSyncFailed(error)
+        } else if error_lower.contains("rpc") {
+            DisabledReason::RpcValidationFailed(error)
+        } else if error_lower.contains("balance") {
+            DisabledReason::BalanceCheckFailed(error)
+        } else if error_lower.contains("sequence") {
+            DisabledReason::SequenceSyncFailed(error)
+        } else {
+            // Default to RPC validation for unrecognized errors
+            DisabledReason::RpcValidationFailed(error)
+        }
+    }
+}
+
+impl std::fmt::Display for DisabledReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.description())
     }
 }
 
@@ -169,6 +379,12 @@ impl SolanaAllowedTokensPolicy {
 }
 
 /// Solana fee payment strategy
+///
+/// Determines who pays transaction fees:
+/// - `User`: User must include fee payment to relayer in transaction (for custom RPC methods)
+/// - `Relayer`: Relayer pays all transaction fees (recommended for send transaction endpoint)
+///
+/// Default is `User`.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, ToSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SolanaFeePaymentStrategy {
@@ -234,6 +450,7 @@ pub struct RelayerSolanaPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_tokens: Option<Vec<SolanaAllowedTokensPolicy>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub fee_payment_strategy: Option<SolanaFeePaymentStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_margin_percentage: Option<f32>,
@@ -244,6 +461,7 @@ pub struct RelayerSolanaPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_allowed_fee_lamports: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub swap_config: Option<RelayerSolanaSwapConfig>,
 }
 
@@ -283,6 +501,8 @@ pub struct RelayerStellarPolicy {
     pub max_fee: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrent_transactions: Option<bool>,
 }
 
 /// Network-specific policy for relayers
@@ -438,10 +658,9 @@ impl Relayer {
                     RelayerNetworkPolicy::Solana(_) => "Solana",
                     RelayerNetworkPolicy::Stellar(_) => "Stellar",
                 };
-                let network_type_str = format!("{:?}", network_type);
+                let network_type_str = format!("{network_type:?}");
                 return Err(RelayerValidationError::InvalidPolicy(format!(
-                    "Network type {} does not match policy type {}",
-                    network_type_str, policy_type
+                    "Network type {network_type_str} does not match policy type {policy_type}"
                 )));
             }
             // No policies is fine
@@ -498,7 +717,7 @@ impl Relayer {
         if let Some(keys) = keys {
             let solana_pub_key_regex =
                 Regex::new(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$").map_err(|e| {
-                    RelayerValidationError::InvalidPolicy(format!("Regex compilation error: {}", e))
+                    RelayerValidationError::InvalidPolicy(format!("Regex compilation error: {e}"))
                 })?;
 
             for key in keys {
@@ -533,8 +752,7 @@ impl Relayer {
                 SolanaSwapStrategy::JupiterSwap | SolanaSwapStrategy::JupiterUltra => {
                     if self.network != "mainnet-beta" {
                         return Err(RelayerValidationError::InvalidPolicy(format!(
-                            "{:?} strategy is only supported on mainnet-beta",
-                            strategy
+                            "{strategy:?} strategy is only supported on mainnet-beta"
                         )));
                     }
                 }
@@ -641,7 +859,7 @@ impl Relayer {
     ) -> Result<Self, RelayerValidationError> {
         // 1. Convert current domain object to JSON
         let mut domain_json = serde_json::to_value(self).map_err(|e| {
-            RelayerValidationError::InvalidField(format!("Serialization error: {}", e))
+            RelayerValidationError::InvalidField(format!("Serialization error: {e}"))
         })?;
 
         // 2. Apply JSON Merge Patch
@@ -649,7 +867,7 @@ impl Relayer {
 
         // 3. Convert back to domain object
         let updated: Relayer = serde_json::from_value(domain_json).map_err(|e| {
-            RelayerValidationError::InvalidField(format!("Invalid result after patch: {}", e))
+            RelayerValidationError::InvalidField(format!("Invalid result after patch: {e}"))
         })?;
 
         // 4. Validate the final result
@@ -698,10 +916,10 @@ impl From<RelayerValidationError> for crate::models::ApiError {
             RelayerValidationError::EmptyName => "Name cannot be empty".to_string(),
             RelayerValidationError::EmptyNetwork => "Network cannot be empty".to_string(),
             RelayerValidationError::InvalidPolicy(msg) => {
-                format!("Invalid relayer policy: {}", msg)
+                format!("Invalid relayer policy: {msg}")
             }
             RelayerValidationError::InvalidRpcUrl(url) => {
-                format!("Invalid RPC URL: {}", url)
+                format!("Invalid RPC URL: {url}")
             }
             RelayerValidationError::InvalidRpcWeight => {
                 "RPC URL weight must be in range 0-100".to_string()
@@ -715,6 +933,140 @@ impl From<RelayerValidationError> for crate::models::ApiError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_disabled_reason_serialization_sanitizes_details() {
+        // Test that serialization removes sensitive error details
+        let reason = DisabledReason::RpcValidationFailed(
+            "Connection failed to https://mainnet.infura.io/v3/SECRET_API_KEY: timeout".to_string(),
+        );
+
+        let serialized = serde_json::to_string(&reason).unwrap();
+
+        // Should not contain the sensitive URL or API key
+        assert!(!serialized.contains("SECRET_API_KEY"));
+        assert!(!serialized.contains("infura.io"));
+
+        // Should contain generic description
+        assert!(serialized.contains("RPC endpoint validation failed"));
+    }
+
+    #[test]
+    fn test_disabled_reason_safe_description() {
+        let reason = DisabledReason::BalanceCheckFailed(
+            "Insufficient balance: 0.001 ETH but need 0.1 ETH at address 0x123...".to_string(),
+        );
+
+        let safe = reason.safe_description();
+
+        // Should not contain specific details
+        assert!(!safe.contains("0.001"));
+        assert!(!safe.contains("0x123"));
+        assert_eq!(safe, "Insufficient balance");
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_same_type_different_message() {
+        // Same variant type with different error messages should be considered the same
+        let reason1 = DisabledReason::RpcValidationFailed("Connection timeout".to_string());
+        let reason2 = DisabledReason::RpcValidationFailed("Connection refused".to_string());
+
+        assert!(
+            reason1.same_variant(&reason2),
+            "Same variant types with different messages should be considered the same"
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_different_types() {
+        // Different variant types should not be considered the same
+        let reason1 = DisabledReason::RpcValidationFailed("Error".to_string());
+        let reason2 = DisabledReason::BalanceCheckFailed("Error".to_string());
+
+        assert!(
+            !reason1.same_variant(&reason2),
+            "Different variant types should not be considered the same"
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_identical() {
+        // Identical reasons should obviously be the same variant
+        let reason1 = DisabledReason::NonceSyncFailed("Nonce error".to_string());
+        let reason2 = DisabledReason::NonceSyncFailed("Nonce error".to_string());
+
+        assert!(
+            reason1.same_variant(&reason2),
+            "Identical reasons should be the same variant"
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_multiple_same_order() {
+        // Multiple reasons with same variants in same order
+        let reason1 = DisabledReason::Multiple(vec![
+            DisabledReason::RpcValidationFailed("Error 1".to_string()),
+            DisabledReason::BalanceCheckFailed("Error 2".to_string()),
+        ]);
+        let reason2 = DisabledReason::Multiple(vec![
+            DisabledReason::RpcValidationFailed("Different error 1".to_string()),
+            DisabledReason::BalanceCheckFailed("Different error 2".to_string()),
+        ]);
+
+        assert!(
+            reason1.same_variant(&reason2),
+            "Multiple with same variant types in same order should be considered the same"
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_multiple_different_order() {
+        // Multiple reasons with same variants but different order
+        let reason1 = DisabledReason::Multiple(vec![
+            DisabledReason::RpcValidationFailed("Error".to_string()),
+            DisabledReason::BalanceCheckFailed("Error".to_string()),
+        ]);
+        let reason2 = DisabledReason::Multiple(vec![
+            DisabledReason::BalanceCheckFailed("Error".to_string()),
+            DisabledReason::RpcValidationFailed("Error".to_string()),
+        ]);
+
+        assert!(
+            !reason1.same_variant(&reason2),
+            "Multiple with different order should not be considered the same"
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_multiple_different_length() {
+        // Multiple reasons with different lengths
+        let reason1 = DisabledReason::Multiple(vec![DisabledReason::RpcValidationFailed(
+            "Error".to_string(),
+        )]);
+        let reason2 = DisabledReason::Multiple(vec![
+            DisabledReason::RpcValidationFailed("Error".to_string()),
+            DisabledReason::BalanceCheckFailed("Error".to_string()),
+        ]);
+
+        assert!(
+            !reason1.same_variant(&reason2),
+            "Multiple with different lengths should not be considered the same"
+        );
+    }
+
+    #[test]
+    fn test_disabled_reason_same_variant_single_vs_multiple() {
+        // Single reason vs Multiple should not be the same even if they contain the same variant
+        let reason1 = DisabledReason::RpcValidationFailed("Error".to_string());
+        let reason2 = DisabledReason::Multiple(vec![DisabledReason::RpcValidationFailed(
+            "Error".to_string(),
+        )]);
+
+        assert!(
+            !reason1.same_variant(&reason2),
+            "Single variant vs Multiple should not be considered the same"
+        );
+    }
 
     // ===== RelayerNetworkType Tests =====
 
@@ -1041,6 +1393,7 @@ mod tests {
             min_balance: Some(20000000),
             max_fee: Some(100000),
             timeout_seconds: Some(30),
+            concurrent_transactions: None,
         };
 
         let network_policy = RelayerNetworkPolicy::Stellar(stellar_policy.clone());

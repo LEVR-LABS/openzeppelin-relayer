@@ -13,13 +13,14 @@ use super::{DexStrategy, SwapParams, SwapResult};
 use crate::domain::relayer::RelayerError;
 use crate::models::{EncodedSerializedTransaction, JupiterSwapOptions};
 use crate::services::{
+    provider::{SolanaProvider, SolanaProviderError, SolanaProviderTrait},
+    signer::{SolanaSignTrait, SolanaSigner},
     JupiterService, JupiterServiceTrait, PrioritizationFeeLamports, PriorityLevelWitMaxLamports,
-    QuoteRequest, SolanaProvider, SolanaProviderError, SolanaProviderTrait, SolanaSignTrait,
-    SolanaSigner, SwapRequest,
+    QuoteRequest, SwapRequest,
 };
 use async_trait::async_trait;
-use log::info;
 use solana_sdk::transaction::VersionedTransaction;
+use tracing::debug;
 
 pub struct JupiterSwapDex<P, S, J>
 where
@@ -64,7 +65,7 @@ where
     J: JupiterServiceTrait + Send + Sync + 'static,
 {
     async fn execute_swap(&self, params: SwapParams) -> Result<SwapResult, RelayerError> {
-        info!("Executing Jupiter swap: {:?}", params);
+        debug!(params = ?params, "executing Jupiter swap");
 
         let quote = self
             .jupiter_service
@@ -75,8 +76,8 @@ where
                 slippage: params.slippage_percent as f32,
             })
             .await
-            .map_err(|e| RelayerError::DexError(format!("Failed to get Jupiter quote: {}", e)))?;
-        info!("Received quote: {:?}", quote);
+            .map_err(|e| RelayerError::DexError(format!("Failed to get Jupiter quote: {e}")))?;
+        debug!(quote = ?quote, "received quote");
 
         let swap_tx = self
             .jupiter_service
@@ -104,23 +105,19 @@ where
                     .map(|o| o.dynamic_compute_unit_limit.unwrap_or_default()),
             })
             .await
-            .map_err(|e| {
-                RelayerError::DexError(format!("Failed to get swap transaction: {}", e))
-            })?;
+            .map_err(|e| RelayerError::DexError(format!("Failed to get swap transaction: {e}")))?;
 
-        info!("Received swap transaction: {:?}", swap_tx);
+        debug!(swap_tx = ?swap_tx, "received swap transaction");
 
         let mut swap_tx = VersionedTransaction::try_from(EncodedSerializedTransaction::new(
             swap_tx.swap_transaction,
         ))
-        .map_err(|e| RelayerError::DexError(format!("Failed to decode swap transaction: {}", e)))?;
+        .map_err(|e| RelayerError::DexError(format!("Failed to decode swap transaction: {e}")))?;
         let signature = self
             .signer
             .sign(&swap_tx.message.serialize())
             .await
-            .map_err(|e| {
-                RelayerError::DexError(format!("Failed to sign Dex transaction: {}", e))
-            })?;
+            .map_err(|e| RelayerError::DexError(format!("Failed to sign Dex transaction: {e}")))?;
 
         swap_tx.signatures[0] = signature;
 
@@ -130,21 +127,21 @@ where
             .await
             .map_err(|e| match e {
                 SolanaProviderError::RpcError(err) => {
-                    RelayerError::ProviderError(format!("Failed to send transaction: {}", err))
+                    RelayerError::ProviderError(format!("Failed to send transaction: {err}"))
                 }
-                _ => RelayerError::ProviderError(format!("Unexpected error: {}", e)),
+                _ => RelayerError::ProviderError(format!("Unexpected error: {e}")),
             })?;
 
         // Wait for transaction confirmation
-        info!("Waiting for transaction confirmation: {}", signature);
+        debug!(signature = %signature, "waiting for transaction confirmation");
         self.provider
             .confirm_transaction(&signature)
             .await
             .map_err(|e| {
-                RelayerError::ProviderError(format!("Transaction failed to confirm: {}", e))
+                RelayerError::ProviderError(format!("Transaction failed to confirm: {e}"))
             })?;
 
-        info!("Transaction confirmed: {}", signature);
+        debug!(signature = %signature, "transaction confirmed");
 
         Ok(SwapResult {
             mint: params.source_mint,
@@ -162,8 +159,8 @@ mod tests {
     use crate::{
         models::SignerError,
         services::{
-            JupiterServiceError, MockJupiterServiceTrait, MockSolanaProviderTrait,
-            MockSolanaSignTrait, QuoteResponse, RoutePlan, SwapInfo, SwapResponse,
+            provider::MockSolanaProviderTrait, signer::MockSolanaSignTrait, JupiterServiceError,
+            MockJupiterServiceTrait, QuoteResponse, RoutePlan, SwapInfo, SwapResponse,
         },
     };
     use solana_sdk::signature::Signature;
