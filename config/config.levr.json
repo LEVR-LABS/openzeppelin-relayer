@@ -164,7 +164,6 @@
       "custom_rpc_urls": ["MONAD_TESTNET_RPC_URL_1"],
       "policies": {
         "min_balance": 1000000000000000000,
-        "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
     }
