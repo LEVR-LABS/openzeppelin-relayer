@@ -11,8 +11,7 @@ pub mod unsigned_xdr;
 use eyre::Result;
 use tracing::{debug, info, warn};
 
-use super::{lane_gate, StellarRelayerTransaction};
-use crate::domain::transaction::common::is_final_state;
+use super::{is_final_state, lane_gate, StellarRelayerTransaction};
 use crate::models::RelayerRepoModel;
 use crate::{
     jobs::JobProducerTrait,
@@ -26,7 +25,7 @@ use crate::{
 
 use common::{sign_and_finalize_transaction, update_and_notify_transaction};
 
-impl<R, T, J, S, P, C> StellarRelayerTransaction<R, T, J, S, P, C>
+impl<R, T, J, S, P, C, D> StellarRelayerTransaction<R, T, J, S, P, C, D>
 where
     R: Repository<RelayerRepoModel, String> + Send + Sync,
     T: TransactionRepository + Send + Sync,
@@ -34,6 +33,7 @@ where
     S: Signer + Send + Sync,
     P: StellarProviderTrait + Send + Sync,
     C: TransactionCounterTrait + Send + Sync,
+    D: crate::services::stellar_dex::StellarDexServiceTrait + Send + Sync + 'static,
 {
     /// Main preparation method with robust error handling and guaranteed lane cleanup.
     pub async fn prepare_transaction_impl(
@@ -88,6 +88,7 @@ where
         let stellar_data = tx.network_data.get_stellar_transaction_data()?;
 
         // Simple dispatch to appropriate processing function based on input type
+        let policy = self.relayer().policies.get_stellar_policy();
         match &stellar_data.transaction_input {
             TransactionInput::Operations(_) => {
                 debug!("preparing operations-based transaction {}", tx.id);
@@ -99,6 +100,7 @@ where
                     stellar_data,
                     self.provider(),
                     self.signer(),
+                    Some(&policy),
                 )
                 .await?;
                 self.finalize_with_signature(tx, stellar_data_with_sim)
@@ -113,6 +115,8 @@ where
                     stellar_data,
                     self.provider(),
                     self.signer(),
+                    Some(&policy),
+                    self.dex_service(),
                 )
                 .await?;
                 self.finalize_with_signature(tx, stellar_data_with_sim)
@@ -125,6 +129,8 @@ where
                     stellar_data,
                     self.provider(),
                     self.signer(),
+                    Some(&policy),
+                    self.dex_service(),
                 )
                 .await?;
                 update_and_notify_transaction(
@@ -164,7 +170,7 @@ where
         tx: TransactionRepoModel,
         error: TransactionError,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        let error_reason = format!("Preparation failed: {}", error);
+        let error_reason = format!("Preparation failed: {error}");
         let tx_id = tx.id.clone(); // Clone the ID before moving tx
         warn!(reason = %error_reason, "transaction preparation failed");
 
@@ -229,6 +235,7 @@ mod prepare_transaction_tests {
     use crate::{
         domain::SignTransactionResponse,
         models::{NetworkTransactionData, OperationSpec, RepositoryError, TransactionStatus},
+        services::provider::ProviderError,
     };
     use soroban_rs::xdr::{Limits, ReadXdr, TransactionEnvelope};
 
@@ -736,7 +743,11 @@ mod prepare_transaction_tests {
             .expect_simulate_transaction_envelope()
             .times(1)
             .returning(|_| {
-                Box::pin(async { Err(eyre::eyre!("Simulation failed: insufficient resources")) })
+                Box::pin(async {
+                    Err(ProviderError::Other(
+                        "Simulation failed: insufficient resources".to_string(),
+                    ))
+                })
             });
 
         // Mock transaction update for failure

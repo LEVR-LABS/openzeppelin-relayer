@@ -33,7 +33,10 @@ use crate::{
         BalanceResponse, SignDataRequest, SignDataResponse, SignTransactionExternalResponse,
         SignTransactionRequest, SignTypedDataRequest,
     },
-    jobs::{JobProducerTrait, RelayerHealthCheck, TransactionRequest, TransactionStatusCheck},
+    jobs::{
+        JobProducerTrait, RelayerHealthCheck, TransactionRequest, TransactionSend,
+        TransactionStatusCheck,
+    },
     models::{
         produce_relayer_disabled_payload, DeletePendingTransactionsResponse, DisabledReason,
         EvmNetwork, HealthCheckFailure, JsonRpcRequest, JsonRpcResponse, NetworkRepoModel,
@@ -189,8 +192,6 @@ where
         &self,
         transaction: TransactionRepoModel,
     ) -> Result<(), RelayerError> {
-        use crate::jobs::TransactionSend;
-
         let cancel_job = TransactionSend::cancel(
             transaction.id.clone(),
             transaction.relayer_id.clone(),
@@ -311,7 +312,7 @@ where
             .provider
             .get_transaction_count(&relayer_model.address)
             .await
-            .map_err(|e| RelayerError::ProviderError(format!("Failed to get nonce: {}", e)))?;
+            .map_err(|e| RelayerError::ProviderError(format!("Failed to get nonce: {e}")))?;
         let nonce_str = nonce_u256.to_string();
 
         let balance_response = self.get_balance().await?;
@@ -484,11 +485,8 @@ where
             }
         };
 
-        // Parse method and params from the EVM request
+        // Parse method and params from the EVM request (single unified variant)
         let (method, params_json) = match evm_request {
-            crate::models::EvmRpcRequest::GenericRpcRequest { method, params } => {
-                (method, serde_json::Value::String(params))
-            }
             crate::models::EvmRpcRequest::RawRpcRequest { method, params } => (method, params),
         };
 
@@ -629,6 +627,7 @@ where
 mod tests {
     use super::*;
     use crate::{
+        config::{EvmNetworkConfig, NetworkConfigCommon},
         jobs::MockJobProducerTrait,
         models::{
             EvmRpcRequest, EvmRpcResult, JsonRpcId, NetworkRepoModel, NetworkType,
@@ -671,8 +670,6 @@ mod tests {
     }
 
     fn create_test_network_repo_model() -> NetworkRepoModel {
-        use crate::config::{EvmNetworkConfig, NetworkConfigCommon};
-
         let config = EvmNetworkConfig {
             common: NetworkConfigCommon {
                 network: "mainnet".to_string(),
@@ -1682,9 +1679,11 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_getBalance".to_string(),
-                params: r#"["0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "latest"]"#.to_string(),
+                params: serde_json::Value::String(
+                    r#"["0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "latest"]"#.to_string(),
+                ),
             }),
             id: Some(JsonRpcId::Number(1)),
         };
@@ -1724,9 +1723,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_blockNumber".to_string(),
-                params: "[]".to_string(),
+                params: serde_json::Value::String("[]".to_string()),
             }),
             id: Some(JsonRpcId::Number(1)),
         };
@@ -1772,9 +1771,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_unsupportedMethod".to_string(),
-                params: "[]".to_string(),
+                params: serde_json::Value::String("[]".to_string()),
             }),
             id: Some(JsonRpcId::Number(1)),
         };
@@ -1819,9 +1818,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_getBalance".to_string(),
-                params: "[]".to_string(), // Missing address parameter
+                params: serde_json::Value::String("[]".to_string()), // Missing address parameter
             }),
             id: Some(JsonRpcId::Number(1)),
         };
@@ -1856,7 +1855,7 @@ mod tests {
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             params: NetworkRpcRequest::Solana(crate::models::SolanaRpcRequest::GetSupportedTokens(
-                crate::models::GetSupportedTokensRequestParams {},
+                crate::models::SolanaGetSupportedTokensRequestParams {},
             )),
             id: Some(JsonRpcId::Number(1)),
         };
@@ -2005,9 +2004,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "net_version".to_string(),
-                params: "[]".to_string(),
+                params: serde_json::Value::String("[]".to_string()),
             }),
             id: Some(JsonRpcId::Number(999)),
         };
@@ -2047,9 +2046,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_getBalance".to_string(),
-                params: r#"["invalid_address", "latest"]"#.to_string(),
+                params: serde_json::Value::String(r#"["invalid_address", "latest"]"#.to_string()),
             }),
             id: Some(JsonRpcId::Number(1)),
         };
@@ -2091,9 +2090,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_chainId".to_string(),
-                params: "[]".to_string(),
+                params: serde_json::Value::String("[]".to_string()),
             }),
             id: Some(JsonRpcId::Number(2)),
         };
@@ -2171,9 +2170,11 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_getBalance".to_string(),
-                params: r#"["0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "latest"]"#.to_string(),
+                params: serde_json::Value::String(
+                    r#"["0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "latest"]"#.to_string(),
+                ),
             }),
             id: Some(JsonRpcId::Number(4)),
         };
@@ -2256,9 +2257,9 @@ mod tests {
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "invalid_method".to_string(),
-                params: "{}".to_string(),
+                params: serde_json::Value::String("{}".to_string()),
             }),
             id: Some(JsonRpcId::Number(6)),
         };
@@ -2341,9 +2342,9 @@ mod tests {
         let request_id = u64::MAX;
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            params: NetworkRpcRequest::Evm(EvmRpcRequest::GenericRpcRequest {
+            params: NetworkRpcRequest::Evm(EvmRpcRequest::RawRpcRequest {
                 method: "eth_chainId".to_string(),
-                params: "[]".to_string(),
+                params: serde_json::Value::String("[]".to_string()),
             }),
             id: Some(JsonRpcId::Number(request_id as i64)),
         };
