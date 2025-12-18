@@ -1,7 +1,7 @@
 name: Openzeppelin Relayer CI/CD Pipeline
 on:
   push:
-    branches: [main, devops]
+    branches: [main, devops, levr-v1-staging]
     # paths:
     #     - "oracle/core/**"
 
@@ -14,12 +14,36 @@ env:
   ECS_SERVICE: openzeppeline
   ECS_TASK_DEFINITION_FAMILY: openzeppeline
   CONTAINER_NAME: openzeppeline
-  SECRET_NAME: levr-v1/oz-relayer
+  SECRET_NAME: levr-v1/openzeppeline-relayer
 
 jobs:
   build-and-push-ecr:
     runs-on: ubuntu-latest
     steps:
+      - name: check push branch
+        id: env_check
+        run: |
+          echo "Running on branch ${{ github.ref }}"
+
+          if   [ "${{ github.ref }}" = "refs/heads/devops" ]; then
+              echo "::set-output name=ENV_NAME_TAG::dev"
+              echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::AWS_ACCESS_KEY_ID"
+              echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::AWS_SECRET_ACCESS_KEY"
+              echo "::set-output name=AWS_ACCOUNT_ID::V1_DEV_AWS_ACCOUNT_ID"
+
+          elif [ "${{ github.ref }}" = "refs/heads/test" ]; then
+              echo "::set-output name=ENV_NAME_TAG::test"
+
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "::set-output name=ENV_NAME_TAG::prod"
+
+          elif [ "${{ github.ref }}" = "refs/heads/levr-v1-devops" ]; then
+              echo "::set-output name=ENV_NAME_TAG::levr-v1-staging"
+              echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::STAGING_AWS_ACCESS_KEY_ID"
+              echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::STAGING_AWS_SECRET_ACCESS_KEY"
+              echo "::set-output name=AWS_ACCOUNT_ID::STAGING_AWS_ACCOUNT_ID"
+
+          fi
       - name: Checkout code
         uses: actions/checkout@v2
 
@@ -30,8 +54,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ secrets[steps.env_check.outputs.AWS_ACCESS_KEY_ID_NAME] }}
+          aws-secret-access-key: ${{ secrets[steps.env_check.outputs.AWS_SECRET_ACCESS_KEY_NAME] }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Login to Amazon ECR
         id: login-ecr
@@ -117,7 +141,7 @@ jobs:
           context: .
           file: ./Dockerfile.production
           push: true
-          tags: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
+          tags: ${{ secrets[steps.env_check.outputs.AWS_ACCOUNT_ID] }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets[steps.env_check.outputs.AWS_ACCOUNT_ID] }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
 
       - name: Fill in the new image ID in the Amazon ECS task definition
         id: task-def
@@ -127,7 +151,7 @@ jobs:
           # task-definition-arn: task-definition-arn
           task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ secrets.V1_DEV_AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
+          image: ${{ secrets[steps.env_check.outputs.AWS_ACCOUNT_ID] }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
 
       - name: Deploy Amazon ECS task definition
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
