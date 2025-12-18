@@ -37,7 +37,7 @@ jobs:
           elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
               echo "::set-output name=ENV_NAME_TAG::prod"
 
-          elif [ "${{ github.ref }}" = "refs/heads/levr-v1-devops" ]; then
+          elif [ "${{ github.ref }}" = "refs/heads/levr-v1-staging" ]; then
               echo "::set-output name=ENV_NAME_TAG::levr-v1-staging"
               echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::STAGING_AWS_ACCESS_KEY_ID"
               echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::STAGING_AWS_SECRET_ACCESS_KEY"
