@@ -8,10 +8,22 @@
       "signer_id": "game_admin_1",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -27,10 +39,22 @@
       "signer_id": "game_admin_2",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -46,10 +70,22 @@
       "signer_id": "game_admin_3",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -65,10 +101,22 @@
       "signer_id": "liquidator_1",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -84,10 +132,22 @@
       "signer_id": "liquidator_2",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -103,10 +163,22 @@
       "signer_id": "liquidator_3",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -122,10 +194,22 @@
       "signer_id": "feed_provider_1",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -141,10 +225,22 @@
       "signer_id": "feed_provider_2",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -160,10 +256,22 @@
       "signer_id": "feed_provider_3",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -179,10 +287,22 @@
       "signer_id": "match_maker_1",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -198,10 +318,22 @@
       "signer_id": "match_maker_2",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
@@ -217,10 +349,22 @@
       "signer_id": "match_maker_3",
       "network_type": "evm",
       "custom_rpc_urls": [
-        "MONAD_TESTNET_RPC_URL_1",
-        "https://monad-testnet.drpc.org",
-        "https://rpc.ankr.com/monad_testnet",
-        "https://testnet-rpc.monad.xyz"
+        {
+          "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "https://monad-testnet.drpc.org",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc.ankr.com/monad_testnet",
+          "weight": 20
+        },
+        {
+          "url": "https://testnet-rpc.monad.xyz",
+          "weight": 20
+        }
       ],
       "policies": {
         "min_balance": 1000000000000000000,
