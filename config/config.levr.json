@@ -368,7 +368,6 @@
       ],
       "policies": {
         "min_balance": 1000000000000000000,
-        "eip1559_pricing": true,
         "gas_limit_estimation": true
       }
     }
