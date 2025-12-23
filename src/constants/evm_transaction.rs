@@ -8,7 +8,7 @@ pub const DEFAULT_TRANSACTION_SPEED: Speed = Speed::Fast;
 pub const DEFAULT_GAS_LIMIT: u64 = 21000;
 pub const ERC20_TRANSFER_GAS_LIMIT: u64 = 65_000;
 pub const ERC721_TRANSFER_GAS_LIMIT: u64 = 80_000;
-pub const COMPLEX_GAS_LIMIT: u64 = 200_000;
+pub const COMPLEX_GAS_LIMIT: u64 = 5_000_000;
 pub const GAS_TX_CREATE_CONTRACT: u64 = 53000;
 
 pub const GAS_TX_DATA_ZERO: u64 = 4; // Cost per zero byte in data
