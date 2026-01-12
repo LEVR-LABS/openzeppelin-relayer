@@ -248,7 +248,7 @@
         "gas_limit_estimation": true
       }
     },
-     {
+    {
       "id": "liquidator_10143_4",
       "name": "Liquidator 10143 4",
       "network": "monad-testnet",
@@ -279,7 +279,7 @@
         "gas_limit_estimation": true
       }
     },
-     {
+    {
       "id": "liquidator_10143_5",
       "name": "Liquidator 10143 5",
       "network": "monad-testnet",
@@ -777,7 +777,7 @@
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
-        "key_id": "1e97e6fa-f7fd-49c4-ac5b-509c941113285"
+        "key_id": "1e97e6fa-f7fd-49c4-ac5b-509c94111328"
       }
     }
   ],
