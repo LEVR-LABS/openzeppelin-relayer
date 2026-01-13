@@ -163,3 +163,96 @@ jobs:
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           # wait-for-service-stability: true
+
+      - name: Discord Notification - Openzeppelin Relayer Service Deployment
+        if: always()
+        run: |
+          # Determine status and color
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS="✅ Success"
+            COLOR=65280  # Green
+            DESCRIPTION="Successfully deployed Openzeppelin Relayer Service to ${{ steps.env_check.outputs.ENV_NAME_TAG }}"
+          elif [ "${{ job.status }}" == "failure" ]; then
+            STATUS="❌ Failed"
+            COLOR=16711680  # Red
+            DESCRIPTION="Failed to deploy Openzeppelin Relayer Service to ${{ steps.env_check.outputs.ENV_NAME_TAG }}"
+          elif [ "${{ job.status }}" == "cancelled" ]; then
+            STATUS="⏹️ Cancelled"
+            COLOR=16776960  # Yellow
+            DESCRIPTION="Openzeppelin Relayer Service deployment was cancelled"
+          else
+            STATUS="⚠️ Unknown"
+            COLOR=16776960  # Yellow
+            DESCRIPTION="Openzeppelin Relayer Service deployment status unknown"
+          fi
+
+          # Get commit message
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s" 2>/dev/null || echo "No commit message available")
+
+          # Prepare webhook payload
+          WEBHOOK_DATA=$(cat <<EOF
+          {
+            "username": "GitHub Actions - Openzeppelin Relayer Service",
+            "content": null,
+            "embeds": [
+              {
+                "type": "rich",
+                "title": "🚀 Openzeppelin Relayer Service Deployment: $STATUS",
+                "description": "$DESCRIPTION",
+                "color": $COLOR,
+                "fields": [
+                  {
+                    "name": "Service", 
+                    "value": "Openzeppelin Relayer Service", 
+                    "inline": true
+                  },
+                  {
+                    "name": "Environment", 
+                    "value": "${{ steps.env_check.outputs.ENV_NAME_TAG }}", 
+                    "inline": true
+                  },
+                  {
+                    "name": "Branch", 
+                    "value": "${{ github.ref_name }}", 
+                    "inline": true
+                  },
+                  {
+                    "name": "Commit", 
+                    "value": "[\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})", 
+                    "inline": true
+                  },
+                  {
+                    "name": "Image", 
+                    "value": "${{ env.ECR_REPOSITORY_APP }}:latest", 
+                    "inline": true
+                  },
+                  {
+                    "name": "Deployment Method", 
+                    "value": "ECS Service Update", 
+                    "inline": true
+                  },
+                  {
+                    "name": "Commit Message", 
+                    "value": "$COMMIT_MSG", 
+                    "inline": false
+                  }
+                ],
+                "author": {
+                  "name": "${{ github.actor }}",
+                  "url": "https://github.com/${{ github.actor }}",
+                  "icon_url": "https://avatars.githubusercontent.com/u/${{ github.actor_id }}?v=4"
+                },
+                "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+                "footer": {
+                  "text": "Openzeppelin Relayer Service CI/CD Pipeline"
+                }
+              }
+            ]
+          }
+          EOF
+          )
+
+          # Send webhook
+          RESPONSE=$(curl -H "Content-Type: application/json" -X POST -d "$WEBHOOK_DATA" ${{ secrets.DISCORD_WEBHOOK_URL }})
+          echo "Webhook server response: $RESPONSE"
