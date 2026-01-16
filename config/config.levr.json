@@ -363,7 +363,7 @@
         },
         {
           "url": "https://testnet-rpc.monad.xyz",
-          "weight": 21
+          "weight": 20
         }
       ],
       "policies": {
