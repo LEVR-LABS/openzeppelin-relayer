@@ -6391,10 +6391,13 @@ dependencies = [
  "num-bigint 0.4.6",
  "percent-encoding",
  "pin-project-lite",
+ "rustls 0.23.35",
+ "rustls-native-certs 0.8.2",
  "ryu",
  "sha1_smol",
  "socket2 0.6.1",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-util",
  "url",
 ]
