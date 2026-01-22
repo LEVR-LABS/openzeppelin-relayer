@@ -1,7 +1,7 @@
 name: Openzeppelin Relayer CI/CD Pipeline
 on:
   push:
-    branches: [main, devops, levr-v1-staging]
+    branches: [main, devops, levr-v1-staging, levr-v1-main]
     # paths:
     #     - "oracle/core/**"
 
@@ -35,8 +35,12 @@ jobs:
           elif [ "${{ github.ref }}" = "refs/heads/test" ]; then
               echo "::set-output name=ENV_NAME_TAG::test"
 
-          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          elif [ "${{ github.ref }}" = "refs/heads/levr-v1-main" ]; then
               echo "::set-output name=ENV_NAME_TAG::prod"
+              echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::PROD_AWS_ACCESS_KEY_ID"
+              echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::PROD_AWS_SECRET_ACCESS_KEY"
+              echo "::set-output name=AWS_ACCOUNT_ID::PROD_AWS_ACCOUNT_ID"
+              echo "::set-output name=CONFIG_NAME::config.prod.levr.json"
 
           elif [ "${{ github.ref }}" = "refs/heads/levr-v1-staging" ]; then
               echo "::set-output name=ENV_NAME_TAG::levr-v1-staging"

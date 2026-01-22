@@ -51,7 +51,7 @@ color-eyre = "0.6"
 apalis = { version = "0.7", features = ["limit", "retry", "catch-panic", "timeout"] }
 apalis-redis = { version = "0.7" }
 apalis-cron = { version = "0.7" }
-redis = { version = "0.32", features = ["aio", "connection-manager", "tokio-comp"] }
+redis = { version = "0.32", features = ["aio", "connection-manager", "tokio-comp", "tls-native-tls", "tokio-native-tls-comp"] }
 tokio = { version = "1.43", features = ["sync", "io-util", "time"] }
 rand = "0.9"
 parking_lot = "0.12"
@@ -99,6 +99,7 @@ k256 = { version = "0.13", features = ["ecdsa-core"]}
 solana-system-interface = { version = "2.0.0", features = ["bincode"] }
 cdp-sdk = "0.1.0"
 reqwest-middleware = { version = "0.4.2", default-features = false, features = ["json"] }
+url = "2"
 
 [dev-dependencies]
 cargo-llvm-cov = "0.6"
