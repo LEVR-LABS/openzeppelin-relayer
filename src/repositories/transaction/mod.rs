@@ -29,7 +29,7 @@ use crate::{
     models::{
         NetworkTransactionData, TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
-    repositories::*,
+    repositories::{BatchDeleteResult, TransactionDeleteRequest, *},
 };
 use async_trait::async_trait;
 use eyre::Result;
@@ -123,6 +123,38 @@ pub trait TransactionRepository: Repository<TransactionRepoModel, String> {
         relayer_id: &str,
         statuses: &[TransactionStatus],
     ) -> Result<u64, RepositoryError>;
+
+    /// Delete multiple transactions by their IDs in a single batch operation.
+    ///
+    /// This is more efficient than calling `delete_by_id` multiple times as it
+    /// reduces the number of round-trips to the storage backend.
+    ///
+    /// Note: This method requires fetching transaction data first to clean up indexes.
+    /// If you already have transaction data, use `delete_by_requests` instead for
+    /// better performance.
+    ///
+    /// # Arguments
+    /// * `ids` - List of transaction IDs to delete
+    ///
+    /// # Returns
+    /// * `BatchDeleteResult` containing the count of successful deletions and any failures
+    async fn delete_by_ids(&self, ids: Vec<String>) -> Result<BatchDeleteResult, RepositoryError>;
+
+    /// Delete multiple transactions using pre-extracted data.
+    ///
+    /// This is the most efficient batch delete method as it doesn't require
+    /// re-fetching transaction data. Use this when you already have the transaction
+    /// data (e.g., from a previous query).
+    ///
+    /// # Arguments
+    /// * `requests` - List of delete requests containing transaction data needed for cleanup
+    ///
+    /// # Returns
+    /// * `BatchDeleteResult` containing the count of successful deletions and any failures
+    async fn delete_by_requests(
+        &self,
+        requests: Vec<TransactionDeleteRequest>,
+    ) -> Result<BatchDeleteResult, RepositoryError>;
 }
 
 #[cfg(test)]
@@ -154,7 +186,8 @@ mockall::mock! {
       async fn set_sent_at(&self, tx_id: String, sent_at: String) -> Result<TransactionRepoModel, RepositoryError>;
       async fn set_confirmed_at(&self, tx_id: String, confirmed_at: String) -> Result<TransactionRepoModel, RepositoryError>;
       async fn count_by_status(&self, relayer_id: &str, statuses: &[TransactionStatus]) -> Result<u64, RepositoryError>;
-
+      async fn delete_by_ids(&self, ids: Vec<String>) -> Result<BatchDeleteResult, RepositoryError>;
+      async fn delete_by_requests(&self, requests: Vec<TransactionDeleteRequest>) -> Result<BatchDeleteResult, RepositoryError>;
   }
 }
 
@@ -177,6 +210,24 @@ impl TransactionRepositoryStorage {
             connection_manager,
             key_prefix,
         )?))
+    }
+
+    /// Returns the underlying connection manager and key prefix if this is a persistent storage backend.
+    ///
+    /// This is useful for operations that need direct storage access, such as
+    /// distributed locking. The key prefix is used to namespace keys for multi-tenant
+    /// deployments. Currently supports Redis, but the design allows for future backends.
+    ///
+    /// # Returns
+    /// * `Some((connection, prefix))` - If using persistent storage (e.g., Redis)
+    /// * `None` - If using in-memory storage
+    pub fn connection_info(&self) -> Option<(Arc<ConnectionManager>, &str)> {
+        match self {
+            TransactionRepositoryStorage::InMemory(_) => None,
+            TransactionRepositoryStorage::Redis(repo) => {
+                Some((repo.client.clone(), &repo.key_prefix))
+            }
+        }
     }
 }
 
@@ -325,6 +376,23 @@ impl TransactionRepository for TransactionRepositoryStorage {
             }
         }
     }
+
+    async fn delete_by_ids(&self, ids: Vec<String>) -> Result<BatchDeleteResult, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => repo.delete_by_ids(ids).await,
+            TransactionRepositoryStorage::Redis(repo) => repo.delete_by_ids(ids).await,
+        }
+    }
+
+    async fn delete_by_requests(
+        &self,
+        requests: Vec<TransactionDeleteRequest>,
+    ) -> Result<BatchDeleteResult, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => repo.delete_by_requests(requests).await,
+            TransactionRepositoryStorage::Redis(repo) => repo.delete_by_requests(requests).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -405,14 +473,16 @@ impl Repository<TransactionRepoModel, String> for TransactionRepositoryStorage {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use color_eyre::Result;
+    use redis::Client;
+
     use super::*;
     use crate::models::{
         EvmTransactionData, NetworkTransactionData, TransactionStatus, TransactionUpdateRequest,
     };
     use crate::repositories::PaginationQuery;
     use crate::utils::mocks::mockutils::create_mock_transaction;
-    use chrono::Utc;
-    use color_eyre::Result;
 
     fn create_test_transaction(id: &str, relayer_id: &str) -> TransactionRepoModel {
         let mut transaction = create_mock_transaction();
@@ -470,6 +540,39 @@ mod tests {
                 panic!("Expected InMemory variant, got Redis");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_connection_info_returns_none_for_in_memory() {
+        let storage = TransactionRepositoryStorage::new_in_memory();
+
+        // In-memory storage should return None for connection_info
+        assert!(storage.connection_info().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_connection_info_returns_some_for_redis() -> Result<()> {
+        let redis_url = std::env::var("REDIS_TEST_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let client = Client::open(redis_url)?;
+        let connection_manager = ConnectionManager::new(client).await?;
+        let connection_manager = Arc::new(connection_manager);
+        let key_prefix = "test_prefix".to_string();
+
+        let storage = TransactionRepositoryStorage::new_redis(
+            connection_manager.clone(),
+            key_prefix.clone(),
+        )?;
+
+        let (returned_connection, returned_prefix) = storage
+            .connection_info()
+            .expect("Expected Redis connection info");
+
+        assert!(Arc::ptr_eq(&connection_manager, &returned_connection));
+        assert_eq!(returned_prefix, key_prefix);
+
+        Ok(())
     }
 
     #[tokio::test]
