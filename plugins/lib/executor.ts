@@ -33,14 +33,19 @@ import { LogInterceptor } from './logger';
  * Now includes pluginId as a separate argument
  */
 function extractCliArguments() {
-  // Get arguments: [node, executor.ts, socketPath, pluginId, paramsJson, userScriptPath]
+  // Get arguments: [node, executor.ts, socketPath, pluginId, paramsJson, userScriptPath, httpRequestId, headersJson, route, configJson, method, queryJson]
   const socketPath = process.argv[2];
   const pluginId = process.argv[3]; // NEW: Plugin ID as separate arg
   const paramsJson = process.argv[4]; // Shifted from argv[3]
   const userScriptPath = process.argv[5]; // Shifted from argv[4]
   const httpRequestId = process.argv[6]; // original HTTP request id
+  const headersJson = process.argv[7]; // HTTP headers as JSON (optional)
+  const route = process.argv[8]; // Wildcard route (optional)
+  const configJson = process.argv[9]; // Plugin config as JSON (optional)
+  const method = process.argv[10]; // HTTP method (optional)
+  const queryJson = process.argv[11]; // Query parameters as JSON (optional)
 
-  // Validate   required arguments
+  // Validate required arguments
   if (!socketPath) {
     throw new Error('Socket path is required (argument 1)');
   }
@@ -57,7 +62,7 @@ function extractCliArguments() {
     throw new Error('User script path is required (argument 4)');
   }
 
-  return { socketPath, pluginId, paramsJson, userScriptPath, httpRequestId };
+  return { socketPath, pluginId, paramsJson, userScriptPath, httpRequestId, headersJson, route, configJson, method, queryJson };
 }
 
 /**
@@ -68,6 +73,57 @@ function parsePluginParameters<T = any>(paramsJson: string): T {
     return JSON.parse(paramsJson) as T;
   } catch (error) {
     throw new Error(`Failed to parse plugin parameters JSON: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+/**
+ * Parse HTTP headers from JSON string
+ */
+function parseHeaders(headersJson: string | undefined): Record<string, string[]> | undefined {
+  if (!headersJson) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(headersJson) as Record<string, string[]>;
+  } catch {
+    // If parsing fails, return undefined (headers won't be available)
+    return undefined;
+  }
+}
+
+/**
+ * Parse plugin config from JSON string
+ * Config must be a JSON object (not array, string, or primitive)
+ */
+function parseConfig(configJson: string | undefined): Record<string, any> | undefined {
+  if (!configJson) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(configJson);
+    // Ensure config is an object (not array or primitive)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, any>;
+    }
+    return undefined;
+  } catch {
+    // If parsing fails, return undefined (config won't be available)
+    return undefined;
+  }
+}
+
+/**
+ * Parse query parameters from JSON string
+ */
+function parseQuery(queryJson: string | undefined): Record<string, string[]> | undefined {
+  if (!queryJson) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(queryJson) as Record<string, string[]>;
+  } catch {
+    // If parsing fails, return undefined (query won't be available)
+    return undefined;
   }
 }
 
@@ -83,13 +139,22 @@ async function main(): Promise<void> {
     logInterceptor.start();
 
     // Extract and validate CLI arguments including plugin ID
-    const { socketPath, pluginId, paramsJson, userScriptPath, httpRequestId } = extractCliArguments();
+    const { socketPath, pluginId, paramsJson, userScriptPath, httpRequestId, headersJson, route, configJson, method, queryJson } = extractCliArguments();
 
     // Parse plugin parameters
     const pluginParams = parsePluginParameters(paramsJson);
 
+    // Parse HTTP headers (optional)
+    const headers = parseHeaders(headersJson);
+
+    // Parse plugin config (optional)
+    const config = parseConfig(configJson);
+
+    // Parse query parameters (optional)
+    const query = parseQuery(queryJson);
+
     // Pass plugin ID as separate argument
-    const result = await runUserPlugin(socketPath, pluginId, pluginParams, userScriptPath, httpRequestId);
+    const result = await runUserPlugin(socketPath, pluginId, pluginParams, userScriptPath, httpRequestId, headers, route, config, method, query);
 
     // Add the result to LogInterceptor output
     logInterceptor.addResult(serializeResult(result));

@@ -40,6 +40,11 @@ pub trait PluginRunnerTrait {
         timeout_duration: Duration,
         script_params: String,
         http_request_id: Option<String>,
+        headers_json: Option<String>,
+        route: Option<String>,
+        config_json: Option<String>,
+        method: Option<String>,
+        query_json: Option<String>,
         state: Arc<ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<ScriptResult, PluginError>
     where
@@ -71,6 +76,11 @@ impl PluginRunnerTrait for PluginRunner {
         timeout_duration: Duration,
         script_params: String,
         http_request_id: Option<String>,
+        headers_json: Option<String>,
+        route: Option<String>,
+        config_json: Option<String>,
+        method: Option<String>,
+        query_json: Option<String>,
         state: Arc<ThinDataAppState<J, RR, TR, NR, NFR, SR, TCR, PR, AKR>>,
     ) -> Result<ScriptResult, PluginError>
     where
@@ -106,6 +116,11 @@ impl PluginRunnerTrait for PluginRunner {
                 socket_path_clone,
                 script_params,
                 http_request_id,
+                headers_json,
+                route,
+                config_json,
+                method,
+                query_json,
             ),
         )
         .await
@@ -203,6 +218,11 @@ mod tests {
                 Duration::from_secs(10),
                 "{ \"test\": \"test\" }".to_string(),
                 None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Arc::new(web::ThinData(state)),
             )
             .await;
@@ -260,6 +280,11 @@ mod tests {
                 script_path_str,
                 Duration::from_millis(100), // 100ms timeout
                 "{}".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
                 None,
                 Arc::new(web::ThinData(state)),
             )

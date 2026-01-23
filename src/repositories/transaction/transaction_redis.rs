@@ -6,7 +6,8 @@ use crate::models::{
 };
 use crate::repositories::redis_base::RedisRepository;
 use crate::repositories::{
-    BatchRetrievalResult, PaginatedResult, Repository, TransactionRepository,
+    BatchDeleteResult, BatchRetrievalResult, PaginatedResult, Repository, TransactionDeleteRequest,
+    TransactionRepository,
 };
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
@@ -18,9 +19,11 @@ use tracing::{debug, error, warn};
 const RELAYER_PREFIX: &str = "relayer";
 const TX_PREFIX: &str = "tx";
 const STATUS_PREFIX: &str = "status";
+const STATUS_SORTED_PREFIX: &str = "status_sorted";
 const NONCE_PREFIX: &str = "nonce";
 const TX_TO_RELAYER_PREFIX: &str = "tx_to_relayer";
 const RELAYER_LIST_KEY: &str = "relayer_list";
+const TX_BY_CREATED_AT_PREFIX: &str = "tx_by_created_at";
 
 #[derive(Clone)]
 pub struct RedisTransactionRepository {
@@ -63,11 +66,20 @@ impl RedisTransactionRepository {
         )
     }
 
-    /// Generate key for relayer status index: relayer:{relayer_id}:status:{status}
+    /// Generate key for relayer status index (legacy SET): relayer:{relayer_id}:status:{status}
     fn relayer_status_key(&self, relayer_id: &str, status: &TransactionStatus) -> String {
         format!(
             "{}:{}:{}:{}:{}",
             self.key_prefix, RELAYER_PREFIX, relayer_id, STATUS_PREFIX, status
+        )
+    }
+
+    /// Generate key for relayer status sorted index (SORTED SET): relayer:{relayer_id}:status_sorted:{status}
+    /// Score is created_at timestamp in milliseconds for efficient ordering.
+    fn relayer_status_sorted_key(&self, relayer_id: &str, status: &TransactionStatus) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.key_prefix, RELAYER_PREFIX, relayer_id, STATUS_SORTED_PREFIX, status
         )
     }
 
@@ -82,6 +94,39 @@ impl RedisTransactionRepository {
     /// Generate key for relayer list: relayer_list (set of all relayer IDs)
     fn relayer_list_key(&self) -> String {
         format!("{}:{}", self.key_prefix, RELAYER_LIST_KEY)
+    }
+
+    /// Generate key for relayer's sorted set by created_at: relayer:{relayer_id}:tx_by_created_at
+    fn relayer_tx_by_created_at_key(&self, relayer_id: &str) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.key_prefix, RELAYER_PREFIX, relayer_id, TX_BY_CREATED_AT_PREFIX
+        )
+    }
+
+    /// Parse timestamp string to score for sorted set (milliseconds since epoch)
+    fn timestamp_to_score(&self, timestamp: &str) -> f64 {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map(|dt| dt.timestamp_millis() as f64)
+            .unwrap_or_else(|_| {
+                warn!(timestamp = %timestamp, "failed to parse timestamp, using 0");
+                0.0
+            })
+    }
+
+    /// Compute the appropriate score for a transaction's status sorted set.
+    /// - For Confirmed status: use confirmed_at (on-chain confirmation order)
+    /// - For all other statuses: use created_at (queue/processing order)
+    fn status_sorted_score(&self, tx: &TransactionRepoModel) -> f64 {
+        if tx.status == TransactionStatus::Confirmed {
+            // For Confirmed, prefer confirmed_at for accurate on-chain ordering
+            if let Some(ref confirmed_at) = tx.confirmed_at {
+                return self.timestamp_to_score(confirmed_at);
+            }
+            // Fallback to created_at if confirmed_at not set (shouldn't happen)
+            warn!(tx_id = %tx.id, "Confirmed transaction missing confirmed_at, using created_at");
+        }
+        self.timestamp_to_score(&tx.created_at)
     }
 
     /// Batch fetch transactions by IDs using reverse lookup
@@ -187,6 +232,104 @@ impl RedisTransactionRepository {
         }
     }
 
+    /// Ensures the status sorted set exists, migrating from legacy SET if needed.
+    ///
+    /// This handles the transition from unordered SETs to sorted SETs for status indexing.
+    /// If the sorted set is empty but the legacy set has data, it migrates the data
+    /// by looking up each transaction's created_at timestamp to compute the score.
+    ///
+    /// # Concurrency
+    /// This function is safe for concurrent calls. If multiple calls race to migrate
+    /// the same status set:
+    /// - ZADD is idempotent (same member + score = no-op)
+    /// - DEL on non-existent key is safe (returns 0)
+    /// - After first successful migration, subsequent calls hit the fast path (ZCARD > 0)
+    ///
+    /// The only downside of concurrent migrations is wasted work, not data corruption.
+    ///
+    /// Returns the count of items in the sorted set after migration.
+    async fn ensure_status_sorted_set(
+        &self,
+        relayer_id: &str,
+        status: &TransactionStatus,
+    ) -> Result<u64, RepositoryError> {
+        let mut conn = self.client.as_ref().clone();
+        let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
+        let legacy_key = self.relayer_status_key(relayer_id, status);
+
+        // Always check if legacy set has data that needs migration
+        // Even if ZSET is non-empty (could be from partial migration failure or rolling deployment)
+        let legacy_count: u64 = conn
+            .scard(&legacy_key)
+            .await
+            .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_scard"))?;
+
+        if legacy_count == 0 {
+            // No legacy data to migrate, return current ZSET count
+            let sorted_count: u64 = conn
+                .zcard(&sorted_key)
+                .await
+                .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_zcard"))?;
+            return Ok(sorted_count);
+        }
+
+        // Migration needed: get all IDs from legacy set
+        debug!(
+            relayer_id = %relayer_id,
+            status = %status,
+            legacy_count = %legacy_count,
+            "migrating status set to sorted set"
+        );
+
+        let legacy_ids: Vec<String> = conn
+            .smembers(&legacy_key)
+            .await
+            .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_smembers"))?;
+
+        if legacy_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Fetch transactions to get their timestamps for scoring
+        let transactions = self.get_transactions_by_ids(&legacy_ids).await?;
+
+        if transactions.results.is_empty() {
+            // All transactions were stale/deleted, clean up legacy set
+            let _: () = conn
+                .del(&legacy_key)
+                .await
+                .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_del_stale"))?;
+            return Ok(0);
+        }
+
+        // Build sorted set entries and migrate atomically
+        // Use status-aware scoring: confirmed_at for Confirmed, created_at for others
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        for tx in &transactions.results {
+            let score = self.status_sorted_score(tx);
+            pipe.zadd(&sorted_key, &tx.id, score);
+        }
+
+        // Delete legacy set after migration
+        pipe.del(&legacy_key);
+
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_migrate"))?;
+
+        let migrated_count = transactions.results.len() as u64;
+        debug!(
+            relayer_id = %relayer_id,
+            status = %status,
+            migrated_count = %migrated_count,
+            "completed migration of status set to sorted set"
+        );
+
+        Ok(migrated_count)
+    }
+
     /// Update indexes atomically with comprehensive error handling
     async fn update_indexes(
         &self,
@@ -203,9 +346,16 @@ impl RedisTransactionRepository {
         let relayer_list_key = self.relayer_list_key();
         pipe.sadd(&relayer_list_key, &tx.relayer_id);
 
-        // Handle status index updates
-        let new_status_key = self.relayer_status_key(&tx.relayer_id, &tx.status);
-        pipe.sadd(&new_status_key, &tx.id);
+        // Compute scores for sorted sets
+        // Status sorted set: uses confirmed_at for Confirmed status, created_at for others
+        let status_score = self.status_sorted_score(tx);
+        // Global tx_by_created_at: always uses created_at for consistent ordering
+        let created_at_score = self.timestamp_to_score(&tx.created_at);
+
+        // Handle status index updates - write to SORTED SET (new format)
+        let new_status_sorted_key = self.relayer_status_sorted_key(&tx.relayer_id, &tx.status);
+        pipe.zadd(&new_status_sorted_key, &tx.id, status_score);
+        debug!(tx_id = %tx.id, status = %tx.status, score = %status_score, "added transaction to status sorted set");
 
         if let Some(nonce) = self.extract_nonce(&tx.network_data) {
             let nonce_key = self.relayer_nonce_key(&tx.relayer_id, nonce);
@@ -213,12 +363,24 @@ impl RedisTransactionRepository {
             debug!(tx_id = %tx.id, nonce = %nonce, "added nonce index for transaction");
         }
 
+        // Add to per-relayer sorted set by created_at (for efficient sorted pagination)
+        let relayer_sorted_key = self.relayer_tx_by_created_at_key(&tx.relayer_id);
+        pipe.zadd(&relayer_sorted_key, &tx.id, created_at_score);
+        debug!(tx_id = %tx.id, score = %created_at_score, "added transaction to sorted set by created_at");
+
         // Remove old indexes if updating
         if let Some(old) = old_tx {
             if old.status != tx.status {
-                let old_status_key = self.relayer_status_key(&old.relayer_id, &old.status);
-                pipe.srem(&old_status_key, &tx.id);
-                debug!(tx_id = %tx.id, old_status = %old.status, new_status = %tx.status, "removing old status index for transaction");
+                // Remove from old status sorted set (new format)
+                let old_status_sorted_key =
+                    self.relayer_status_sorted_key(&old.relayer_id, &old.status);
+                pipe.zrem(&old_status_sorted_key, &tx.id);
+
+                // Also clean up legacy SET if it exists (for migration cleanup)
+                let old_status_legacy_key = self.relayer_status_key(&old.relayer_id, &old.status);
+                pipe.srem(&old_status_legacy_key, &tx.id);
+
+                debug!(tx_id = %tx.id, old_status = %old.status, new_status = %tx.status, "removing old status indexes for transaction");
             }
 
             // Handle nonce index cleanup
@@ -250,9 +412,27 @@ impl RedisTransactionRepository {
 
         debug!(tx_id = %tx.id, "removing all indexes for transaction");
 
-        // Remove from status index
-        let status_key = self.relayer_status_key(&tx.relayer_id, &tx.status);
-        pipe.srem(&status_key, &tx.id);
+        // Remove from ALL possible status indexes to ensure complete cleanup
+        // This handles cases where a transaction might be in multiple status sets
+        // due to race conditions, partial failures, or bugs
+        for status in &[
+            TransactionStatus::Canceled,
+            TransactionStatus::Pending,
+            TransactionStatus::Sent,
+            TransactionStatus::Submitted,
+            TransactionStatus::Mined,
+            TransactionStatus::Confirmed,
+            TransactionStatus::Failed,
+            TransactionStatus::Expired,
+        ] {
+            // Remove from sorted status set (new format)
+            let status_sorted_key = self.relayer_status_sorted_key(&tx.relayer_id, status);
+            pipe.zrem(&status_sorted_key, &tx.id);
+
+            // Remove from legacy status set (for migration cleanup)
+            let status_legacy_key = self.relayer_status_key(&tx.relayer_id, status);
+            pipe.srem(&status_legacy_key, &tx.id);
+        }
 
         // Remove nonce index if exists
         if let Some(nonce) = self.extract_nonce(&tx.network_data) {
@@ -260,6 +440,11 @@ impl RedisTransactionRepository {
             pipe.del(&nonce_key);
             debug!(tx_id = %tx.id, nonce = %nonce, "removing nonce index for transaction");
         }
+
+        // Remove from per-relayer sorted set by created_at
+        let relayer_sorted_key = self.relayer_tx_by_created_at_key(&tx.relayer_id);
+        pipe.zrem(&relayer_sorted_key, &tx.id);
+        debug!(tx_id = %tx.id, "removing transaction from sorted set by created_at");
 
         // Remove reverse lookup
         let reverse_key = self.tx_to_relayer_key(&tx.id);
@@ -386,10 +571,11 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
         }
     }
 
+    // Unoptimized implementation of list_paginated. Rarely used. find_by_relayer_id is preferred.
     async fn list_all(&self) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
         let mut conn = self.client.as_ref().clone();
 
-        debug!("fetching all transaction IDs");
+        debug!("fetching all transactions sorted by created_at (newest first)");
 
         // Get all relayer IDs
         let relayer_list_key = self.relayer_list_key();
@@ -400,43 +586,31 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
         debug!(count = %relayer_ids.len(), "found relayers");
 
-        // Collect all transaction IDs from all relayers
-        let mut all_tx_ids = Vec::new();
+        // Collect all transactions from all relayers using their sorted sets
+        let mut all_transactions = Vec::new();
         for relayer_id in relayer_ids {
-            let pattern = format!(
-                "{}:{}:{}:{}:*",
-                self.key_prefix, RELAYER_PREFIX, relayer_id, TX_PREFIX
-            );
-            let mut cursor = 0;
-            loop {
-                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .cursor_arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| self.map_redis_error(e, "list_all_scan_keys"))?;
+            let relayer_sorted_key = self.relayer_tx_by_created_at_key(&relayer_id);
+            let tx_ids: Vec<String> = redis::cmd("ZRANGE")
+                .arg(&relayer_sorted_key)
+                .arg(0)
+                .arg(-1)
+                .arg("REV")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "list_all_relayer_sorted"))?;
 
-                // Extract transaction IDs from keys
-                for key in keys {
-                    if let Some(tx_id) = key.split(':').next_back() {
-                        all_tx_ids.push(tx_id.to_string());
-                    }
-                }
-
-                cursor = next_cursor;
-                if cursor == 0 {
-                    break;
-                }
-            }
+            let batch_result = self.get_transactions_by_ids(&tx_ids).await?;
+            all_transactions.extend(batch_result.results);
         }
 
-        debug!(count = %all_tx_ids.len(), "found transaction IDs");
+        // Sort all transactions by created_at (newest first)
+        all_transactions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-        let transactions = self.get_transactions_by_ids(&all_tx_ids).await?;
-        Ok(transactions.results)
+        debug!(count = %all_transactions.len(), "found transactions");
+        Ok(all_transactions)
     }
 
+    // Unoptimized implementation of list_paginated. Rarely used. find_by_relayer_id is preferred.
     async fn list_paginated(
         &self,
         query: PaginationQuery,
@@ -449,7 +623,7 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
         let mut conn = self.client.as_ref().clone();
 
-        debug!(page = %query.page, per_page = %query.per_page, "fetching paginated transactions");
+        debug!(page = %query.page, per_page = %query.per_page, "fetching paginated transactions sorted by created_at (newest first)");
 
         // Get all relayer IDs
         let relayer_list_key = self.relayer_list_key();
@@ -458,42 +632,31 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "list_paginated_relayer_ids"))?;
 
-        // Collect all transaction IDs from all relayers
-        let mut all_tx_ids = Vec::new();
+        // Collect all transactions from all relayers using their sorted sets
+        let mut all_transactions = Vec::new();
         for relayer_id in relayer_ids {
-            let pattern = format!(
-                "{}:{}:{}:{}:*",
-                self.key_prefix, RELAYER_PREFIX, relayer_id, TX_PREFIX
-            );
-            let mut cursor = 0;
-            loop {
-                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .cursor_arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| self.map_redis_error(e, "list_paginated_scan_keys"))?;
+            let relayer_sorted_key = self.relayer_tx_by_created_at_key(&relayer_id);
+            let tx_ids: Vec<String> = redis::cmd("ZRANGE")
+                .arg(&relayer_sorted_key)
+                .arg(0)
+                .arg(-1)
+                .arg("REV")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "list_paginated_relayer_sorted"))?;
 
-                // Extract transaction IDs from keys
-                for key in keys {
-                    if let Some(tx_id) = key.split(':').next_back() {
-                        all_tx_ids.push(tx_id.to_string());
-                    }
-                }
-
-                cursor = next_cursor;
-                if cursor == 0 {
-                    break;
-                }
-            }
+            let batch_result = self.get_transactions_by_ids(&tx_ids).await?;
+            all_transactions.extend(batch_result.results);
         }
 
-        let total = all_tx_ids.len() as u64;
-        let start = ((query.page - 1) * query.per_page) as usize;
-        let end = (start + query.per_page as usize).min(all_tx_ids.len());
+        // Sort all transactions by created_at (newest first)
+        all_transactions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-        if start >= all_tx_ids.len() {
+        let total = all_transactions.len() as u64;
+        let start = ((query.page - 1) * query.per_page) as usize;
+        let end = (start + query.per_page as usize).min(all_transactions.len());
+
+        if start >= all_transactions.len() {
             debug!(page = %query.page, total = %total, "page is beyond available data");
             return Ok(PaginatedResult {
                 items: vec![],
@@ -503,13 +666,12 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             });
         }
 
-        let page_ids = &all_tx_ids[start..end];
-        let items = self.get_transactions_by_ids(page_ids).await?;
+        let items = all_transactions[start..end].to_vec();
 
-        debug!(count = %items.results.len(), page = %query.page, "successfully fetched transactions for page");
+        debug!(count = %items.len(), page = %query.page, "successfully fetched transactions for page");
 
         Ok(PaginatedResult {
-            items: items.results.clone(),
+            items,
             total,
             page: query.page,
             per_page: query.per_page,
@@ -584,42 +746,27 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
         Ok(())
     }
 
+    // Unoptimized implementation of count. Rarely used. find_by_relayer_id is preferred.
     async fn count(&self) -> Result<usize, RepositoryError> {
         let mut conn = self.client.as_ref().clone();
 
         debug!("counting transactions");
 
-        // Get all relayer IDs
+        // Get all relayer IDs and sum their sorted set counts
         let relayer_list_key = self.relayer_list_key();
         let relayer_ids: Vec<String> = conn
             .smembers(&relayer_list_key)
             .await
             .map_err(|e| self.map_redis_error(e, "count_relayer_ids"))?;
 
-        // Count transactions across all relayers
-        let mut total_count = 0;
+        let mut total_count = 0usize;
         for relayer_id in relayer_ids {
-            let pattern = format!(
-                "{}:{}:{}:{}:*",
-                self.key_prefix, RELAYER_PREFIX, relayer_id, TX_PREFIX
-            );
-            let mut cursor = 0;
-            loop {
-                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .cursor_arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| self.map_redis_error(e, "count_scan_keys"))?;
-
-                total_count += keys.len();
-
-                cursor = next_cursor;
-                if cursor == 0 {
-                    break;
-                }
-            }
+            let relayer_sorted_key = self.relayer_tx_by_created_at_key(&relayer_id);
+            let count: usize = conn
+                .zcard(&relayer_sorted_key)
+                .await
+                .map_err(|e| self.map_redis_error(e, "count_relayer_transactions"))?;
+            total_count += count;
         }
 
         debug!(count = %total_count, "transaction count");
@@ -700,18 +847,31 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
                 let reverse_key = self.tx_to_relayer_key(&tx_id);
                 pipe.del(&reverse_key);
 
-                // Delete status indexes (we can't know the specific status, so we'll clean up known ones)
+                // Delete status indexes (we can't know the specific status, so we'll clean up all possible ones)
+                // This ensures complete cleanup even if there are orphaned entries
                 for status in &[
+                    TransactionStatus::Canceled,
                     TransactionStatus::Pending,
                     TransactionStatus::Sent,
+                    TransactionStatus::Submitted,
+                    TransactionStatus::Mined,
                     TransactionStatus::Confirmed,
                     TransactionStatus::Failed,
-                    TransactionStatus::Canceled,
+                    TransactionStatus::Expired,
                 ] {
+                    // Remove from sorted status set (new format)
+                    let status_sorted_key = self.relayer_status_sorted_key(relayer_id, status);
+                    pipe.zrem(&status_sorted_key, &tx_id);
+
+                    // Remove from legacy status set (for migration cleanup)
                     let status_key = self.relayer_status_key(relayer_id, status);
                     pipe.srem(&status_key, &tx_id);
                 }
             }
+
+            // Delete the relayer's sorted set by created_at
+            let relayer_sorted_key = self.relayer_tx_by_created_at_key(relayer_id);
+            pipe.del(&relayer_sorted_key);
         }
 
         // Delete the relayer list key
@@ -735,76 +895,262 @@ impl TransactionRepository for RedisTransactionRepository {
     ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError> {
         let mut conn = self.client.as_ref().clone();
 
-        // Scan for all transaction keys for this relayer
-        let pattern = format!(
-            "{}:{}:{}:{}:*",
-            self.key_prefix, RELAYER_PREFIX, relayer_id, TX_PREFIX
-        );
-        let mut all_tx_ids = Vec::new();
-        let mut cursor = 0;
+        debug!(relayer_id = %relayer_id, page = %query.page, per_page = %query.per_page, "fetching transactions for relayer sorted by created_at (newest first)");
 
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .cursor_arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| self.map_redis_error(e, "find_by_relayer_id_scan"))?;
+        let relayer_sorted_key = self.relayer_tx_by_created_at_key(relayer_id);
 
-            // Extract transaction IDs from keys
-            for key in keys {
-                if let Some(tx_id) = key.split(':').next_back() {
-                    all_tx_ids.push(tx_id.to_string());
-                }
-            }
+        // Get total count from relayer's sorted set
+        let sorted_set_count: u64 = conn
+            .zcard(&relayer_sorted_key)
+            .await
+            .map_err(|e| self.map_redis_error(e, "find_by_relayer_id_count"))?;
 
-            cursor = next_cursor;
-            if cursor == 0 {
-                break;
-            }
+        // If sorted set is empty, return empty result immediately
+        // All new transactions are automatically added to the sorted set
+        if sorted_set_count == 0 {
+            debug!(relayer_id = %relayer_id, "no transactions found for relayer (sorted set is empty)");
+            return Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                page: query.page,
+                per_page: query.per_page,
+            });
         }
 
-        let total = all_tx_ids.len() as u64;
-        let start = ((query.page - 1) * query.per_page) as usize;
-        let end = (start + query.per_page as usize).min(all_tx_ids.len());
+        let total = sorted_set_count;
 
-        let page_ids = &all_tx_ids[start..end];
-        let items = self.get_transactions_by_ids(page_ids).await?;
+        // Calculate pagination range (0-indexed for Redis ZRANGE with REV)
+        let start = ((query.page - 1) * query.per_page) as isize;
+        let end = start + query.per_page as isize - 1;
+
+        if start as u64 >= total {
+            debug!(relayer_id = %relayer_id, page = %query.page, total = %total, "page is beyond available data");
+            return Ok(PaginatedResult {
+                items: vec![],
+                total,
+                page: query.page,
+                per_page: query.per_page,
+            });
+        }
+
+        // Get page of transaction IDs from sorted set (newest first using ZRANGE with REV)
+        let page_ids: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&relayer_sorted_key)
+            .arg(start)
+            .arg(end)
+            .arg("REV")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "find_by_relayer_id_sorted"))?;
+
+        let items = self.get_transactions_by_ids(&page_ids).await?;
+
+        debug!(relayer_id = %relayer_id, count = %items.results.len(), page = %query.page, "successfully fetched transactions for relayer");
 
         Ok(PaginatedResult {
-            items: items.results.clone(),
+            items: items.results,
             total,
             page: query.page,
             per_page: query.per_page,
         })
     }
 
+    // Unoptimized implementation of find_by_status. Rarely used. find_by_status_paginated is preferred.
     async fn find_by_status(
         &self,
         relayer_id: &str,
         statuses: &[TransactionStatus],
     ) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
         let mut conn = self.client.as_ref().clone();
-        let mut all_ids = Vec::new();
 
-        // Collect IDs from all status sets
+        // Ensure all status sorted sets are migrated and collect IDs
+        let mut all_ids: Vec<String> = Vec::new();
         for status in statuses {
-            let status_key = self.relayer_status_key(relayer_id, status);
-            let ids: Vec<String> = conn
-                .smembers(status_key)
+            // Trigger migration if needed
+            self.ensure_status_sorted_set(relayer_id, status).await?;
+
+            // Get IDs from sorted set (already ordered by created_at)
+            let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
+            let ids: Vec<String> = redis::cmd("ZRANGE")
+                .arg(&sorted_key)
+                .arg(0)
+                .arg(-1)
+                .arg("REV") // Newest first
+                .query_async(&mut conn)
                 .await
                 .map_err(|e| self.map_redis_error(e, "find_by_status"))?;
 
             all_ids.extend(ids);
         }
 
-        // Remove duplicates and batch fetch
+        if all_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Remove duplicates (can happen if a transaction is in multiple status sets due to partial failures)
         all_ids.sort();
         all_ids.dedup();
 
-        let transactions = self.get_transactions_by_ids(&all_ids).await?;
+        // Fetch all transactions and sort by created_at (newest first)
+        let mut transactions = self.get_transactions_by_ids(&all_ids).await?;
+
+        // Sort by created_at descending (newest first)
+        transactions
+            .results
+            .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
         Ok(transactions.results)
+    }
+
+    async fn find_by_status_paginated(
+        &self,
+        relayer_id: &str,
+        statuses: &[TransactionStatus],
+        query: PaginationQuery,
+        oldest_first: bool,
+    ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError> {
+        let mut conn = self.client.as_ref().clone();
+
+        // Ensure all status sorted sets are migrated
+        for status in statuses {
+            self.ensure_status_sorted_set(relayer_id, status).await?;
+        }
+
+        // For single status, we can paginate directly from the sorted set
+        if statuses.len() == 1 {
+            let sorted_key = self.relayer_status_sorted_key(relayer_id, &statuses[0]);
+
+            // Get total count
+            let total: u64 = conn
+                .zcard(&sorted_key)
+                .await
+                .map_err(|e| self.map_redis_error(e, "find_by_status_paginated_count"))?;
+
+            if total == 0 {
+                return Ok(PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: query.page,
+                    per_page: query.per_page,
+                });
+            }
+
+            // Calculate pagination bounds
+            let start = ((query.page.saturating_sub(1)) * query.per_page) as isize;
+            let end = start + query.per_page as isize - 1;
+
+            // Get page of IDs directly from sorted set
+            // REV = newest first (descending), no REV = oldest first (ascending)
+            let mut cmd = redis::cmd("ZRANGE");
+            cmd.arg(&sorted_key).arg(start).arg(end);
+            if !oldest_first {
+                cmd.arg("REV");
+            }
+            let page_ids: Vec<String> = cmd
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "find_by_status_paginated"))?;
+
+            let transactions = self.get_transactions_by_ids(&page_ids).await?;
+
+            debug!(
+                relayer_id = %relayer_id,
+                status = %statuses[0],
+                total = %total,
+                page = %query.page,
+                page_size = %transactions.results.len(),
+                "fetched paginated transactions by single status"
+            );
+
+            return Ok(PaginatedResult {
+                items: transactions.results,
+                total,
+                page: query.page,
+                per_page: query.per_page,
+            });
+        }
+
+        // For multiple statuses, collect all IDs and merge
+        let mut all_ids: Vec<(String, f64)> = Vec::new();
+        for status in statuses {
+            let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
+
+            // Get IDs with scores for proper sorting
+            let ids_with_scores: Vec<(String, f64)> = redis::cmd("ZRANGE")
+                .arg(&sorted_key)
+                .arg(0)
+                .arg(-1)
+                .arg("WITHSCORES")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "find_by_status_paginated_multi"))?;
+
+            all_ids.extend(ids_with_scores);
+        }
+
+        // Remove duplicates (keep highest/lowest score based on sort order)
+        let mut id_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (id, score) in all_ids {
+            id_map
+                .entry(id)
+                .and_modify(|s| {
+                    // For oldest_first, keep the lowest score; otherwise keep highest
+                    if oldest_first {
+                        if score < *s {
+                            *s = score
+                        }
+                    } else if score > *s {
+                        *s = score
+                    }
+                })
+                .or_insert(score);
+        }
+
+        // Sort by score: descending for newest first, ascending for oldest first
+        let mut sorted_ids: Vec<(String, f64)> = id_map.into_iter().collect();
+        if oldest_first {
+            sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            sorted_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        let total = sorted_ids.len() as u64;
+
+        if total == 0 {
+            return Ok(PaginatedResult {
+                items: vec![],
+                total: 0,
+                page: query.page,
+                per_page: query.per_page,
+            });
+        }
+
+        // Apply pagination
+        let start = ((query.page.saturating_sub(1)) * query.per_page) as usize;
+        let page_ids: Vec<String> = sorted_ids
+            .into_iter()
+            .skip(start)
+            .take(query.per_page as usize)
+            .map(|(id, _)| id)
+            .collect();
+
+        // Fetch only the transactions for this page
+        let transactions = self.get_transactions_by_ids(&page_ids).await?;
+
+        debug!(
+            relayer_id = %relayer_id,
+            total = %total,
+            page = %query.page,
+            page_size = %transactions.results.len(),
+            "fetched paginated transactions by status"
+        );
+
+        Ok(PaginatedResult {
+            items: transactions.results,
+            total,
+            page: query.page,
+            per_page: query.per_page,
+        })
     }
 
     async fn find_by_nonce(
@@ -945,6 +1291,153 @@ impl TransactionRepository for RedisTransactionRepository {
             ..Default::default()
         };
         self.partial_update(tx_id, update).await
+    }
+
+    /// Count transactions by status using Redis ZCARD (O(1) per sorted set).
+    /// Much more efficient than find_by_status when you only need the count.
+    /// Triggers migration from legacy SETs if needed.
+    async fn count_by_status(
+        &self,
+        relayer_id: &str,
+        statuses: &[TransactionStatus],
+    ) -> Result<u64, RepositoryError> {
+        let mut conn = self.client.as_ref().clone();
+        let mut total_count: u64 = 0;
+
+        for status in statuses {
+            // Ensure sorted set is migrated
+            self.ensure_status_sorted_set(relayer_id, status).await?;
+
+            let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
+            let count: u64 = conn
+                .zcard(&sorted_key)
+                .await
+                .map_err(|e| self.map_redis_error(e, "count_by_status"))?;
+            total_count += count;
+        }
+
+        debug!(relayer_id = %relayer_id, count = %total_count, "counted transactions by status");
+        Ok(total_count)
+    }
+
+    async fn delete_by_ids(&self, ids: Vec<String>) -> Result<BatchDeleteResult, RepositoryError> {
+        if ids.is_empty() {
+            debug!("no transaction IDs provided for batch delete");
+            return Ok(BatchDeleteResult::default());
+        }
+
+        debug!(count = %ids.len(), "batch deleting transactions by IDs (with fetch)");
+
+        // Fetch transactions to get their data for index cleanup
+        let batch_result = self.get_transactions_by_ids(&ids).await?;
+
+        // Convert to delete requests
+        let requests: Vec<TransactionDeleteRequest> = batch_result
+            .results
+            .iter()
+            .map(|tx| TransactionDeleteRequest {
+                id: tx.id.clone(),
+                relayer_id: tx.relayer_id.clone(),
+                nonce: self.extract_nonce(&tx.network_data),
+            })
+            .collect();
+
+        // Track IDs that weren't found
+        let mut result = self.delete_by_requests(requests).await?;
+
+        // Add the IDs that weren't found during fetch
+        for id in batch_result.failed_ids {
+            result
+                .failed
+                .push((id.clone(), format!("Transaction with ID {id} not found")));
+        }
+
+        Ok(result)
+    }
+
+    async fn delete_by_requests(
+        &self,
+        requests: Vec<TransactionDeleteRequest>,
+    ) -> Result<BatchDeleteResult, RepositoryError> {
+        if requests.is_empty() {
+            debug!("no delete requests provided for batch delete");
+            return Ok(BatchDeleteResult::default());
+        }
+
+        debug!(count = %requests.len(), "batch deleting transactions by requests (no fetch)");
+
+        let mut conn = self.client.as_ref().clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        // All possible statuses for index cleanup
+        let all_statuses = [
+            TransactionStatus::Canceled,
+            TransactionStatus::Pending,
+            TransactionStatus::Sent,
+            TransactionStatus::Submitted,
+            TransactionStatus::Mined,
+            TransactionStatus::Confirmed,
+            TransactionStatus::Failed,
+            TransactionStatus::Expired,
+        ];
+
+        // Build pipeline for all deletions and index removals
+        for req in &requests {
+            // Delete transaction data
+            let tx_key = self.tx_key(&req.relayer_id, &req.id);
+            pipe.del(&tx_key);
+
+            // Delete reverse lookup
+            let reverse_key = self.tx_to_relayer_key(&req.id);
+            pipe.del(&reverse_key);
+
+            // Remove from all possible status indexes
+            for status in &all_statuses {
+                let status_sorted_key = self.relayer_status_sorted_key(&req.relayer_id, status);
+                pipe.zrem(&status_sorted_key, &req.id);
+
+                let status_legacy_key = self.relayer_status_key(&req.relayer_id, status);
+                pipe.srem(&status_legacy_key, &req.id);
+            }
+
+            // Remove nonce index if exists
+            if let Some(nonce) = req.nonce {
+                let nonce_key = self.relayer_nonce_key(&req.relayer_id, nonce);
+                pipe.del(&nonce_key);
+            }
+
+            // Remove from per-relayer sorted set by created_at
+            let relayer_sorted_key = self.relayer_tx_by_created_at_key(&req.relayer_id);
+            pipe.zrem(&relayer_sorted_key, &req.id);
+        }
+
+        // Execute the entire pipeline in one round-trip
+        match pipe.exec_async(&mut conn).await {
+            Ok(_) => {
+                let deleted_count = requests.len();
+                debug!(
+                    deleted_count = %deleted_count,
+                    "batch delete completed"
+                );
+                Ok(BatchDeleteResult {
+                    deleted_count,
+                    failed: vec![],
+                })
+            }
+            Err(e) => {
+                error!(error = %e, "batch delete pipeline failed");
+                // Mark all requests as failed
+                let failed: Vec<(String, String)> = requests
+                    .iter()
+                    .map(|req| (req.id.clone(), format!("Redis pipeline error: {e}")))
+                    .collect();
+                Ok(BatchDeleteResult {
+                    deleted_count: 0,
+                    failed,
+                })
+            }
+        }
     }
 }
 
@@ -1315,6 +1808,165 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires active Redis instance"]
+    async fn test_find_by_relayer_id_sorted_by_created_at_newest_first() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // Create transactions with different created_at timestamps
+        let mut tx1 = create_test_transaction_with_relayer("test-1", &relayer_id);
+        tx1.created_at = "2025-01-27T10:00:00.000000+00:00".to_string(); // Oldest
+
+        let mut tx2 = create_test_transaction_with_relayer("test-2", &relayer_id);
+        tx2.created_at = "2025-01-27T12:00:00.000000+00:00".to_string(); // Middle
+
+        let mut tx3 = create_test_transaction_with_relayer("test-3", &relayer_id);
+        tx3.created_at = "2025-01-27T14:00:00.000000+00:00".to_string(); // Newest
+
+        // Create transactions in non-chronological order to ensure sorting works
+        repo.create(tx2.clone()).await.unwrap(); // Middle first
+        repo.create(tx1.clone()).await.unwrap(); // Oldest second
+        repo.create(tx3.clone()).await.unwrap(); // Newest last
+
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 10,
+        };
+        let result = repo.find_by_relayer_id(&relayer_id, query).await.unwrap();
+
+        assert_eq!(result.total, 3);
+        assert_eq!(result.items.len(), 3);
+
+        // Verify transactions are sorted by created_at descending (newest first)
+        assert_eq!(
+            result.items[0].id, "test-3",
+            "First item should be newest (test-3)"
+        );
+        assert_eq!(
+            result.items[0].created_at,
+            "2025-01-27T14:00:00.000000+00:00"
+        );
+
+        assert_eq!(
+            result.items[1].id, "test-2",
+            "Second item should be middle (test-2)"
+        );
+        assert_eq!(
+            result.items[1].created_at,
+            "2025-01-27T12:00:00.000000+00:00"
+        );
+
+        assert_eq!(
+            result.items[2].id, "test-1",
+            "Third item should be oldest (test-1)"
+        );
+        assert_eq!(
+            result.items[2].created_at,
+            "2025-01-27T10:00:00.000000+00:00"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_find_by_relayer_id_migration_from_old_index() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // Create transactions with different created_at timestamps
+        let mut tx1 = create_test_transaction_with_relayer("migrate-test-1", &relayer_id);
+        tx1.created_at = "2025-01-27T10:00:00.000000+00:00".to_string(); // Oldest
+
+        let mut tx2 = create_test_transaction_with_relayer("migrate-test-2", &relayer_id);
+        tx2.created_at = "2025-01-27T12:00:00.000000+00:00".to_string(); // Middle
+
+        let mut tx3 = create_test_transaction_with_relayer("migrate-test-3", &relayer_id);
+        tx3.created_at = "2025-01-27T14:00:00.000000+00:00".to_string(); // Newest
+
+        // Create transactions directly in Redis WITHOUT adding to sorted set
+        // This simulates old transactions created before the sorted set index existed
+        let mut conn = repo.client.as_ref().clone();
+        let relayer_list_key = repo.relayer_list_key();
+        let _: () = conn.sadd(&relayer_list_key, &relayer_id).await.unwrap();
+
+        for tx in &[&tx1, &tx2, &tx3] {
+            let key = repo.tx_key(&tx.relayer_id, &tx.id);
+            let reverse_key = repo.tx_to_relayer_key(&tx.id);
+            let value = repo.serialize_entity(tx, |t| &t.id, "transaction").unwrap();
+
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            pipe.set(&key, &value);
+            pipe.set(&reverse_key, &tx.relayer_id);
+
+            // Add to status index (but NOT to sorted set)
+            let status_key = repo.relayer_status_key(&tx.relayer_id, &tx.status);
+            pipe.sadd(&status_key, &tx.id);
+
+            pipe.exec_async(&mut conn).await.unwrap();
+        }
+
+        // Verify sorted set is empty (transactions were created without sorted set index)
+        let relayer_sorted_key = repo.relayer_tx_by_created_at_key(&relayer_id);
+        let count: u64 = conn.zcard(&relayer_sorted_key).await.unwrap();
+        assert_eq!(count, 0, "Sorted set should be empty for old transactions");
+
+        // Call find_by_relayer_id - this should trigger migration
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 10,
+        };
+        let result = repo
+            .find_by_relayer_id(&relayer_id, query.clone())
+            .await
+            .unwrap();
+
+        // Verify migration happened - sorted set should now have entries
+        let count_after: u64 = conn.zcard(&relayer_sorted_key).await.unwrap();
+        assert_eq!(
+            count_after, 3,
+            "Sorted set should be populated after migration"
+        );
+
+        // Verify results are correct and sorted (newest first)
+        assert_eq!(result.total, 3);
+        assert_eq!(result.items.len(), 3);
+
+        assert_eq!(
+            result.items[0].id, "migrate-test-3",
+            "First item should be newest after migration"
+        );
+        assert_eq!(
+            result.items[0].created_at,
+            "2025-01-27T14:00:00.000000+00:00"
+        );
+
+        assert_eq!(
+            result.items[1].id, "migrate-test-2",
+            "Second item should be middle after migration"
+        );
+        assert_eq!(
+            result.items[1].created_at,
+            "2025-01-27T12:00:00.000000+00:00"
+        );
+
+        assert_eq!(
+            result.items[2].id, "migrate-test-1",
+            "Third item should be oldest after migration"
+        );
+        assert_eq!(
+            result.items[2].created_at,
+            "2025-01-27T10:00:00.000000+00:00"
+        );
+
+        // Verify second call uses sorted set (no migration needed)
+        let result2 = repo.find_by_relayer_id(&relayer_id, query).await.unwrap();
+        assert_eq!(result2.total, 3);
+        assert_eq!(result2.items.len(), 3);
+        // Results should be identical since sorted set is now populated
+        assert_eq!(result.items[0].id, result2.items[0].id);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
     async fn test_find_by_status() {
         let repo = setup_test_repo().await;
         let random_id = Uuid::new_v4().to_string();
@@ -1362,6 +2014,237 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_find_by_status_paginated() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // Create 5 pending transactions with different timestamps
+        for i in 1..=5 {
+            let tx_id = Uuid::new_v4().to_string();
+            let mut tx = create_test_transaction_with_status(
+                &tx_id,
+                &relayer_id,
+                TransactionStatus::Pending,
+            );
+            tx.created_at = format!("2025-01-27T{:02}:00:00.000000+00:00", 10 + i);
+            repo.create(tx).await.unwrap();
+        }
+
+        // Create 2 confirmed transactions
+        for i in 6..=7 {
+            let tx_id = Uuid::new_v4().to_string();
+            let mut tx = create_test_transaction_with_status(
+                &tx_id,
+                &relayer_id,
+                TransactionStatus::Confirmed,
+            );
+            tx.created_at = format!("2025-01-27T{:02}:00:00.000000+00:00", 10 + i);
+            repo.create(tx).await.unwrap();
+        }
+
+        // Test first page (2 items per page)
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 2,
+        };
+        let result = repo
+            .find_by_status_paginated(&relayer_id, &[TransactionStatus::Pending], query, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 5);
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.page, 1);
+        assert_eq!(result.per_page, 2);
+
+        // Test second page
+        let query = PaginationQuery {
+            page: 2,
+            per_page: 2,
+        };
+        let result = repo
+            .find_by_status_paginated(&relayer_id, &[TransactionStatus::Pending], query, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 5);
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.page, 2);
+
+        // Test last page (partial)
+        let query = PaginationQuery {
+            page: 3,
+            per_page: 2,
+        };
+        let result = repo
+            .find_by_status_paginated(&relayer_id, &[TransactionStatus::Pending], query, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 5);
+        assert_eq!(result.items.len(), 1);
+
+        // Test multiple statuses
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 10,
+        };
+        let result = repo
+            .find_by_status_paginated(
+                &relayer_id,
+                &[TransactionStatus::Pending, TransactionStatus::Confirmed],
+                query,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 7);
+        assert_eq!(result.items.len(), 7);
+
+        // Test empty result
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 10,
+        };
+        let result = repo
+            .find_by_status_paginated(&relayer_id, &[TransactionStatus::Failed], query, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 0);
+        assert_eq!(result.items.len(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_find_by_status_paginated_oldest_first() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // Create 5 pending transactions with ascending timestamps
+        for i in 1..=5 {
+            let tx_id = format!("tx{}-{}", i, Uuid::new_v4());
+            let mut tx = create_test_transaction(&tx_id);
+            tx.relayer_id = relayer_id.clone();
+            tx.status = TransactionStatus::Pending;
+            tx.created_at = format!("2025-01-27T{:02}:00:00.000000+00:00", 10 + i);
+            repo.create(tx).await.unwrap();
+        }
+
+        // Test oldest_first: true - should return oldest transactions first
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 3,
+        };
+        let result = repo
+            .find_by_status_paginated(
+                &relayer_id,
+                &[TransactionStatus::Pending],
+                query.clone(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 5);
+        assert_eq!(result.items.len(), 3);
+        // Verify ordering: oldest first (11:00, 12:00, 13:00)
+        assert!(
+            result.items[0].created_at < result.items[1].created_at,
+            "First item should be older than second"
+        );
+        assert!(
+            result.items[1].created_at < result.items[2].created_at,
+            "Second item should be older than third"
+        );
+
+        // Contrast with oldest_first: false - should return newest first
+        let result_newest = repo
+            .find_by_status_paginated(&relayer_id, &[TransactionStatus::Pending], query, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result_newest.items.len(), 3);
+        // Verify ordering: newest first (15:00, 14:00, 13:00)
+        assert!(
+            result_newest.items[0].created_at > result_newest.items[1].created_at,
+            "First item should be newer than second"
+        );
+        assert!(
+            result_newest.items[1].created_at > result_newest.items[2].created_at,
+            "Second item should be newer than third"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_find_by_status_paginated_oldest_first_single_item() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // Create transactions with specific timestamps
+        let timestamps = [
+            "2025-01-27T08:00:00.000000+00:00", // oldest
+            "2025-01-27T10:00:00.000000+00:00", // middle
+            "2025-01-27T12:00:00.000000+00:00", // newest
+        ];
+
+        let mut oldest_id = String::new();
+        let mut newest_id = String::new();
+
+        for (i, timestamp) in timestamps.iter().enumerate() {
+            let tx_id = format!("tx-{}-{}", i, Uuid::new_v4());
+            if i == 0 {
+                oldest_id = tx_id.clone();
+            }
+            if i == 2 {
+                newest_id = tx_id.clone();
+            }
+            let mut tx = create_test_transaction(&tx_id);
+            tx.relayer_id = relayer_id.clone();
+            tx.status = TransactionStatus::Pending;
+            tx.created_at = timestamp.to_string();
+            repo.create(tx).await.unwrap();
+        }
+
+        // Request just 1 item with oldest_first: true
+        let query = PaginationQuery {
+            page: 1,
+            per_page: 1,
+        };
+        let result = repo
+            .find_by_status_paginated(
+                &relayer_id,
+                &[TransactionStatus::Pending],
+                query.clone(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 3);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].id, oldest_id,
+            "With oldest_first=true and per_page=1, should return the oldest transaction"
+        );
+
+        // Contrast with oldest_first: false
+        let result = repo
+            .find_by_status_paginated(&relayer_id, &[TransactionStatus::Pending], query, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].id, newest_id,
+            "With oldest_first=false and per_page=1, should return the newest transaction"
+        );
     }
 
     #[tokio::test]
@@ -1890,5 +2773,260 @@ mod tests {
 
         // Cleanup
         env::remove_var("TRANSACTION_EXPIRATION_HOURS");
+    }
+
+    // Tests for delete_by_ids batch delete functionality
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_empty_list() {
+        let repo = setup_test_repo().await;
+        let tx_id = format!("test-empty-{}", Uuid::new_v4());
+
+        // Create a transaction to ensure repo is not empty
+        let tx = create_test_transaction(&tx_id);
+        repo.create(tx).await.unwrap();
+
+        // Delete with empty list should succeed and not affect existing data
+        let result = repo.delete_by_ids(vec![]).await.unwrap();
+
+        assert_eq!(result.deleted_count, 0);
+        assert!(result.failed.is_empty());
+
+        // Original transaction should still exist
+        assert!(repo.get_by_id(tx_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_single_transaction() {
+        let repo = setup_test_repo().await;
+        let tx_id = format!("test-single-{}", Uuid::new_v4());
+
+        let tx = create_test_transaction(&tx_id);
+        repo.create(tx).await.unwrap();
+
+        let result = repo.delete_by_ids(vec![tx_id.clone()]).await.unwrap();
+
+        assert_eq!(result.deleted_count, 1);
+        assert!(result.failed.is_empty());
+
+        // Verify transaction was deleted
+        assert!(repo.get_by_id(tx_id).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_multiple_transactions() {
+        let repo = setup_test_repo().await;
+        let base_id = Uuid::new_v4();
+
+        // Create multiple transactions
+        let mut created_ids = Vec::new();
+        for i in 1..=5 {
+            let tx_id = format!("test-multi-{}-{}", base_id, i);
+            let tx = create_test_transaction(&tx_id);
+            repo.create(tx).await.unwrap();
+            created_ids.push(tx_id);
+        }
+
+        // Delete 3 of them
+        let ids_to_delete = vec![
+            created_ids[0].clone(),
+            created_ids[2].clone(),
+            created_ids[4].clone(),
+        ];
+        let result = repo.delete_by_ids(ids_to_delete).await.unwrap();
+
+        assert_eq!(result.deleted_count, 3);
+        assert!(result.failed.is_empty());
+
+        // Verify correct transactions were deleted
+        assert!(repo.get_by_id(created_ids[0].clone()).await.is_err());
+        assert!(repo.get_by_id(created_ids[1].clone()).await.is_ok()); // Not deleted
+        assert!(repo.get_by_id(created_ids[2].clone()).await.is_err());
+        assert!(repo.get_by_id(created_ids[3].clone()).await.is_ok()); // Not deleted
+        assert!(repo.get_by_id(created_ids[4].clone()).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_nonexistent_transactions() {
+        let repo = setup_test_repo().await;
+        let base_id = Uuid::new_v4();
+
+        // Try to delete transactions that don't exist
+        let ids_to_delete = vec![
+            format!("nonexistent-{}-1", base_id),
+            format!("nonexistent-{}-2", base_id),
+        ];
+        let result = repo.delete_by_ids(ids_to_delete.clone()).await.unwrap();
+
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.failed.len(), 2);
+
+        // Verify error messages contain the IDs
+        let failed_ids: Vec<&String> = result.failed.iter().map(|(id, _)| id).collect();
+        assert!(failed_ids.contains(&&ids_to_delete[0]));
+        assert!(failed_ids.contains(&&ids_to_delete[1]));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_mixed_existing_and_nonexistent() {
+        let repo = setup_test_repo().await;
+        let base_id = Uuid::new_v4();
+
+        // Create some transactions
+        let existing_ids: Vec<String> = (1..=3)
+            .map(|i| format!("test-mixed-existing-{}-{}", base_id, i))
+            .collect();
+
+        for id in &existing_ids {
+            let tx = create_test_transaction(id);
+            repo.create(tx).await.unwrap();
+        }
+
+        let nonexistent_ids: Vec<String> = (1..=2)
+            .map(|i| format!("test-mixed-nonexistent-{}-{}", base_id, i))
+            .collect();
+
+        // Try to delete mix of existing and non-existing
+        let ids_to_delete = vec![
+            existing_ids[0].clone(),
+            nonexistent_ids[0].clone(),
+            existing_ids[1].clone(),
+            nonexistent_ids[1].clone(),
+        ];
+        let result = repo.delete_by_ids(ids_to_delete).await.unwrap();
+
+        assert_eq!(result.deleted_count, 2);
+        assert_eq!(result.failed.len(), 2);
+
+        // Verify existing transactions were deleted
+        assert!(repo.get_by_id(existing_ids[0].clone()).await.is_err());
+        assert!(repo.get_by_id(existing_ids[1].clone()).await.is_err());
+
+        // Verify remaining transaction still exists
+        assert!(repo.get_by_id(existing_ids[2].clone()).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_removes_all_indexes() {
+        let repo = setup_test_repo().await;
+        let relayer_id = format!("relayer-{}", Uuid::new_v4());
+        let tx_id = format!("test-indexes-{}", Uuid::new_v4());
+
+        // Create a transaction with specific status
+        let mut tx = create_test_transaction(&tx_id);
+        tx.relayer_id = relayer_id.clone();
+        tx.status = TransactionStatus::Confirmed;
+        repo.create(tx).await.unwrap();
+
+        // Verify transaction exists and is indexed
+        let found = repo
+            .find_by_status(&relayer_id, &[TransactionStatus::Confirmed])
+            .await
+            .unwrap();
+        assert!(found.iter().any(|t| t.id == tx_id));
+
+        // Delete the transaction
+        let result = repo.delete_by_ids(vec![tx_id.clone()]).await.unwrap();
+        assert_eq!(result.deleted_count, 1);
+
+        // Verify transaction is no longer in status index
+        let found_after = repo
+            .find_by_status(&relayer_id, &[TransactionStatus::Confirmed])
+            .await
+            .unwrap();
+        assert!(!found_after.iter().any(|t| t.id == tx_id));
+
+        // Verify transaction cannot be found
+        assert!(repo.get_by_id(tx_id).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_removes_nonce_index() {
+        let repo = setup_test_repo().await;
+        let relayer_id = format!("relayer-{}", Uuid::new_v4());
+        let tx_id = format!("test-nonce-{}", Uuid::new_v4());
+        let nonce = 12345u64;
+
+        // Create a transaction with a specific nonce
+        let tx = create_test_transaction_with_nonce(&tx_id, nonce, &relayer_id);
+        repo.create(tx).await.unwrap();
+
+        // Verify nonce index works
+        let found = repo.find_by_nonce(&relayer_id, nonce).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, tx_id);
+
+        // Delete the transaction
+        let result = repo.delete_by_ids(vec![tx_id.clone()]).await.unwrap();
+        assert_eq!(result.deleted_count, 1);
+
+        // Verify nonce index was cleaned up
+        let found_after = repo.find_by_nonce(&relayer_id, nonce).await.unwrap();
+        assert!(found_after.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_large_batch() {
+        let repo = setup_test_repo().await;
+        let base_id = Uuid::new_v4();
+
+        // Create many transactions to test batch performance
+        let count = 50;
+        let mut created_ids = Vec::new();
+
+        for i in 0..count {
+            let tx_id = format!("test-large-{}-{}", base_id, i);
+            let tx = create_test_transaction(&tx_id);
+            repo.create(tx).await.unwrap();
+            created_ids.push(tx_id);
+        }
+
+        // Delete all of them in one batch
+        let result = repo.delete_by_ids(created_ids.clone()).await.unwrap();
+
+        assert_eq!(result.deleted_count, count);
+        assert!(result.failed.is_empty());
+
+        // Verify all were deleted
+        for id in created_ids {
+            assert!(repo.get_by_id(id).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_delete_by_ids_preserves_other_relayer_transactions() {
+        let repo = setup_test_repo().await;
+        let relayer_1 = format!("relayer-1-{}", Uuid::new_v4());
+        let relayer_2 = format!("relayer-2-{}", Uuid::new_v4());
+        let tx_id_1 = format!("tx-relayer-1-{}", Uuid::new_v4());
+        let tx_id_2 = format!("tx-relayer-2-{}", Uuid::new_v4());
+
+        // Create transactions for different relayers
+        let tx1 = create_test_transaction_with_relayer(&tx_id_1, &relayer_1);
+        let tx2 = create_test_transaction_with_relayer(&tx_id_2, &relayer_2);
+
+        repo.create(tx1).await.unwrap();
+        repo.create(tx2).await.unwrap();
+
+        // Delete only relayer-1's transaction
+        let result = repo.delete_by_ids(vec![tx_id_1.clone()]).await.unwrap();
+
+        assert_eq!(result.deleted_count, 1);
+
+        // relayer-1's transaction should be deleted
+        assert!(repo.get_by_id(tx_id_1).await.is_err());
+
+        // relayer-2's transaction should still exist
+        let remaining = repo.get_by_id(tx_id_2).await.unwrap();
+        assert_eq!(remaining.relayer_id, relayer_2);
     }
 }
