@@ -9,9 +9,7 @@
         "https://testnet.monadscan.com",
         "https://api-testnet.monadscan.com/api"
       ],
-      "features": [
-        "eip1559"
-      ],
+      "features": ["eip1559"],
       "is_testnet": true,
       "network": "monad-testnet",
       "required_confirmations": 1,
@@ -21,10 +19,29 @@
         "https://testnet-rpc.monad.xyz"
       ],
       "symbol": "MON",
-      "tags": [
-        "L1",
-        "no-mempool"
+      "tags": ["L1", "no-mempool"],
+      "type": "evm"
+    },
+    {
+      "average_blocktime_ms": 500,
+      "chain_id": 143,
+      "explorer_urls": [
+        "https://monadvision.com",
+        "https://monadscan.com",
+        "https://monad.socialscan.io"
       ],
+      "features": ["eip1559"],
+      "is_testnet": false,
+      "network": "monad-mainnet",
+      "required_confirmations": 1,
+      "rpc_urls": [
+        "https://rpc.monad.xyz",
+        "https://rpc1.monad.xyz",
+        "https://rpc3.monad.xyz",
+        "https://rpc-mainnet.monadinfra.com"
+      ],
+      "symbol": "MON",
+      "tags": ["L1", "no-mempool"],
       "type": "evm"
     }
   ]

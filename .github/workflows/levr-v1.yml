@@ -31,6 +31,7 @@ jobs:
               echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::AWS_SECRET_ACCESS_KEY"
               echo "::set-output name=AWS_ACCOUNT_ID::V1_DEV_AWS_ACCOUNT_ID"
               echo "::set-output name=CONFIG_NAME::config.levr.json"
+              echo "::set-output name=SECRET_NAME::levr-v1/openzeppeline-relayer"
 
           elif [ "${{ github.ref }}" = "refs/heads/test" ]; then
               echo "::set-output name=ENV_NAME_TAG::test"
@@ -41,6 +42,7 @@ jobs:
               echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::PROD_AWS_SECRET_ACCESS_KEY"
               echo "::set-output name=AWS_ACCOUNT_ID::PROD_AWS_ACCOUNT_ID"
               echo "::set-output name=CONFIG_NAME::config.prod.levr.json"
+              echo "::set-output name=SECRET_NAME::levr-v1/openzeppeline-relayer"
 
           elif [ "${{ github.ref }}" = "refs/heads/levr-v1-staging" ]; then
               echo "::set-output name=ENV_NAME_TAG::levr-v1-staging"
@@ -48,6 +50,7 @@ jobs:
               echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::STAGING_AWS_SECRET_ACCESS_KEY"
               echo "::set-output name=AWS_ACCOUNT_ID::STAGING_AWS_ACCOUNT_ID"
               echo "::set-output name=CONFIG_NAME::config.staging.levr.json"
+              echo "::set-output name=SECRET_NAME::levr-v1/openzeppeline-relayer"
 
 
           fi
@@ -70,12 +73,26 @@ jobs:
 
       - name: Generate config file
         id: generate-config
+        env:
+          SECRET_NAME: ${{ steps.env_check.outputs.SECRET_NAME }}
         run: |
           mv ${APP_DIR}/config/${{ steps.env_check.outputs.CONFIG_NAME }} ${APP_DIR}/config/config.json
           ls -al ${APP_DIR}/config
-          MONAD_TESTNET_RPC_URL_1=$(aws ssm get-parameter --name /aws/reference/secretsmanager/${SECRET_NAME} --with-decryption | jq -r '.Parameter.Value | fromjson | .MONAD_TESTNET_RPC_URL_1')
-          echo $MONAD_TESTNET_RPC_URL_1
-          sed -i "s|MONAD_TESTNET_RPC_URL_1|$MONAD_TESTNET_RPC_URL_1|g" ${APP_DIR}/config/config.json
+
+          SECRET_JSON=$(aws ssm get-parameter --name /aws/reference/secretsmanager/${SECRET_NAME} --with-decryption | jq -r '.Parameter.Value')
+
+          if [ "${{ steps.env_check.outputs.ENV_NAME_TAG }}" = "prod" ]; then
+            MONAD_MAINNET_RPC_URL_1=$(echo "$SECRET_JSON" | jq -r '.MONAD_MAINNET_RPC_URL_1')
+            MONAD_MAINNET_RPC_URL_2=$(echo "$SECRET_JSON" | jq -r '.MONAD_MAINNET_RPC_URL_2')
+            echo "Substituting mainnet RPC URLs..."
+            sed -i "s|\${MONAD_MAINNET_RPC_URL_1}|$MONAD_MAINNET_RPC_URL_1|g" ${APP_DIR}/config/config.json
+            sed -i "s|\${MONAD_MAINNET_RPC_URL_2}|$MONAD_MAINNET_RPC_URL_2|g" ${APP_DIR}/config/config.json
+          else
+            MONAD_TESTNET_RPC_URL_1=$(echo "$SECRET_JSON" | jq -r '.MONAD_TESTNET_RPC_URL_1')
+            echo "Substituting testnet RPC URL..."
+            sed -i "s|MONAD_TESTNET_RPC_URL_1|$MONAD_TESTNET_RPC_URL_1|g" ${APP_DIR}/config/config.json
+          fi
+
           cat ${APP_DIR}/config/config.json
           echo "PAYLOAD=$(jq -c . ${APP_DIR}/config/config.json)" >> $GITHUB_OUTPUT
 
