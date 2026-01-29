@@ -81,7 +81,7 @@ jobs:
 
           SECRET_JSON=$(aws ssm get-parameter --name /aws/reference/secretsmanager/${SECRET_NAME} --with-decryption | jq -r '.Parameter.Value')
 
-          if [ "${{ steps.env_check.outputs.ENV_NAME_TAG }}" = "prod" ]; then
+          if [ "${{ steps.env_check.outputs.ENV_NAME_TAG }}" = "prod" ] || [ "${{ steps.env_check.outputs.ENV_NAME_TAG }}" = "levr-v1-staging" ]; then
             MONAD_MAINNET_RPC_URL_1=$(echo "$SECRET_JSON" | jq -r '.MONAD_MAINNET_RPC_URL_1')
             MONAD_MAINNET_RPC_URL_2=$(echo "$SECRET_JSON" | jq -r '.MONAD_MAINNET_RPC_URL_2')
             echo "Substituting mainnet RPC URLs..."
