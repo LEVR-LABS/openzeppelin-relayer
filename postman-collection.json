@@ -1,0 +1,749 @@
+{
+  "info": {
+    "name": "OpenZeppelin Relayer",
+    "description": "Postman collection for the OpenZeppelin Relayer used by LEVR.\n\nManages relayers, transactions, signing, signers, notifications, networks, plugins, and API keys. Auth via `Authorization` header with raw API key.\n\nLEVR relayer groups: game_admin, liquidator, feed_provider, match_maker (each with multiple relayer instances per environment).\n\n**Variables:**\n- `RELAYER_BASE_URL`: Base URL (e.g. `http://localhost:8080`)\n- `API_KEY`: Relayer API key\n- `RELAYER_ID`: Relayer instance ID (e.g. `game_admin_10143_1`)\n- `TRANSACTION_ID`: Transaction ID\n- `NONCE`: Transaction nonce\n- `SIGNER_ID`: Signer ID\n- `NOTIFICATION_ID`: Notification ID\n- `NETWORK_ID`: Network ID (e.g. `evm:monad-testnet`)\n- `PLUGIN_ID`: Plugin ID\n- `API_KEY_ID`: API key ID",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "RELAYER_BASE_URL", "value": "http://localhost:8080", "type": "string" },
+    { "key": "API_KEY", "value": "", "type": "string" },
+    { "key": "RELAYER_ID", "value": "game_admin_10143_1", "type": "string" },
+    { "key": "TRANSACTION_ID", "value": "", "type": "string" },
+    { "key": "NONCE", "value": "", "type": "string" },
+    { "key": "SIGNER_ID", "value": "", "type": "string" },
+    { "key": "NOTIFICATION_ID", "value": "", "type": "string" },
+    { "key": "NETWORK_ID", "value": "evm:monad-testnet", "type": "string" },
+    { "key": "PLUGIN_ID", "value": "", "type": "string" },
+    { "key": "API_KEY_ID", "value": "", "type": "string" }
+  ],
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "Authorization", "type": "string" },
+      { "key": "value", "value": "{{API_KEY}}", "type": "string" },
+      { "key": "in", "value": "header", "type": "string" }
+    ]
+  },
+  "item": [
+    {
+      "name": "Health",
+      "description": "Public health and readiness endpoints (no auth required).",
+      "item": [
+        {
+          "name": "Liveness Check",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/health",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "health"]
+            },
+            "description": "Returns 200 OK with body 'OK' (text/plain)."
+          }
+        },
+        {
+          "name": "Readiness Check",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/ready",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "ready"]
+            },
+            "description": "Returns JSON { ready, fd_count, fd_limit, fd_usage_percent, close_wait_count }. Returns 503 if unhealthy."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Relayers",
+      "description": "CRUD operations on relayer instances.",
+      "item": [
+        {
+          "name": "List Relayers",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers?page=1&per_page=50",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "50" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Relayer",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"my_relayer_1\",\n  \"name\": \"My Relayer\",\n  \"network\": \"evm:monad-testnet\",\n  \"signer_id\": \"{{SIGNER_ID}}\",\n  \"paused\": false,\n  \"policies\": {\n    \"min_balance\": 1000000000000000000,\n    \"eip1559_pricing\": true,\n    \"gas_limit_estimation\": true\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Get Relayer",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Relayer",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/merge-patch+json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paused\": false\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "JSON Merge Patch (RFC 7396). Only include fields to update."
+          }
+        },
+        {
+          "name": "Delete Relayer",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}"]
+            },
+            "description": "Fails if the relayer has active transactions."
+          }
+        },
+        {
+          "name": "Get Relayer Status",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/status",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "status"]
+            }
+          }
+        },
+        {
+          "name": "Get Relayer Balance",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/balance",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "balance"]
+            },
+            "description": "Returns { balance, unit }."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transactions",
+      "description": "Send, list, get, replace, and cancel transactions.",
+      "item": [
+        {
+          "name": "Send Transaction",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"0x...\",\n  \"value\": \"0\",\n  \"data\": \"0x...\",\n  \"gas_limit\": 200000\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "List Transactions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/?page=1&per_page=20",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", ""],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "20" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Transaction",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/{{TRANSACTION_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "{{TRANSACTION_ID}}"]
+            }
+          }
+        },
+        {
+          "name": "Replace Transaction",
+          "request": {
+            "method": "PUT",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/{{TRANSACTION_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "{{TRANSACTION_ID}}"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"0x...\",\n  \"value\": \"0\",\n  \"data\": \"0x...\",\n  \"gas_limit\": 200000\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Replace a pending transaction with updated parameters."
+          }
+        },
+        {
+          "name": "Cancel Transaction",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/{{TRANSACTION_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "{{TRANSACTION_ID}}"]
+            }
+          }
+        },
+        {
+          "name": "Get Transaction by Nonce",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/by-nonce/{{NONCE}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "by-nonce", "{{NONCE}}"]
+            }
+          }
+        },
+        {
+          "name": "Delete Pending Transactions",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/pending",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "pending"]
+            },
+            "description": "Delete all pending transactions for this relayer."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sponsored Transactions",
+      "description": "Gas abstraction / sponsored (gasless) transaction endpoints.",
+      "item": [
+        {
+          "name": "Quote Sponsored Transaction",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/sponsored/quote",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "sponsored", "quote"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"0x...\",\n  \"value\": \"0\",\n  \"data\": \"0x...\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Estimate fees for a sponsored (gasless) transaction. Returns { estimated_fee, conversion_rate }."
+          }
+        },
+        {
+          "name": "Build Sponsored Transaction",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/transactions/sponsored/build",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "transactions", "sponsored", "build"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"0x...\",\n  \"value\": \"0\",\n  \"data\": \"0x...\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Build a sponsored transaction with fee payments. Returns { transaction, fee_in_token, fee_in_stroops, fee_token, valid_until }."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Signing",
+      "description": "Sign raw data, EIP-712 typed data, and transactions.",
+      "item": [
+        {
+          "name": "Sign Data",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/sign",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "sign"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"0x...\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Sign raw data using the relayer's signer."
+          }
+        },
+        {
+          "name": "Sign Typed Data (EIP-712)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/sign-typed-data",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "sign-typed-data"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain_separator\": {},\n  \"primary_type\": \"Transfer\",\n  \"types\": {},\n  \"message\": {}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Sign EIP-712 typed data."
+          }
+        },
+        {
+          "name": "Sign Transaction",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/sign-transaction",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "sign-transaction"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"transaction\": \"0x...\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Sign a transaction (Stellar only)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON-RPC",
+      "description": "Proxy JSON-RPC calls through a relayer.",
+      "item": [
+        {
+          "name": "JSON-RPC Call",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/relayers/{{RELAYER_ID}}/rpc",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "relayers", "{{RELAYER_ID}}", "rpc"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"eth_blockNumber\",\n  \"params\": []\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Signers",
+      "description": "CRUD operations on signer configurations (AWS KMS, local keys, etc.).",
+      "item": [
+        {
+          "name": "List Signers",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/signers?page=1&per_page=50",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "signers"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "50" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Signer",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/signers",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "signers"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"my_signer\",\n  \"type\": \"aws_kms\",\n  \"config\": {\n    \"region\": \"ap-south-1\",\n    \"key_id\": \"arn:aws:kms:...\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Get Signer",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/signers/{{SIGNER_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "signers", "{{SIGNER_ID}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Signer",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/signers/{{SIGNER_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "signers", "{{SIGNER_ID}}"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"config\": {\n    \"region\": \"ap-south-1\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Delete Signer",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/signers/{{SIGNER_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "signers", "{{SIGNER_ID}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Notifications",
+      "description": "CRUD for notification configurations.",
+      "item": [
+        {
+          "name": "List Notifications",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/notifications?page=1&per_page=20",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "notifications"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "20" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create Notification",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/notifications",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "notifications"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"my_notification\",\n  \"type\": \"webhook\",\n  \"config\": {\n    \"url\": \"https://example.com/webhook\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Get Notification",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/notifications/{{NOTIFICATION_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "notifications", "{{NOTIFICATION_ID}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Notification",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/notifications/{{NOTIFICATION_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "notifications", "{{NOTIFICATION_ID}}"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"config\": {\n    \"url\": \"https://example.com/new-webhook\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Delete Notification",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/notifications/{{NOTIFICATION_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "notifications", "{{NOTIFICATION_ID}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Networks",
+      "description": "List and manage network configurations.",
+      "item": [
+        {
+          "name": "List Networks",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/networks?page=1&per_page=20",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "networks"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "20" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Network",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/networks/{{NETWORK_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "networks", "{{NETWORK_ID}}"]
+            }
+          }
+        },
+        {
+          "name": "Update Network",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/networks/{{NETWORK_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "networks", "{{NETWORK_ID}}"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rpc_urls\": [\"https://rpc.example.com\"]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Currently supports updating RPC URLs only."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Plugins",
+      "description": "List and execute plugins.",
+      "item": [
+        {
+          "name": "List Plugins",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/plugins?page=1&per_page=20",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "plugins"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "20" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Execute Plugin (POST)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/plugins/{{PLUGIN_ID}}/call?route=/",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "plugins", "{{PLUGIN_ID}}", "call"],
+              "query": [{ "key": "route", "value": "/", "description": "Plugin route path" }]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Execute Plugin (GET)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/plugins/{{PLUGIN_ID}}/call?route=/",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "plugins", "{{PLUGIN_ID}}", "call"],
+              "query": [{ "key": "route", "value": "/", "description": "Plugin route path" }]
+            },
+            "description": "Plugin must have allow_get_invocation enabled."
+          }
+        }
+      ]
+    },
+    {
+      "name": "API Keys",
+      "description": "Manage API keys for relayer access.",
+      "item": [
+        {
+          "name": "List API Keys",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/api-keys?page=1&per_page=20",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "api-keys"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "20" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create API Key",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/api-keys",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "api-keys"]
+            },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"my-api-key\",\n  \"permissions\": [],\n  \"allowed_origins\": []\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          }
+        },
+        {
+          "name": "Get API Key Permissions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/api-keys/{{API_KEY_ID}}/permissions",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "api-keys", "{{API_KEY_ID}}", "permissions"]
+            }
+          }
+        },
+        {
+          "name": "Delete API Key",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/api/v1/api-keys/{{API_KEY_ID}}",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["api", "v1", "api-keys", "{{API_KEY_ID}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Metrics",
+      "description": "Prometheus metrics endpoints (port 8081 if METRICS_ENABLED).",
+      "item": [
+        {
+          "name": "List Metrics",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/metrics",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["metrics"]
+            },
+            "description": "Returns JSON array of all available metric names."
+          }
+        },
+        {
+          "name": "Get Metric",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/metrics/relayer_transactions_total",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["metrics", "relayer_transactions_total"]
+            },
+            "description": "Get a specific metric in Prometheus text format. Replace the metric name in the URL."
+          }
+        },
+        {
+          "name": "Scrape System Metrics",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{RELAYER_BASE_URL}}/debug/metrics/scrape",
+              "host": ["{{RELAYER_BASE_URL}}"],
+              "path": ["debug", "metrics", "scrape"]
+            },
+            "description": "Trigger system metrics update and return Prometheus exposition format."
+          }
+        }
+      ]
+    }
+  ]
+}
