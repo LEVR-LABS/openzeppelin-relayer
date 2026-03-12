@@ -13,6 +13,10 @@
           "weight": 100
         },
         {
+          "url": "MONAD_TESTNET_RPC_URL_2",
+          "weight": 100
+        },
+        {
           "url": "https://monad-testnet.drpc.org",
           "weight": 20
         },
@@ -41,6 +45,10 @@
       "custom_rpc_urls": [
         {
           "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "MONAD_TESTNET_RPC_URL_2",
           "weight": 100
         },
         {
@@ -75,6 +83,10 @@
           "weight": 100
         },
         {
+          "url": "MONAD_TESTNET_RPC_URL_2",
+          "weight": 100
+        },
+        {
           "url": "https://monad-testnet.drpc.org",
           "weight": 20
         },
@@ -103,6 +115,10 @@
       "custom_rpc_urls": [
         {
           "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "MONAD_TESTNET_RPC_URL_2",
           "weight": 100
         },
         {
@@ -137,6 +153,10 @@
           "weight": 100
         },
         {
+          "url": "MONAD_TESTNET_RPC_URL_2",
+          "weight": 100
+        },
+        {
           "url": "https://monad-testnet.drpc.org",
           "weight": 20
         },
@@ -165,6 +185,10 @@
       "custom_rpc_urls": [
         {
           "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "MONAD_TESTNET_RPC_URL_2",
           "weight": 100
         },
         {
@@ -199,6 +223,10 @@
           "weight": 100
         },
         {
+          "url": "MONAD_TESTNET_RPC_URL_2",
+          "weight": 100
+        },
+        {
           "url": "https://monad-testnet.drpc.org",
           "weight": 20
         },
@@ -227,6 +255,10 @@
       "custom_rpc_urls": [
         {
           "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "MONAD_TESTNET_RPC_URL_2",
           "weight": 100
         },
         {
@@ -261,6 +293,10 @@
           "weight": 100
         },
         {
+          "url": "MONAD_TESTNET_RPC_URL_2",
+          "weight": 100
+        },
+        {
           "url": "https://monad-testnet.drpc.org",
           "weight": 20
         },
@@ -289,6 +325,10 @@
       "custom_rpc_urls": [
         {
           "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "MONAD_TESTNET_RPC_URL_2",
           "weight": 100
         },
         {
@@ -323,6 +363,10 @@
           "weight": 100
         },
         {
+          "url": "MONAD_TESTNET_RPC_URL_2",
+          "weight": 100
+        },
+        {
           "url": "https://monad-testnet.drpc.org",
           "weight": 20
         },
@@ -351,6 +395,10 @@
       "custom_rpc_urls": [
         {
           "url": "MONAD_TESTNET_RPC_URL_1",
+          "weight": 100
+        },
+        {
+          "url": "MONAD_TESTNET_RPC_URL_2",
           "weight": 100
         },
         {
