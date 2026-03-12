@@ -9,11 +9,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -44,11 +44,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -79,11 +79,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -114,11 +114,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -149,11 +149,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -184,11 +184,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -219,11 +219,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -254,11 +254,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -289,11 +289,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -324,11 +324,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -359,11 +359,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
@@ -394,11 +394,11 @@
       "network_type": "evm",
       "custom_rpc_urls": [
         {
-          "url": "MONAD_TESTNET_RPC_URL_1",
+          "url": "${MONAD_TESTNET_RPC_URL_1}",
           "weight": 100
         },
         {
-          "url": "MONAD_TESTNET_RPC_URL_2",
+          "url": "${MONAD_TESTNET_RPC_URL_2}",
           "weight": 100
         },
         {
