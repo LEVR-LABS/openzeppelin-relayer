@@ -1,7 +1,21 @@
 use std::num::ParseIntError;
+use std::time::Duration;
+
+use once_cell::sync::Lazy;
+use reqwest::Client as ReqwestClient;
+use tracing::debug;
 
 use crate::config::ServerConfig;
+use crate::constants::{
+    matches_known_transaction, ALREADY_SUBMITTED_PATTERNS,
+    DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
+    DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
+    DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS, DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST,
+    DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS, NONCE_TOO_HIGH_PATTERNS,
+};
 use crate::models::{EvmNetwork, RpcConfig, SolanaNetwork, StellarNetwork};
+use crate::utils::create_secure_redirect_policy;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -96,6 +110,60 @@ impl ProviderConfig {
         let server_config = ServerConfig::from_env();
         Self::from_server_config(&server_config, rpc_configs)
     }
+}
+
+/// Pre-configured `reqwest::ClientBuilder` with standard pool, keepalive, TLS,
+/// and redirect settings. Callers chain on extras (e.g., `.timeout(...)`) then `.build()`.
+fn base_rpc_client_builder() -> reqwest::ClientBuilder {
+    ReqwestClient::builder()
+        .connect_timeout(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
+        ))
+        .pool_max_idle_per_host(DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS,
+        ))
+        .tcp_keepalive(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS,
+        ))
+        .http2_keep_alive_interval(Some(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
+        )))
+        .http2_keep_alive_timeout(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
+        ))
+        .use_rustls_tls()
+        .redirect(create_secure_redirect_policy())
+}
+
+/// Shared `reqwest::Client` for RPC providers that set per-request timeouts
+/// (e.g., Stellar raw HTTP). No request-level timeout is baked in.
+static SHARED_RPC_HTTP_CLIENT: Lazy<Result<ReqwestClient, String>> = Lazy::new(|| {
+    debug!("Creating shared RPC HTTP client");
+    base_rpc_client_builder()
+        .build()
+        .map_err(|e| format!("Failed to create shared RPC HTTP client: {e}"))
+});
+
+/// Get the shared RPC HTTP client (no per-request timeout).
+pub fn get_shared_rpc_http_client() -> Result<ReqwestClient, ProviderError> {
+    SHARED_RPC_HTTP_CLIENT
+        .as_ref()
+        .map(|c| c.clone())
+        .map_err(|e| ProviderError::NetworkConfiguration(e.clone()))
+}
+
+/// Build a new RPC HTTP client with standard settings plus a per-request timeout.
+/// Use when the provider needs timeouts baked into the client (e.g., EVM via alloy transport).
+pub fn build_rpc_http_client_with_timeout(
+    timeout: Duration,
+) -> Result<ReqwestClient, ProviderError> {
+    base_rpc_client_builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| {
+            ProviderError::NetworkConfiguration(format!("Failed to build RPC HTTP client: {e}"))
+        })
 }
 
 #[derive(Error, Debug, Serialize)]
@@ -374,6 +442,23 @@ pub fn should_mark_provider_failed(error: &ProviderError) -> bool {
     }
 }
 
+/// Returns true if the RPC error message indicates a transaction-level error
+/// that should not be retried — the RPC is working correctly, but rejecting
+/// the transaction itself.
+///
+/// Uses the shared `ALREADY_SUBMITTED_PATTERNS` from constants, consistent with
+/// `is_already_submitted_error` in `domain::transaction::evm::evm_transaction`.
+fn is_non_retriable_transaction_rpc_message(message: &str) -> bool {
+    let msg_lower = message.to_lowercase();
+    ALREADY_SUBMITTED_PATTERNS
+        .iter()
+        .any(|p| msg_lower.contains(p))
+        || NONCE_TOO_HIGH_PATTERNS
+            .iter()
+            .any(|p| msg_lower.contains(p))
+        || matches_known_transaction(&msg_lower)
+}
+
 // Errors that are retriable
 pub fn is_retriable_error(error: &ProviderError) -> bool {
     match error {
@@ -403,14 +488,16 @@ pub fn is_retriable_error(error: &ProviderError) -> bool {
         }
 
         // JSON-RPC error codes (EIP-1474)
-        ProviderError::RpcErrorCode { code, .. } => {
+        ProviderError::RpcErrorCode { code, message } => {
             match code {
-                // -32002: Resource unavailable (temporary state)
-                -32002 => true,
+                // -32002: Resource unavailable — retriable unless the message indicates a
+                // transaction-level rejection (some providers wrap nonce/tx errors here)
+                -32002 => !is_non_retriable_transaction_rpc_message(message),
                 // -32005: Limit exceeded / rate limited
                 -32005 => true,
-                // -32603: Internal error (may be temporary)
-                -32603 => true,
+                // -32603: Internal error — retriable unless the message indicates a
+                // transaction-level rejection (some providers wrap nonce/tx errors here)
+                -32603 => !is_non_retriable_transaction_rpc_message(message),
                 // -32000: Invalid input
                 -32000 => false,
                 // -32001: Resource not found
@@ -1251,6 +1338,99 @@ mod tests {
                 description,
                 if should_be_retriable { "" } else { " NOT" }
             );
+        }
+    }
+
+    #[test]
+    fn test_is_non_retriable_transaction_rpc_message() {
+        // Positive cases: these messages should be recognized as non-retriable
+        assert!(is_non_retriable_transaction_rpc_message("nonce too low"));
+        assert!(is_non_retriable_transaction_rpc_message("Nonce Too Low"));
+        assert!(is_non_retriable_transaction_rpc_message("nonce is too low"));
+        assert!(is_non_retriable_transaction_rpc_message("already known"));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "known transaction"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "Known Transaction"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "replacement transaction underpriced"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "same hash was already imported"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "Transaction nonce too low"
+        ));
+
+        // Negative cases: generic/unrelated messages should not match
+        assert!(!is_non_retriable_transaction_rpc_message("Internal error"));
+        assert!(!is_non_retriable_transaction_rpc_message("server busy"));
+        assert!(!is_non_retriable_transaction_rpc_message(""));
+        // "unknown transaction" must NOT match "known transaction"
+        assert!(!is_non_retriable_transaction_rpc_message(
+            "Unknown transaction status"
+        ));
+
+        // Nonce-too-high patterns are also non-retriable
+        assert!(is_non_retriable_transaction_rpc_message("nonce too high"));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "nonce too far in the future",
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "exceeds next nonce"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "Nonce Too Far In The Future"
+        ));
+    }
+
+    #[test]
+    fn test_is_retriable_error_rpc_tx_errors_not_retriable() {
+        // Transaction-level messages that should NOT be retriable regardless of code
+        let non_retriable_messages = vec![
+            "Transaction nonce too low",
+            "nonce too low",
+            "nonce is too low",
+            "already known",
+            "known transaction",
+            "replacement transaction underpriced",
+            "same hash was already imported",
+        ];
+
+        // Messages that should remain retriable (generic/unrelated)
+        let retriable_messages = vec![
+            "Internal error",
+            "",
+            // "unknown transaction" must NOT false-positive on "known transaction"
+            "Unknown transaction status",
+            "Resource unavailable",
+        ];
+
+        // Both -32603 and -32002 should behave the same way for tx-level messages
+        for code in [-32603, -32002] {
+            for message in &non_retriable_messages {
+                let error = ProviderError::RpcErrorCode {
+                    code,
+                    message: message.to_string(),
+                };
+                assert!(
+                    !is_retriable_error(&error),
+                    "{code} with message {message:?} should NOT be retriable"
+                );
+            }
+
+            for message in &retriable_messages {
+                let error = ProviderError::RpcErrorCode {
+                    code,
+                    message: message.to_string(),
+                };
+                assert!(
+                    is_retriable_error(&error),
+                    "{code} with message {message:?} should be retriable"
+                );
+            }
         }
     }
 }
