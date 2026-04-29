@@ -40,7 +40,7 @@ use crate::{
         HealthCheckFailure, NetworkRepoModel, NetworkTransactionData, NetworkType, PaginationQuery,
         RelayerNetworkPolicy, RelayerRepoModel, RelayerSolanaPolicy, SolanaAllowedTokensPolicy,
         SolanaDexPayload, SolanaFeePaymentStrategy, SolanaNetwork, SolanaTransactionData,
-        TransactionRepoModel, TransactionStatus,
+        TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{NetworkRepository, RelayerRepository, Repository, TransactionRepository},
     services::{
@@ -54,7 +54,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use futures::future::try_join_all;
 use solana_sdk::{account::Account, pubkey::Pubkey};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::{NetworkDex, SolanaRpcError, SolanaTokenProgram, SwapResult, TokenAccount};
 
@@ -142,6 +142,14 @@ where
     ///
     /// This method sends a request to the Solana RPC to obtain the latest blockhash.
     /// If the call fails, it returns a `RelayerError::ProviderError` containing the error message.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn validate_rpc(&self) -> Result<(), RelayerError> {
         self.provider
             .get_latest_blockhash()
@@ -162,6 +170,14 @@ where
     /// unchanged.
     ///
     /// Finally, the updated policy is stored in the repository.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn populate_allowed_tokens_metadata(&self) -> Result<RelayerSolanaPolicy, RelayerError> {
         let mut policy = self.relayer.policies.get_solana_policy();
         // Check if allowed_tokens is specified; if not, return the policy unchanged.
@@ -210,6 +226,14 @@ where
     /// verifies that the program is executable.
     /// If any of the programs are not executable, it returns a
     /// `RelayerError::PolicyConfigurationError`.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn validate_program_policy(&self) -> Result<(), RelayerError> {
         let policy = self.relayer.policies.get_solana_policy();
         let allowed_programs = match policy.allowed_programs.as_ref() {
@@ -246,6 +270,14 @@ where
 
     /// Checks the relayer's balance and triggers a token swap if the balance is below the
     /// specified threshold.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn check_balance_and_trigger_token_swap_if_needed(&self) -> Result<(), RelayerError> {
         let policy = self.relayer.policies.get_solana_policy();
         let swap_config = match policy.get_swap_config() {
@@ -342,6 +374,14 @@ where
     /// 4. Collects and returns all `SwapResult`s (empty if no swaps were needed).
     ///
     /// Returns a `RelayerError` on any repository, provider, or swap execution failure.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn handle_token_swap_request(
         &self,
         relayer_id: String,
@@ -532,6 +572,15 @@ where
     SP: SolanaProviderTrait + Send + Sync + 'static,
     NR: NetworkRepository + Repository<NetworkRepoModel, String> + Send + Sync + 'static,
 {
+    #[instrument(
+        level = "debug",
+        skip(self, network_transaction),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+            network_type = ?self.relayer.network_type,
+        )
+    )]
     async fn process_transaction_request(
         &self,
         network_transaction: crate::models::NetworkTransactionRequest,
@@ -607,15 +656,11 @@ where
                 .await
                 .map_err(|e| RepositoryError::TransactionFailure(e.to_string()))?;
 
-            self.job_producer
-                .produce_transaction_request_job(
-                    TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
-                    None,
-                )
-                .await?;
-
-            // Queue status check job (with initial delay)
-            self.job_producer
+            // Status check FIRST - this is our safety net for monitoring.
+            // If this fails, mark transaction as failed and don't proceed.
+            // This ensures we never have an unmonitored transaction.
+            if let Err(e) = self
+                .job_producer
                 .produce_check_transaction_status_job(
                     TransactionStatusCheck::new(
                         transaction.id.clone(),
@@ -626,12 +671,58 @@ where
                         SOLANA_STATUS_CHECK_INITIAL_DELAY_SECONDS,
                     )),
                 )
+                .await
+            {
+                // Status queue failed - mark transaction as failed to prevent orphaned tx
+                error!(
+                    relayer_id = %self.relayer.id,
+                    transaction_id = %transaction.id,
+                    error = %e,
+                    "Status check queue push failed - marking transaction as failed"
+                );
+                if let Err(update_err) = self
+                    .transaction_repository
+                    .partial_update(
+                        transaction.id.clone(),
+                        TransactionUpdateRequest {
+                            status: Some(TransactionStatus::Failed),
+                            status_reason: Some("Queue unavailable".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        relayer_id = %self.relayer.id,
+                        transaction_id = %transaction.id,
+                        error = %update_err,
+                        "Failed to mark transaction as failed after queue push failure"
+                    );
+                }
+                return Err(e.into());
+            }
+
+            // Now safe to push transaction request.
+            // Even if this fails, status check will monitor and detect the stuck transaction.
+            self.job_producer
+                .produce_transaction_request_job(
+                    TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
+                    None,
+                )
                 .await?;
 
             Ok(transaction)
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn get_balance(&self) -> Result<BalanceResponse, RelayerError> {
         let address = &self.relayer.address;
         let balance = self.provider.get_balance(address).await?;
@@ -642,6 +733,14 @@ where
         })
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn delete_pending_transactions(
         &self,
     ) -> Result<DeletePendingTransactionsResponse, RelayerError> {
@@ -650,6 +749,14 @@ where
         ))
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, _request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_data(
         &self,
         _request: SignDataRequest,
@@ -659,6 +766,14 @@ where
         ))
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, _request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_typed_data(
         &self,
         _request: SignTypedDataRequest,
@@ -668,6 +783,14 @@ where
         ))
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_transaction(
         &self,
         request: &SignTransactionRequest,
@@ -759,6 +882,14 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn rpc(
         &self,
         request: JsonRpcRequest<NetworkRpcRequest>,
@@ -919,6 +1050,14 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn get_status(&self) -> Result<RelayerStatus, RelayerError> {
         let address = &self.relayer.address;
         let balance = self.provider.get_balance(address).await?;
@@ -958,8 +1097,16 @@ where
         })
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn initialize_relayer(&self) -> Result<(), RelayerError> {
-        debug!("initializing Solana relayer {}", self.relayer.id);
+        debug!("initializing Solana relayer");
 
         // Populate model with allowed token metadata and update DB entry
         // Error will be thrown if any of the tokens are not found
@@ -1029,6 +1176,14 @@ where
         Ok(())
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn check_health(&self) -> Result<(), Vec<HealthCheckFailure>> {
         debug!(
             "running health checks for Solana relayer {}",
@@ -1060,6 +1215,14 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn validate_min_balance(&self) -> Result<(), RelayerError> {
         let balance = self
             .provider
@@ -1092,6 +1255,14 @@ where
     SP: SolanaProviderTrait + Send + Sync + 'static,
     NR: NetworkRepository + Repository<NetworkRepoModel, String> + Send + Sync + 'static,
 {
+    #[instrument(
+        level = "debug",
+        skip(self, params),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn quote_sponsored_transaction(
         &self,
         params: SponsoredTransactionQuoteRequest,
@@ -1115,6 +1286,14 @@ where
         Ok(SponsoredTransactionQuoteResponse::Solana(result))
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, params),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn build_sponsored_transaction(
         &self,
         params: SponsoredTransactionBuildRequest,
@@ -1929,7 +2108,7 @@ mod tests {
             RelayerError::ProviderError(msg) => {
                 assert!(msg.contains("rpc failure"));
             }
-            other => panic!("expected ProviderError, got {:?}", other),
+            other => panic!("expected ProviderError, got {other:?}"),
         }
     }
 
@@ -2088,7 +2267,7 @@ mod tests {
             RelayerError::UnderlyingSolanaProvider(err) => {
                 assert!(err.to_string().contains("oops"));
             }
-            other => panic!("expected ProviderError, got {:?}", other),
+            other => panic!("expected ProviderError, got {other:?}"),
         }
     }
 
@@ -2142,7 +2321,7 @@ mod tests {
             RelayerError::InsufficientBalanceError(msg) => {
                 assert_eq!(msg, "Insufficient balance");
             }
-            other => panic!("expected InsufficientBalanceError, got {:?}", other),
+            other => panic!("expected InsufficientBalanceError, got {other:?}"),
         }
     }
 
@@ -2164,7 +2343,7 @@ mod tests {
             RelayerError::ProviderError(msg) => {
                 assert!(msg.contains("fail"));
             }
-            other => panic!("expected ProviderError, got {:?}", other),
+            other => panic!("expected ProviderError, got {other:?}"),
         }
     }
 
@@ -2209,11 +2388,11 @@ mod tests {
         let data = resp.result.unwrap();
         let sol_res = match data {
             NetworkRpcResult::Solana(inner) => inner,
-            other => panic!("expected Solana, got {:?}", other),
+            other => panic!("expected Solana, got {other:?}"),
         };
         let features = match sol_res {
             SolanaRpcResult::GetFeaturesEnabled(f) => f,
-            other => panic!("expected GetFeaturesEnabled, got {:?}", other),
+            other => panic!("expected GetFeaturesEnabled, got {other:?}"),
         };
         assert_eq!(features.features, vec!["gasless".to_string()]);
     }
@@ -2484,7 +2663,7 @@ mod tests {
             RelayerError::PolicyConfigurationError(msg) => {
                 assert!(msg.contains("Error while processing allowed tokens policy"));
             }
-            other => panic!("Expected PolicyConfigurationError, got {:?}", other),
+            other => panic!("Expected PolicyConfigurationError, got {other:?}"),
         }
     }
 
@@ -2571,7 +2750,7 @@ mod tests {
                     && statuses == [TransactionStatus::Confirmed]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == false
+                    && !(*oldest_first)
             })
             .returning(move |_, _, _, _| {
                 Ok(crate::repositories::PaginatedResult {
@@ -2633,7 +2812,7 @@ mod tests {
             RelayerError::UnderlyingSolanaProvider(err) => {
                 assert!(err.to_string().contains("RPC error"));
             }
-            other => panic!("Expected UnderlyingSolanaProvider, got {:?}", other),
+            other => panic!("Expected UnderlyingSolanaProvider, got {other:?}"),
         }
     }
 
@@ -2668,7 +2847,7 @@ mod tests {
                     && statuses == [TransactionStatus::Confirmed]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == false
+                    && !(*oldest_first)
             })
             .returning(|_, _, _, _| {
                 Ok(crate::repositories::PaginatedResult {
@@ -2761,5 +2940,124 @@ mod tests {
         } else {
             panic!("Expected ValidationError for wrong network type");
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_transaction_request_status_check_failure_returns_error() {
+        let relayer_model = RelayerRepoModel {
+            id: "test-relayer-id".to_string(),
+            address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            network: "devnet".to_string(),
+            network_type: NetworkType::Solana,
+            policies: RelayerNetworkPolicy::Solana(RelayerSolanaPolicy {
+                fee_payment_strategy: Some(SolanaFeePaymentStrategy::Relayer),
+                min_balance: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let network_tx =
+            NetworkTransactionRequest::Solana(crate::models::SolanaTransactionRequest {
+                transaction: Some(EncodedSerializedTransaction::new(
+                    "test_transaction".to_string(),
+                )),
+                instructions: None,
+                valid_until: None,
+            });
+
+        let mut tx_repo = MockTransactionRepository::new();
+        tx_repo.expect_create().returning(|t| Ok(t.clone()));
+        // When status check fails, transaction is marked as failed
+        tx_repo
+            .expect_partial_update()
+            .returning(|_, _| Ok(TransactionRepoModel::default()));
+
+        let mut job_producer = MockJobProducerTrait::new();
+
+        // Status check fails
+        job_producer
+            .expect_produce_check_transaction_status_job()
+            .returning(|_, _| {
+                Box::pin(async {
+                    Err(crate::jobs::JobProducerError::QueueError(
+                        "Failed to queue job".to_string(),
+                    ))
+                })
+            });
+
+        // Transaction request should NOT be called when status check fails
+        // (no expectation set = test fails if called)
+
+        let ctx = TestCtx {
+            relayer_model,
+            tx_repo: Arc::new(tx_repo),
+            job_producer: Arc::new(job_producer),
+            ..Default::default()
+        };
+        let solana_relayer = ctx.into_relayer().await;
+
+        let result = solana_relayer.process_transaction_request(network_tx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_transaction_request_status_check_failure_marks_tx_failed() {
+        let relayer_model = RelayerRepoModel {
+            id: "test-relayer-id".to_string(),
+            address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            network: "devnet".to_string(),
+            network_type: NetworkType::Solana,
+            policies: RelayerNetworkPolicy::Solana(RelayerSolanaPolicy {
+                fee_payment_strategy: Some(SolanaFeePaymentStrategy::Relayer),
+                min_balance: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let network_tx =
+            NetworkTransactionRequest::Solana(crate::models::SolanaTransactionRequest {
+                transaction: Some(EncodedSerializedTransaction::new(
+                    "test_transaction".to_string(),
+                )),
+                instructions: None,
+                valid_until: None,
+            });
+
+        let mut tx_repo = MockTransactionRepository::new();
+        tx_repo.expect_create().returning(|t| Ok(t.clone()));
+
+        // Verify partial_update is called with correct status and reason
+        tx_repo
+            .expect_partial_update()
+            .withf(|_tx_id, update| {
+                update.status == Some(TransactionStatus::Failed)
+                    && update.status_reason == Some("Queue unavailable".to_string())
+            })
+            .returning(|_, _| Ok(TransactionRepoModel::default()));
+
+        let mut job_producer = MockJobProducerTrait::new();
+        job_producer
+            .expect_produce_check_transaction_status_job()
+            .returning(|_, _| {
+                Box::pin(async {
+                    Err(crate::jobs::JobProducerError::QueueError(
+                        "Redis timeout".to_string(),
+                    ))
+                })
+            });
+
+        let ctx = TestCtx {
+            relayer_model,
+            tx_repo: Arc::new(tx_repo),
+            job_producer: Arc::new(job_producer),
+            ..Default::default()
+        };
+        let solana_relayer = ctx.into_relayer().await;
+
+        let result = solana_relayer.process_transaction_request(network_tx).await;
+        assert!(result.is_err());
+        // The mock verification (withf) ensures partial_update was called correctly
     }
 }
