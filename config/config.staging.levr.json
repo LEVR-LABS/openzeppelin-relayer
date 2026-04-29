@@ -696,6 +696,181 @@
         "min_balance": 1000000000000000000,
         "gas_limit_estimation": true
       }
+    },
+    {
+      "id": "merkl_claimer_143_1",
+      "name": "Merkl Claimer 143 1",
+      "network": "monad-mainnet",
+      "paused": false,
+      "signer_id": "merkl_claimer_1",
+      "network_type": "evm",
+      "custom_rpc_urls": [
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
+          "weight": 100
+        },
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
+          "weight": 100
+        },
+        {
+          "url": "https://rpc.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc1.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc3.monad.xyz",
+          "weight": 20
+        }
+      ],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "merkl_claimer_143_2",
+      "name": "Merkl Claimer 143 2",
+      "network": "monad-mainnet",
+      "paused": false,
+      "signer_id": "merkl_claimer_2",
+      "network_type": "evm",
+      "custom_rpc_urls": [
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
+          "weight": 100
+        },
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
+          "weight": 100
+        },
+        {
+          "url": "https://rpc.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc1.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc3.monad.xyz",
+          "weight": 20
+        }
+      ],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "merkl_claimer_143_3",
+      "name": "Merkl Claimer 143 3",
+      "network": "monad-mainnet",
+      "paused": false,
+      "signer_id": "merkl_claimer_3",
+      "network_type": "evm",
+      "custom_rpc_urls": [
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
+          "weight": 100
+        },
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
+          "weight": 100
+        },
+        {
+          "url": "https://rpc.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc1.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc3.monad.xyz",
+          "weight": 20
+        }
+      ],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "merkl_claimer_143_4",
+      "name": "Merkl Claimer 143 4",
+      "network": "monad-mainnet",
+      "paused": false,
+      "signer_id": "merkl_claimer_4",
+      "network_type": "evm",
+      "custom_rpc_urls": [
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
+          "weight": 100
+        },
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
+          "weight": 100
+        },
+        {
+          "url": "https://rpc.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc1.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc3.monad.xyz",
+          "weight": 20
+        }
+      ],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
+    },
+    {
+      "id": "merkl_claimer_143_5",
+      "name": "Merkl Claimer 143 5",
+      "network": "monad-mainnet",
+      "paused": false,
+      "signer_id": "merkl_claimer_5",
+      "network_type": "evm",
+      "custom_rpc_urls": [
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_1}",
+          "weight": 100
+        },
+        {
+          "url": "${MONAD_MAINNET_RPC_URL_2}",
+          "weight": 100
+        },
+        {
+          "url": "https://rpc.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc1.monad.xyz",
+          "weight": 20
+        },
+        {
+          "url": "https://rpc3.monad.xyz",
+          "weight": 20
+        }
+      ],
+      "policies": {
+        "min_balance": 1000000000000000000,
+        "eip1559_pricing": true,
+        "gas_limit_estimation": true
+      }
     }
   ],
   "notifications": [],
@@ -858,6 +1033,46 @@
       "config": {
         "region": "ap-south-1",
         "key_id": "1e97e6fa-f7fd-49c4-ac5b-509c94111328"
+      }
+    },
+    {
+      "id": "merkl_claimer_1",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "76fd6ece-78a0-47da-b164-f5b12d8e368c"
+      }
+    },
+    {
+      "id": "merkl_claimer_2",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "6d1b61df-3fdd-4630-8f76-a73f7320d2ff"
+      }
+    },
+    {
+      "id": "merkl_claimer_3",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "efc3ddc4-20f8-4903-8390-6c78b4da4146"
+      }
+    },
+    {
+      "id": "merkl_claimer_4",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "fa7aa3cc-57b9-4d0f-b35a-cb7b7b16826a"
+      }
+    },
+    {
+      "id": "merkl_claimer_5",
+      "type": "aws_kms",
+      "config": {
+        "region": "ap-south-1",
+        "key_id": "8f094143-8aa5-4d2e-9a27-cf563db5b558"
       }
     }
   ],
