@@ -11,6 +11,7 @@
 use actix_web::web::ThinData;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::instrument;
 use utoipa::ToSchema;
 
 #[cfg(test)]
@@ -183,6 +184,17 @@ pub trait Relayer {
         &self,
         request: &SignTransactionRequest,
     ) -> Result<SignTransactionExternalResponse, RelayerError>;
+
+    /// Handles a targeted health action dispatched via job metadata.
+    ///
+    /// Returns `Ok(true)` if an action was handled, `Ok(false)` if no recognized action.
+    /// Only meaningful for EVM relayers; other network types return `Ok(false)` by default.
+    async fn handle_health_action(
+        &self,
+        _metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<bool, RelayerError> {
+        Ok(false)
+    }
 }
 
 /// Solana Relayer Dex Trait
@@ -375,6 +387,16 @@ impl<
             NetworkRelayer::Stellar(relayer) => relayer.sign_transaction(request).await,
         }
     }
+
+    async fn handle_health_action(
+        &self,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<bool, RelayerError> {
+        match self {
+            NetworkRelayer::Evm(relayer) => relayer.handle_health_action(metadata).await,
+            NetworkRelayer::Solana(_) | NetworkRelayer::Stellar(_) => Ok(false),
+        }
+    }
 }
 
 #[async_trait]
@@ -526,6 +548,15 @@ impl<
         AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
     > RelayerFactoryTrait<J, RR, TR, NR, NFR, SR, TCR, PR, AKR> for RelayerFactory
 {
+    #[instrument(
+        level = "debug",
+        skip(relayer, signer, state),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %relayer.id,
+            network_type = ?relayer.network_type,
+        )
+    )]
     async fn create_relayer(
         relayer: RelayerRepoModel,
         signer: SignerRepoModel,
