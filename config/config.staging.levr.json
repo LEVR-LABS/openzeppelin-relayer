@@ -698,11 +698,11 @@
       }
     },
     {
-      "id": "merkl_claimer_143_1",
-      "name": "Merkl Claimer 143 1",
+      "id": "free_bet_operator_143_1",
+      "name": "Free Bet Operator 143 1",
       "network": "monad-mainnet",
       "paused": false,
-      "signer_id": "merkl_claimer_1",
+      "signer_id": "free_bet_operator_1",
       "network_type": "evm",
       "custom_rpc_urls": [
         {
@@ -733,11 +733,11 @@
       }
     },
     {
-      "id": "merkl_claimer_143_2",
-      "name": "Merkl Claimer 143 2",
+      "id": "free_bet_operator_143_2",
+      "name": "Free Bet Operator 143 2",
       "network": "monad-mainnet",
       "paused": false,
-      "signer_id": "merkl_claimer_2",
+      "signer_id": "free_bet_operator_2",
       "network_type": "evm",
       "custom_rpc_urls": [
         {
@@ -768,11 +768,11 @@
       }
     },
     {
-      "id": "merkl_claimer_143_3",
-      "name": "Merkl Claimer 143 3",
+      "id": "free_bet_operator_143_3",
+      "name": "Free Bet Operator 143 3",
       "network": "monad-mainnet",
       "paused": false,
-      "signer_id": "merkl_claimer_3",
+      "signer_id": "free_bet_operator_3",
       "network_type": "evm",
       "custom_rpc_urls": [
         {
@@ -803,11 +803,11 @@
       }
     },
     {
-      "id": "merkl_claimer_143_4",
-      "name": "Merkl Claimer 143 4",
+      "id": "free_bet_operator_143_4",
+      "name": "Free Bet Operator 143 4",
       "network": "monad-mainnet",
       "paused": false,
-      "signer_id": "merkl_claimer_4",
+      "signer_id": "free_bet_operator_4",
       "network_type": "evm",
       "custom_rpc_urls": [
         {
@@ -838,11 +838,11 @@
       }
     },
     {
-      "id": "merkl_claimer_143_5",
-      "name": "Merkl Claimer 143 5",
+      "id": "free_bet_operator_143_5",
+      "name": "Free Bet Operator 143 5",
       "network": "monad-mainnet",
       "paused": false,
-      "signer_id": "merkl_claimer_5",
+      "signer_id": "free_bet_operator_5",
       "network_type": "evm",
       "custom_rpc_urls": [
         {
@@ -1036,7 +1036,7 @@
       }
     },
     {
-      "id": "merkl_claimer_1",
+      "id": "free_bet_operator_1",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
@@ -1044,7 +1044,7 @@
       }
     },
     {
-      "id": "merkl_claimer_2",
+      "id": "free_bet_operator_2",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
@@ -1052,7 +1052,7 @@
       }
     },
     {
-      "id": "merkl_claimer_3",
+      "id": "free_bet_operator_3",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
@@ -1060,7 +1060,7 @@
       }
     },
     {
-      "id": "merkl_claimer_4",
+      "id": "free_bet_operator_4",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
@@ -1068,7 +1068,7 @@
       }
     },
     {
-      "id": "merkl_claimer_5",
+      "id": "free_bet_operator_5",
       "type": "aws_kms",
       "config": {
         "region": "ap-south-1",
