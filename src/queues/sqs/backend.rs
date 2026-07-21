@@ -21,6 +21,7 @@ use crate::{
     },
     models::{DefaultAppState, NetworkType},
     queues::QueueBackendType,
+    utils::{aws_error::DisplayErrorContext, classify_sdk_error},
 };
 use actix_web::web::ThinData;
 
@@ -444,8 +445,13 @@ impl SqsBackend {
         }
 
         let response = request.send().await.map_err(|e| {
-            error!(error = %e, queue_url = %queue_url, "Failed to send message to SQS");
-            QueueBackendError::SqsError(format!("SendMessage failed: {e}"))
+            error!(
+                error.kind = classify_sdk_error(&e),
+                error.detail = %DisplayErrorContext(&e),
+                queue_url = %queue_url,
+                "Failed to send message to SQS"
+            );
+            QueueBackendError::SqsError(format!("SendMessage failed: {}", classify_sdk_error(&e)))
         })?;
 
         let message_id = response
@@ -501,7 +507,12 @@ impl SqsBackend {
         match sqs_client.get_queue_url().queue_name(dlq_name).send().await {
             Ok(output) => output.queue_url().map(str::to_string),
             Err(err) => {
-                warn!(error = %err, dlq_name = %dlq_name, "Failed to resolve DLQ URL at startup");
+                warn!(
+                    error.kind = classify_sdk_error(&err),
+                    error.detail = %DisplayErrorContext(&err),
+                    dlq_name = %dlq_name,
+                    "Failed to resolve DLQ URL at startup"
+                );
                 None
             }
         }
@@ -532,7 +543,12 @@ impl SqsBackend {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
             Err(err) => {
-                warn!(error = %err, dlq_url = %dlq_url, "Failed to fetch DLQ depth");
+                warn!(
+                    error.kind = classify_sdk_error(&err),
+                    error.detail = %DisplayErrorContext(&err),
+                    dlq_url = %dlq_url,
+                    "Failed to fetch DLQ depth"
+                );
                 0
             }
         }
@@ -737,6 +753,7 @@ impl QueueBackend for SqsBackend {
     async fn initialize_workers(
         &self,
         app_state: Arc<ThinData<DefaultAppState>>,
+        handle: tokio::runtime::Handle,
     ) -> Result<Vec<WorkerHandle>, QueueBackendError> {
         info!(
             "Initializing SQS workers for {} queues",
@@ -745,32 +762,41 @@ impl QueueBackend for SqsBackend {
 
         let mut handles = Vec::new();
 
-        // Spawn a worker for each queue type
+        // Spawn a worker for each queue type onto the pipeline runtime.
         for (queue_type, queue_url) in &self.queue_urls {
-            let handle = super::sqs_worker::spawn_worker_for_queue(
+            let worker_handle = super::sqs_worker::spawn_worker_for_queue(
                 self.sqs_client.clone(),
                 *queue_type,
                 queue_url.clone(),
                 app_state.clone(),
                 self.shutdown_tx.subscribe(),
+                handle.clone(),
             )
             .await?;
 
-            handles.push(handle);
+            handles.push(worker_handle);
         }
 
         // Start cron scheduler for periodic tasks (cleanup, token swaps)
-        let cron_scheduler =
-            super::sqs_cron::SqsCronScheduler::new(app_state.clone(), self.shutdown_tx.subscribe());
+        let cron_scheduler = super::sqs_cron::SqsCronScheduler::new(
+            app_state.clone(),
+            self.shutdown_tx.subscribe(),
+            handle.clone(),
+        );
         let cron_handles = cron_scheduler.start().await?;
         handles.extend(cron_handles);
 
         // Internal shutdown signal handler — listens for SIGINT/SIGTERM and
         // broadcasts shutdown to all SQS workers and cron tasks.
         // (Redis/Apalis workers handle signals via their own Monitor.)
+        //
+        // NOT pushed into `handles`: this task only resolves on an OS signal, so on a
+        // programmatic/server-driven shutdown (no signal sent) it would never complete
+        // and `drain_worker_handles` would block for the full drain timeout waiting on
+        // it instead of the real worker/cron tasks.
         {
             let shutdown_tx = self.shutdown_tx.clone();
-            let handle = tokio::spawn(async move {
+            handle.spawn(async move {
                 let mut sigint =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                         .expect("Failed to create SIGINT handler");
@@ -785,7 +811,6 @@ impl QueueBackend for SqsBackend {
 
                 let _ = shutdown_tx.send(true);
             });
-            handles.push(WorkerHandle::Tokio(handle));
         }
 
         info!(
@@ -845,7 +870,9 @@ impl QueueBackend for SqsBackend {
 
             health_statuses.push(QueueHealth {
                 queue_type: *queue_type,
-                messages_visible,
+                // SQS reports an approximate visible count (or 0 on probe error),
+                // both genuine values, so always `Some(..)`.
+                messages_visible: Some(messages_visible),
                 messages_in_flight,
                 messages_dlq,
                 backend: "sqs".to_string(),
