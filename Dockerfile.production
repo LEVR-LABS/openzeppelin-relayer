@@ -37,7 +37,7 @@ USER root
 RUN apk add --no-cache nodejs=~${NODE_VERSION} npm
 ENV PATH="/usr/local/bin:$PATH"
 
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10.34.5
 
 # Copy plugins folder and install dependencies
 COPY --chown=nonroot:nonroot ./plugins /app/plugins
