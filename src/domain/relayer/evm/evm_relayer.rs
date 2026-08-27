@@ -45,7 +45,7 @@ use crate::{
         EvmNetwork, HealthCheckFailure, JsonRpcRequest, JsonRpcResponse, NetworkRepoModel,
         NetworkRpcRequest, NetworkRpcResult, NetworkTransactionRequest, NetworkType,
         PaginationQuery, RelayerRepoModel, RelayerStatus, RepositoryError, RpcErrorCodes,
-        TransactionRepoModel, TransactionStatus,
+        TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{NetworkRepository, RelayerRepository, Repository, TransactionRepository},
     services::{
@@ -57,7 +57,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use eyre::Result;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::{create_error_response, create_success_response, EvmTransactionValidator};
 use crate::utils::{map_provider_error, sanitize_error_description};
@@ -72,15 +72,15 @@ where
     J: JobProducerTrait + Send + Sync + 'static,
     S: DataSignerTrait + Send + Sync + 'static,
 {
-    relayer: RelayerRepoModel,
-    signer: S,
-    network: EvmNetwork,
-    provider: P,
-    relayer_repository: Arc<RR>,
-    network_repository: Arc<NR>,
-    transaction_repository: Arc<TR>,
-    job_producer: Arc<J>,
-    transaction_counter_service: Arc<TCS>,
+    pub(super) relayer: RelayerRepoModel,
+    pub(super) signer: S,
+    pub(super) network: EvmNetwork,
+    pub(super) provider: P,
+    pub(super) relayer_repository: Arc<RR>,
+    pub(super) network_repository: Arc<NR>,
+    pub(super) transaction_repository: Arc<TR>,
+    pub(super) job_producer: Arc<J>,
+    pub(super) transaction_counter_service: Arc<TCS>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,45 +134,19 @@ where
         })
     }
 
-    /// Synchronizes the nonce with the blockchain.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or a `RelayerError` if the operation fails.
-    async fn sync_nonce(&self) -> Result<(), RelayerError> {
-        let on_chain_nonce = self
-            .provider
-            .get_transaction_count(&self.relayer.address)
-            .await
-            .map_err(|e| RelayerError::ProviderError(e.to_string()))?;
-
-        let transaction_counter_nonce = self
-            .transaction_counter_service
-            .get()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-
-        let nonce = std::cmp::max(on_chain_nonce, transaction_counter_nonce);
-
-        debug!(
-            "Relayer: {} - On-chain nonce: {}, Transaction counter nonce: {}",
-            self.relayer.id, on_chain_nonce, transaction_counter_nonce
-        );
-
-        debug!(nonce = %nonce, "setting nonce for relayer");
-
-        self.transaction_counter_service.set(nonce).await?;
-
-        Ok(())
-    }
-
     /// Validates the RPC connection to the blockchain provider.
     ///
     /// # Returns
     ///
     /// A `Result` indicating success or a `RelayerError` if the operation fails.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn validate_rpc(&self) -> Result<(), RelayerError> {
         self.provider
             .health_check()
@@ -191,6 +165,15 @@ where
     /// # Returns
     ///
     /// A `Result` indicating success or a `RelayerError` if the job creation fails.
+    #[instrument(
+        level = "debug",
+        skip(self, transaction),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+            tx_id = %transaction.id,
+        )
+    )]
     async fn cancel_transaction_via_job(
         &self,
         transaction: TransactionRepoModel,
@@ -234,6 +217,15 @@ where
     /// # Returns
     ///
     /// A `Result` containing the `TransactionRepoModel` or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self, network_transaction),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+            network_type = ?self.relayer.network_type,
+        )
+    )]
     async fn process_transaction_request(
         &self,
         network_transaction: NetworkTransactionRequest,
@@ -256,16 +248,11 @@ where
             .await
             .map_err(|e| RepositoryError::TransactionFailure(e.to_string()))?;
 
-        // Queue preparation job (immediate)
-        self.job_producer
-            .produce_transaction_request_job(
-                TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
-                None,
-            )
-            .await?;
-
-        // Queue status check job (with initial delay)
-        self.job_producer
+        // Status check FIRST - this is our safety net for monitoring.
+        // If this fails, mark transaction as failed and don't proceed.
+        // This ensures we never have an unmonitored transaction.
+        if let Err(e) = self
+            .job_producer
             .produce_check_transaction_status_job(
                 TransactionStatusCheck::new(
                     transaction.id.clone(),
@@ -275,6 +262,44 @@ where
                 Some(calculate_scheduled_timestamp(
                     EVM_STATUS_CHECK_INITIAL_DELAY_SECONDS,
                 )),
+            )
+            .await
+        {
+            // Status queue failed - mark transaction as failed to prevent orphaned tx
+            error!(
+                relayer_id = %self.relayer.id,
+                transaction_id = %transaction.id,
+                error = %e,
+                "Status check queue push failed - marking transaction as failed"
+            );
+            if let Err(update_err) = self
+                .transaction_repository
+                .partial_update(
+                    transaction.id.clone(),
+                    TransactionUpdateRequest {
+                        status: Some(TransactionStatus::Failed),
+                        status_reason: Some("Queue unavailable".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                warn!(
+                    relayer_id = %self.relayer.id,
+                    transaction_id = %transaction.id,
+                    error = %update_err,
+                    "Failed to mark transaction as failed after queue push failure"
+                );
+            }
+            return Err(e.into());
+        }
+
+        // Now safe to push transaction request.
+        // Even if this fails, status check will monitor and detect the stuck transaction.
+        self.job_producer
+            .produce_transaction_request_job(
+                TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
+                None,
             )
             .await?;
 
@@ -286,6 +311,14 @@ where
     /// # Returns
     ///
     /// A `Result` containing the `BalanceResponse` or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn get_balance(&self) -> Result<BalanceResponse, RelayerError> {
         let balance: u128 = self
             .provider
@@ -308,6 +341,14 @@ where
     /// # Returns
     ///
     /// A `Result` containing a boolean indicating the status or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn get_status(&self) -> Result<RelayerStatus, RelayerError> {
         let relayer_model = &self.relayer;
 
@@ -365,6 +406,14 @@ where
     ///
     /// A `Result` containing a `DeletePendingTransactionsResponse` with details
     /// about which transactions were cancelled and which failed, or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn delete_pending_transactions(
         &self,
     ) -> Result<DeletePendingTransactionsResponse, RelayerError> {
@@ -385,8 +434,8 @@ where
 
         if transaction_count == 0 {
             info!(
-                "No pending transactions found for relayer: {}",
-                self.relayer.id
+                relayer_id = %self.relayer.id,
+                "no pending transactions found for relayer"
             );
             return Ok(DeletePendingTransactionsResponse {
                 queued_for_cancellation_transaction_ids: vec![],
@@ -396,8 +445,9 @@ where
         }
 
         info!(
-            "Processing {} pending transactions for relayer: {}",
-            transaction_count, self.relayer.id
+            relayer_id = %self.relayer.id,
+            transaction_count = %transaction_count,
+            "processing pending transactions for relayer"
         );
 
         let mut cancelled_transaction_ids = Vec::new();
@@ -409,15 +459,19 @@ where
                 Ok(_) => {
                     cancelled_transaction_ids.push(transaction.id.clone());
                     info!(
-                        "Initiated cancellation for transaction {} with status {:?} for relayer {}",
-                        transaction.id, transaction.status, self.relayer.id
+                        tx_id = %transaction.id,
+                        relayer_id = %self.relayer.id,
+                        status = ?transaction.status,
+                        "initiated cancellation for transaction"
                     );
                 }
                 Err(e) => {
                     failed_transaction_ids.push(transaction.id.clone());
                     warn!(
-                        "Failed to cancel transaction {} for relayer {}: {}",
-                        transaction.id, self.relayer.id, e
+                        tx_id = %transaction.id,
+                        relayer_id = %self.relayer.id,
+                        error = %e,
+                        "failed to cancel transaction"
                     );
                 }
             }
@@ -447,6 +501,14 @@ where
     /// # Returns
     ///
     /// A `Result` containing the `SignDataResponse` or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_data(&self, request: SignDataRequest) -> Result<SignDataResponse, RelayerError> {
         let result = self.signer.sign_data(request).await?;
 
@@ -462,6 +524,14 @@ where
     /// # Returns
     ///
     /// A `Result` containing the `SignDataResponse` or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_typed_data(
         &self,
         request: SignTypedDataRequest,
@@ -480,6 +550,14 @@ where
     /// # Returns
     ///
     /// A `Result` containing the `JsonRpcResponse` or a `RelayerError`.
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn rpc(
         &self,
         request: JsonRpcRequest<NetworkRpcRequest>,
@@ -527,6 +605,14 @@ where
     /// # Returns
     ///
     /// A `Result` indicating success or a `RelayerError` if the balance is insufficient.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn validate_min_balance(&self) -> Result<(), RelayerError> {
         let policy = self.relayer.policies.get_evm_policy();
         EvmTransactionValidator::init_balance_validation(
@@ -545,8 +631,16 @@ where
     /// # Returns
     ///
     /// A `Result` indicating success or a `RelayerError` if any initialization step fails.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn check_health(&self) -> Result<(), Vec<HealthCheckFailure>> {
-        debug!("running health checks for EVM relayer {}", self.relayer.id);
+        debug!("running health checks");
 
         let nonce_sync_result = self.sync_nonce().await;
         let validate_rpc_result = self.validate_rpc().await;
@@ -577,8 +671,16 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn initialize_relayer(&self) -> Result<(), RelayerError> {
-        debug!("initializing EVM relayer {}", self.relayer.id);
+        debug!("initializing EVM relayer");
 
         match self.check_health().await {
             Ok(_) => {
@@ -630,6 +732,14 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, _request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_transaction(
         &self,
         _request: &SignTransactionRequest,
@@ -723,6 +833,7 @@ mod tests {
             signer_id: "test-signer-id".to_string(),
             notification_id: Some("test-notification-id".to_string()),
             policies: RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+                include_revert_data: None,
                 min_balance: Some(100000000000000000u128), // 0.1 ETH
                 whitelist_receivers: Some(vec!["0xRecipient".to_string()]),
                 gas_price_cap: Some(100000000000), // 100 Gwei
@@ -841,6 +952,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_transaction_request_status_check_failure_returns_error() {
+        let (
+            provider,
+            relayer_repo,
+            mut network_repo,
+            mut tx_repo,
+            mut job_producer,
+            signer,
+            counter,
+        ) = setup_mocks();
+        let relayer_model = create_test_relayer();
+
+        let network_tx = NetworkTransactionRequest::Evm(crate::models::EvmTransactionRequest {
+            to: Some("0xRecipient".to_string()),
+            value: U256::from(1000000000000000000u64),
+            data: Some("0xData".to_string()),
+            gas_limit: Some(21000),
+            gas_price: Some(20000000000),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            speed: None,
+            valid_until: None,
+        });
+
+        network_repo
+            .expect_get_by_name()
+            .with(eq(NetworkType::Evm), eq("mainnet"))
+            .returning(|_, _| Ok(Some(create_test_network_repo_model())));
+
+        tx_repo.expect_create().returning(Ok);
+        // When status check fails, transaction is marked as failed
+        tx_repo
+            .expect_partial_update()
+            .returning(|_, _| Ok(TransactionRepoModel::default()));
+
+        // Status check fails
+        job_producer
+            .expect_produce_check_transaction_status_job()
+            .returning(|_, _| {
+                Box::pin(ready(Err(crate::jobs::JobProducerError::QueueError(
+                    "Failed to queue job".to_string(),
+                ))))
+            });
+
+        // Transaction request should NOT be called when status check fails
+        // (no expectation set = test fails if called)
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.process_transaction_request(network_tx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_transaction_request_status_check_failure_marks_tx_failed() {
+        let (
+            provider,
+            relayer_repo,
+            mut network_repo,
+            mut tx_repo,
+            mut job_producer,
+            signer,
+            counter,
+        ) = setup_mocks();
+        let relayer_model = create_test_relayer();
+
+        let network_tx = NetworkTransactionRequest::Evm(crate::models::EvmTransactionRequest {
+            to: Some("0xRecipient".to_string()),
+            value: U256::from(1000000000000000000u64),
+            data: Some("0xData".to_string()),
+            gas_limit: Some(21000),
+            gas_price: Some(20000000000),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            speed: None,
+            valid_until: None,
+        });
+
+        network_repo
+            .expect_get_by_name()
+            .with(eq(NetworkType::Evm), eq("mainnet"))
+            .returning(|_, _| Ok(Some(create_test_network_repo_model())));
+
+        tx_repo.expect_create().returning(Ok);
+
+        // Verify partial_update is called with correct status and reason
+        tx_repo
+            .expect_partial_update()
+            .withf(|_tx_id, update| {
+                update.status == Some(TransactionStatus::Failed)
+                    && update.status_reason == Some("Queue unavailable".to_string())
+            })
+            .returning(|_, _| Ok(TransactionRepoModel::default()));
+
+        job_producer
+            .expect_produce_check_transaction_status_job()
+            .returning(|_, _| {
+                Box::pin(ready(Err(crate::jobs::JobProducerError::QueueError(
+                    "Redis timeout".to_string(),
+                ))))
+            });
+
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let result = relayer.process_transaction_request(network_tx).await;
+        assert!(result.is_err());
+        // The mock verification (withf) ensures partial_update was called correctly
+    }
+
+    #[tokio::test]
     async fn test_validate_min_balance_sufficient() {
         let (mut provider, relayer_repo, network_repo, tx_repo, job_producer, signer, counter) =
             setup_mocks();
@@ -908,12 +1151,9 @@ mod tests {
             .returning(|_| Box::pin(ready(Ok(42u64))));
 
         counter
-            .expect_set()
-            .returning(|_nonce| Box::pin(ready(Ok(()))));
-
-        counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+            .expect_sync_floor()
+            .with(eq(42u64))
+            .returning(|floor| Box::pin(ready(Ok(floor))));
 
         let relayer = EvmRelayer::new(
             relayer_model,
@@ -942,14 +1182,11 @@ mod tests {
             .expect_get_transaction_count()
             .returning(|_| Box::pin(ready(Ok(40u64))));
 
+        // Chain nonce (40) is below the counter; sync_floor(40) leaves it at 42.
         counter
-            .expect_set()
-            .with(eq(42u64))
-            .returning(|_nonce| Box::pin(ready(Ok(()))));
-
-        counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+            .expect_sync_floor()
+            .with(eq(40u64))
+            .returning(|_| Box::pin(ready(Ok(42u64))));
 
         let relayer = EvmRelayer::new(
             relayer_model,
@@ -978,14 +1215,11 @@ mod tests {
             .expect_get_transaction_count()
             .returning(|_| Box::pin(ready(Ok(42u64))));
 
+        // Chain nonce (42) is above the counter; sync_floor(42) raises it to 42.
         counter
-            .expect_set()
+            .expect_sync_floor()
             .with(eq(42u64))
-            .returning(|_nonce| Box::pin(ready(Ok(()))));
-
-        counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(40u64)))));
+            .returning(|floor| Box::pin(ready(Ok(floor))));
 
         let relayer = EvmRelayer::new(
             relayer_model,
@@ -1085,7 +1319,7 @@ mod tests {
                     && statuses == [TransactionStatus::Confirmed]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == false
+                    && !(*oldest_first)
             })
             .returning(move |_, _, _, _| {
                 Ok(crate::repositories::PaginatedResult {
@@ -1171,7 +1405,7 @@ mod tests {
                 statuses == [TransactionStatus::Confirmed]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == false
+                    && !(*oldest_first)
             })
             .returning(|_, _, _, _| {
                 Ok(crate::repositories::PaginatedResult {
@@ -1312,7 +1546,7 @@ mod tests {
                     && statuses == [TransactionStatus::Confirmed]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == false
+                    && !(*oldest_first)
             })
             .returning(|_, _, _, _| {
                 Ok(crate::repositories::PaginatedResult {
@@ -2600,11 +2834,9 @@ mod tests {
             .expect_get_transaction_count()
             .returning(|_| Box::pin(ready(Ok(42u64))));
 
-        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
-
         counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+            .expect_sync_floor()
+            .returning(|floor| Box::pin(ready(Ok(floor))));
 
         provider
             .expect_get_balance()
@@ -2651,11 +2883,9 @@ mod tests {
             .expect_get_transaction_count()
             .returning(|_| Box::pin(ready(Ok(42u64))));
 
-        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
-
         counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+            .expect_sync_floor()
+            .returning(|floor| Box::pin(ready(Ok(floor))));
 
         provider
             .expect_get_balance()
@@ -2704,11 +2934,9 @@ mod tests {
             .expect_get_transaction_count()
             .returning(|_| Box::pin(ready(Ok(42u64))));
 
-        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
-
         counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+            .expect_sync_floor()
+            .returning(|floor| Box::pin(ready(Ok(floor))));
 
         provider
             .expect_get_balance()
@@ -2775,11 +3003,9 @@ mod tests {
             .expect_get_transaction_count()
             .returning(|_| Box::pin(ready(Ok(42u64))));
 
-        counter.expect_set().returning(|_| Box::pin(ready(Ok(()))));
-
         counter
-            .expect_get()
-            .returning(|| Box::pin(ready(Ok(Some(42u64)))));
+            .expect_sync_floor()
+            .returning(|floor| Box::pin(ready(Ok(floor))));
 
         provider
             .expect_get_balance()

@@ -1,7 +1,21 @@
 use std::num::ParseIntError;
+use std::time::Duration;
+
+use once_cell::sync::Lazy;
+use reqwest::Client as ReqwestClient;
+use tracing::debug;
 
 use crate::config::ServerConfig;
+use crate::constants::{
+    matches_known_transaction, ALREADY_SUBMITTED_PATTERNS,
+    DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
+    DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
+    DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS, DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST,
+    DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS, NONCE_TOO_HIGH_PATTERNS,
+};
 use crate::models::{EvmNetwork, RpcConfig, SolanaNetwork, StellarNetwork};
+use crate::utils::create_secure_redirect_policy;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -96,6 +110,51 @@ impl ProviderConfig {
         let server_config = ServerConfig::from_env();
         Self::from_server_config(&server_config, rpc_configs)
     }
+}
+
+/// Pre-configured `reqwest::ClientBuilder` with standard pool, keepalive, TLS,
+/// and redirect settings. Callers chain on extras (e.g., `.timeout(...)`) then `.build()`.
+///
+/// Response compression: the crate-level reqwest `zstd` feature (see Cargo.toml)
+/// makes clients built here send `Accept-Encoding: zstd` and transparently
+/// decompress zstd responses from providers that support it (e.g. QuickNode).
+fn base_rpc_client_builder() -> reqwest::ClientBuilder {
+    ReqwestClient::builder()
+        .connect_timeout(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
+        ))
+        .pool_max_idle_per_host(DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS,
+        ))
+        .tcp_keepalive(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS,
+        ))
+        .http2_keep_alive_interval(Some(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
+        )))
+        .http2_keep_alive_timeout(Duration::from_secs(
+            DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
+        ))
+        .use_rustls_tls()
+        .redirect(create_secure_redirect_policy())
+}
+
+/// Shared `reqwest::Client` for RPC providers that set per-request timeouts
+/// (e.g., Stellar raw HTTP). No request-level timeout is baked in.
+static SHARED_RPC_HTTP_CLIENT: Lazy<Result<ReqwestClient, String>> = Lazy::new(|| {
+    debug!("Creating shared RPC HTTP client");
+    base_rpc_client_builder()
+        .build()
+        .map_err(|e| format!("Failed to create shared RPC HTTP client: {e}"))
+});
+
+/// Get the shared RPC HTTP client (no per-request timeout).
+pub fn get_shared_rpc_http_client() -> Result<ReqwestClient, ProviderError> {
+    SHARED_RPC_HTTP_CLIENT
+        .as_ref()
+        .map(|c| c.clone())
+        .map_err(|e| ProviderError::NetworkConfiguration(e.clone()))
 }
 
 #[derive(Error, Debug, Serialize)]
@@ -374,6 +433,23 @@ pub fn should_mark_provider_failed(error: &ProviderError) -> bool {
     }
 }
 
+/// Returns true if the RPC error message indicates a transaction-level error
+/// that should not be retried — the RPC is working correctly, but rejecting
+/// the transaction itself.
+///
+/// Uses the shared `ALREADY_SUBMITTED_PATTERNS` from constants, consistent with
+/// `is_already_submitted_error` in `domain::transaction::evm::evm_transaction`.
+fn is_non_retriable_transaction_rpc_message(message: &str) -> bool {
+    let msg_lower = message.to_lowercase();
+    ALREADY_SUBMITTED_PATTERNS
+        .iter()
+        .any(|p| msg_lower.contains(p))
+        || NONCE_TOO_HIGH_PATTERNS
+            .iter()
+            .any(|p| msg_lower.contains(p))
+        || matches_known_transaction(&msg_lower)
+}
+
 // Errors that are retriable
 pub fn is_retriable_error(error: &ProviderError) -> bool {
     match error {
@@ -403,14 +479,16 @@ pub fn is_retriable_error(error: &ProviderError) -> bool {
         }
 
         // JSON-RPC error codes (EIP-1474)
-        ProviderError::RpcErrorCode { code, .. } => {
+        ProviderError::RpcErrorCode { code, message } => {
             match code {
-                // -32002: Resource unavailable (temporary state)
-                -32002 => true,
+                // -32002: Resource unavailable — retriable unless the message indicates a
+                // transaction-level rejection (some providers wrap nonce/tx errors here)
+                -32002 => !is_non_retriable_transaction_rpc_message(message),
                 // -32005: Limit exceeded / rate limited
                 -32005 => true,
-                // -32603: Internal error (may be temporary)
-                -32603 => true,
+                // -32603: Internal error — retriable unless the message indicates a
+                // transaction-level rejection (some providers wrap nonce/tx errors here)
+                -32603 => !is_non_retriable_transaction_rpc_message(message),
                 // -32000: Invalid input
                 -32000 => false,
                 // -32001: Resource not found
@@ -626,6 +704,37 @@ mod tests {
         assert!(matches!(provider_error, ProviderError::Other(_)));
     }
 
+    #[actix_rt::test]
+    async fn test_shared_rpc_client_zstd_response_decompression() {
+        let mut mock_server = mockito::Server::new_async().await;
+
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}});
+        let compressed = zstd::encode_all(body.to_string().as_bytes(), 3).unwrap();
+
+        let mock = mock_server
+            .mock("POST", "/")
+            .match_header(
+                "accept-encoding",
+                mockito::Matcher::Regex("zstd".to_string()),
+            )
+            .with_header("content-encoding", "zstd")
+            .with_body(compressed)
+            .create_async()
+            .await;
+
+        let client = get_shared_rpc_http_client().unwrap();
+        let response = client
+            .post(mock_server.url())
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "test"}))
+            .send()
+            .await
+            .unwrap();
+
+        let json: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(json["result"]["ok"], true);
+        mock.assert_async().await;
+    }
+
     #[test]
     fn test_from_eyre_report_other_error() {
         let eyre_error: eyre::Report = eyre::eyre!("Generic error");
@@ -836,7 +945,7 @@ mod tests {
             code: -32000,
             message: "insufficient funds".to_string(),
         };
-        let error_string = format!("{}", error);
+        let error_string = format!("{error}");
         assert!(error_string.contains("-32000"));
         assert!(error_string.contains("insufficient funds"));
     }
@@ -864,13 +973,12 @@ mod tests {
         // 5xx errors should mark provider as failed
         for status_code in 500..=599 {
             let error = ProviderError::RequestError {
-                error: format!("Server error {}", status_code),
+                error: format!("Server error {status_code}"),
                 status_code,
             };
             assert!(
                 should_mark_provider_failed(&error),
-                "Status code {} should mark provider as failed",
-                status_code
+                "Status code {status_code} should mark provider as failed"
             );
         }
     }
@@ -881,13 +989,12 @@ mod tests {
         let auth_errors = [401, 403];
         for &status_code in &auth_errors {
             let error = ProviderError::RequestError {
-                error: format!("Auth error {}", status_code),
+                error: format!("Auth error {status_code}"),
                 status_code,
             };
             assert!(
                 should_mark_provider_failed(&error),
-                "Status code {} should mark provider as failed",
-                status_code
+                "Status code {status_code} should mark provider as failed"
             );
         }
     }
@@ -898,13 +1005,12 @@ mod tests {
         let not_found_errors = [404, 410];
         for &status_code in &not_found_errors {
             let error = ProviderError::RequestError {
-                error: format!("Not found error {}", status_code),
+                error: format!("Not found error {status_code}"),
                 status_code,
             };
             assert!(
                 should_mark_provider_failed(&error),
-                "Status code {} should mark provider as failed",
-                status_code
+                "Status code {status_code} should mark provider as failed"
             );
         }
     }
@@ -915,13 +1021,12 @@ mod tests {
         let client_errors = [400, 405, 413, 414, 415, 422, 429];
         for &status_code in &client_errors {
             let error = ProviderError::RequestError {
-                error: format!("Client error {}", status_code),
+                error: format!("Client error {status_code}"),
                 status_code,
             };
             assert!(
                 !should_mark_provider_failed(&error),
-                "Status code {} should NOT mark provider as failed",
-                status_code
+                "Status code {status_code} should NOT mark provider as failed"
             );
         }
     }
@@ -941,8 +1046,7 @@ mod tests {
         for error in errors {
             assert!(
                 !should_mark_provider_failed(&error),
-                "Error type {:?} should NOT mark provider as failed",
-                error
+                "Error type {error:?} should NOT mark provider as failed"
             );
         }
     }
@@ -960,7 +1064,7 @@ mod tests {
 
         for (status_code, should_fail) in edge_cases {
             let error = ProviderError::RequestError {
-                error: format!("Edge case error {}", status_code),
+                error: format!("Edge case error {status_code}"),
                 status_code,
             };
             assert_eq!(
@@ -986,8 +1090,7 @@ mod tests {
         for error in retriable_errors {
             assert!(
                 is_retriable_error(&error),
-                "Error type {:?} should be retriable",
-                error
+                "Error type {error:?} should be retriable"
             );
         }
     }
@@ -1007,8 +1110,7 @@ mod tests {
         for error in non_retriable_errors {
             assert!(
                 !is_retriable_error(&error),
-                "Error type {:?} should NOT be retriable",
-                error
+                "Error type {error:?} should NOT be retriable"
             );
         }
     }
@@ -1028,8 +1130,7 @@ mod tests {
             let error = ProviderError::Other(message.to_string());
             assert!(
                 is_retriable_error(&error),
-                "Error with message '{}' should be retriable",
-                message
+                "Error with message '{message}' should be retriable"
             );
         }
     }
@@ -1049,8 +1150,7 @@ mod tests {
             let error = ProviderError::Other(message.to_string());
             assert!(
                 !is_retriable_error(&error),
-                "Error with message '{}' should NOT be retriable",
-                message
+                "Error with message '{message}' should NOT be retriable"
             );
         }
     }
@@ -1074,8 +1174,7 @@ mod tests {
             let error = ProviderError::Other(message.to_string());
             assert!(
                 is_retriable_error(&error),
-                "Error with message '{}' should be retriable (case insensitive)",
-                message
+                "Error with message '{message}' should be retriable (case insensitive)"
             );
         }
     }
@@ -1103,9 +1202,7 @@ mod tests {
             };
             assert!(
                 is_retriable_error(&error),
-                "Status code {} ({}) should be retriable",
-                status_code,
-                description
+                "Status code {status_code} ({description}) should be retriable"
             );
         }
     }
@@ -1125,9 +1222,7 @@ mod tests {
             };
             assert!(
                 !is_retriable_error(&error),
-                "Status code {} ({}) should NOT be retriable",
-                status_code,
-                description
+                "Status code {status_code} ({description}) should NOT be retriable"
             );
         }
     }
@@ -1148,9 +1243,7 @@ mod tests {
             };
             assert!(
                 is_retriable_error(&error),
-                "Status code {} ({}) should be retriable",
-                status_code,
-                description
+                "Status code {status_code} ({description}) should be retriable"
             );
         }
     }
@@ -1194,9 +1287,7 @@ mod tests {
             };
             assert!(
                 !is_retriable_error(&error),
-                "Status code {} ({}) should NOT be retriable",
-                status_code,
-                description
+                "Status code {status_code} ({description}) should NOT be retriable"
             );
         }
     }
@@ -1225,9 +1316,7 @@ mod tests {
             };
             assert!(
                 !is_retriable_error(&error),
-                "Status code {} ({}) should NOT be retriable",
-                status_code,
-                description
+                "Status code {status_code} ({description}) should NOT be retriable"
             );
         }
     }
@@ -1271,6 +1360,99 @@ mod tests {
                 description,
                 if should_be_retriable { "" } else { " NOT" }
             );
+        }
+    }
+
+    #[test]
+    fn test_is_non_retriable_transaction_rpc_message() {
+        // Positive cases: these messages should be recognized as non-retriable
+        assert!(is_non_retriable_transaction_rpc_message("nonce too low"));
+        assert!(is_non_retriable_transaction_rpc_message("Nonce Too Low"));
+        assert!(is_non_retriable_transaction_rpc_message("nonce is too low"));
+        assert!(is_non_retriable_transaction_rpc_message("already known"));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "known transaction"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "Known Transaction"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "replacement transaction underpriced"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "same hash was already imported"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "Transaction nonce too low"
+        ));
+
+        // Negative cases: generic/unrelated messages should not match
+        assert!(!is_non_retriable_transaction_rpc_message("Internal error"));
+        assert!(!is_non_retriable_transaction_rpc_message("server busy"));
+        assert!(!is_non_retriable_transaction_rpc_message(""));
+        // "unknown transaction" must NOT match "known transaction"
+        assert!(!is_non_retriable_transaction_rpc_message(
+            "Unknown transaction status"
+        ));
+
+        // Nonce-too-high patterns are also non-retriable
+        assert!(is_non_retriable_transaction_rpc_message("nonce too high"));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "nonce too far in the future",
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "exceeds next nonce"
+        ));
+        assert!(is_non_retriable_transaction_rpc_message(
+            "Nonce Too Far In The Future"
+        ));
+    }
+
+    #[test]
+    fn test_is_retriable_error_rpc_tx_errors_not_retriable() {
+        // Transaction-level messages that should NOT be retriable regardless of code
+        let non_retriable_messages = vec![
+            "Transaction nonce too low",
+            "nonce too low",
+            "nonce is too low",
+            "already known",
+            "known transaction",
+            "replacement transaction underpriced",
+            "same hash was already imported",
+        ];
+
+        // Messages that should remain retriable (generic/unrelated)
+        let retriable_messages = vec![
+            "Internal error",
+            "",
+            // "unknown transaction" must NOT false-positive on "known transaction"
+            "Unknown transaction status",
+            "Resource unavailable",
+        ];
+
+        // Both -32603 and -32002 should behave the same way for tx-level messages
+        for code in [-32603, -32002] {
+            for message in &non_retriable_messages {
+                let error = ProviderError::RpcErrorCode {
+                    code,
+                    message: message.to_string(),
+                };
+                assert!(
+                    !is_retriable_error(&error),
+                    "{code} with message {message:?} should NOT be retriable"
+                );
+            }
+
+            for message in &retriable_messages {
+                let error = ProviderError::RpcErrorCode {
+                    code,
+                    message: message.to_string(),
+                };
+                assert!(
+                    is_retriable_error(&error),
+                    "{code} with message {message:?} should be retriable"
+                );
+            }
         }
     }
 }

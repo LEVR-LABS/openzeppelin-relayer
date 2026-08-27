@@ -4,8 +4,6 @@
 //! It implements common operations like getting balances, sending transactions, and querying
 //! blockchain state.
 
-use std::time::Duration;
-
 use alloy::{
     network::AnyNetwork,
     primitives::{Bytes, TxKind, Uint},
@@ -17,7 +15,10 @@ use alloy::{
         client::ClientBuilder,
         types::{BlockNumberOrTag, FeeHistory, TransactionInput, TransactionRequest},
     },
-    transports::http::Http,
+    transports::{
+        http::{reqwest as alloy_reqwest, Http},
+        RpcError,
+    },
 };
 
 type EvmProviderType = FillProvider<
@@ -30,20 +31,12 @@ type EvmProviderType = FillProvider<
 >;
 use async_trait::async_trait;
 use eyre::Result;
-use reqwest::ClientBuilder as ReqwestClientBuilder;
 use serde_json;
 use tracing::debug;
 
 use super::rpc_selector::RpcSelector;
 use super::{retry_rpc_call, ProviderConfig, RetryConfig};
 use crate::{
-    constants::{
-        DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
-        DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
-        DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
-        DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS, DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST,
-        DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS,
-    },
     models::{
         BlockResponse, EvmTransactionData, RpcConfig, TransactionError, TransactionReceipt, U256,
     },
@@ -51,7 +44,7 @@ use crate::{
     utils::mask_url,
 };
 
-use crate::utils::{create_secure_redirect_policy, validate_safe_url};
+use crate::utils::validate_safe_url;
 
 #[cfg(test)]
 use mockall::automock;
@@ -160,6 +153,35 @@ pub trait EvmProviderTrait: Send + Sync {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError>;
+
+    /// Like [`Self::raw_request_dyn`], but a failure never marks the provider as failed.
+    ///
+    /// Intended for best-effort, diagnostic calls (e.g. `debug_traceTransaction` during
+    /// revert-data recovery) that must not influence provider health accounting: a node that
+    /// gates the method rejects it with a non-retriable 403/404/`-32601`, which the normal path
+    /// would count as a provider failure and could pause an otherwise-healthy RPC for all traffic.
+    async fn raw_request_dyn_best_effort(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError>;
+
+    /// Re-executes `tx` as an `eth_call` at `block_number` and extracts the on-chain revert
+    /// payload from the JSON-RPC error `data` field, bypassing the lossy `From<RpcError>`
+    /// conversion that would otherwise discard it.
+    ///
+    /// Returns:
+    /// - `Ok(Some(bytes))` when the call reverts with a decodable revert payload.
+    /// - `Ok(None)` only when the call unexpectedly succeeds (no revert to surface).
+    /// - `Err(..)` for every other error response — including a revert-less error response —
+    ///   so retriable JSON-RPC codes still reach the retry/failover path instead of being
+    ///   silently collapsed into "no revert data". This call is best-effort and never marks the
+    ///   provider as failed.
+    async fn get_call_revert_data(
+        &self,
+        tx: &TransactionRequest,
+        block_number: u64,
+    ) -> Result<Option<Bytes>, ProviderError>;
 }
 
 impl EvmProvider {
@@ -210,7 +232,6 @@ impl EvmProvider {
 
     /// Initialize a provider for a given URL
     fn initialize_provider(&self, url: &str) -> Result<EvmProviderType, ProviderError> {
-        // Re-validate URL security as a safety net
         let allowed_hosts = crate::config::ServerConfig::get_rpc_allowed_hosts();
         let block_private_ips = crate::config::ServerConfig::get_rpc_block_private_ips();
         validate_safe_url(url, &allowed_hosts, block_private_ips).map_err(|e| {
@@ -222,25 +243,13 @@ impl EvmProvider {
             .parse()
             .map_err(|e| ProviderError::NetworkConfiguration(format!("Invalid URL format: {e}")))?;
 
-        // Using use_rustls_tls() forces the use of rustls instead of native-tls to support TLS 1.3
-        let client = ReqwestClientBuilder::new()
-            .timeout(Duration::from_secs(self.timeout_seconds))
-            .connect_timeout(Duration::from_secs(DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS))
-            .pool_max_idle_per_host(DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS))
-            .tcp_keepalive(Duration::from_secs(DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS))
-            .http2_keep_alive_interval(Some(Duration::from_secs(
-                DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
-            )))
-            .http2_keep_alive_timeout(Duration::from_secs(
-                DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
-            ))
-            .use_rustls_tls()
-            // Allow only HTTP→HTTPS redirects on same host to handle legitimate protocol upgrades
-            // while preventing SSRF via redirect chains to different hosts
-            .redirect(create_secure_redirect_policy())
-            .build()
-            .map_err(|e| ProviderError::Other(format!("Failed to build HTTP client: {e}")))?;
+        // Build the HTTP client using alloy's re-exported reqwest so the Client
+        // type matches what alloy-transport-http expects, even when nightly cargo
+        // updates bump alloy (and its transitive reqwest) ahead of the direct
+        // reqwest dependency. All settings here MUST mirror
+        // `base_rpc_client_builder()` in `services::provider::mod` — in particular
+        // `use_rustls_tls()` and the secure redirect policy are SSRF-relevant.
+        let client = build_alloy_rpc_http_client(self.timeout_seconds)?;
 
         let mut transport = Http::new(rpc_url);
         transport.set_client(client);
@@ -289,6 +298,123 @@ impl EvmProvider {
         )
         .await
     }
+
+    /// Like [`Self::retry_rpc_call`], but never marks the provider as failed.
+    ///
+    /// Best-effort, diagnostic calls (e.g. revert-data recovery) must not affect provider
+    /// health accounting: a gateway that gates `debug_*` behind a plan rejects it with a
+    /// non-retriable 403/404 (or a `-32601`), which the normal path would count as a provider
+    /// failure and could pause an otherwise-healthy RPC for all traffic. Retries and failover
+    /// still apply; only the "mark failed" side effect is suppressed.
+    async fn retry_rpc_call_best_effort<T, F, Fut>(
+        &self,
+        operation_name: &str,
+        operation: F,
+    ) -> Result<T, ProviderError>
+    where
+        F: Fn(EvmProviderType) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ProviderError>>,
+    {
+        retry_rpc_call(
+            &self.selector,
+            operation_name,
+            is_retriable_error,
+            |_| false,
+            |url| match self.initialize_provider(url) {
+                Ok(provider) => Ok(provider),
+                Err(e) => Err(e),
+            },
+            operation,
+            Some(self.retry_config.clone()),
+        )
+        .await
+    }
+
+    /// Shared body for [`EvmProviderTrait::raw_request_dyn`] and its best-effort variant. When
+    /// `best_effort` is set, a failure never marks the provider as failed.
+    async fn raw_request_dyn_inner(
+        &self,
+        operation_name: &str,
+        method: &str,
+        params: serde_json::Value,
+        best_effort: bool,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let operation = move |provider: EvmProviderType| {
+            let params_clone = params.clone();
+            let method = method.to_string();
+            async move {
+                // Convert params to RawValue and use Cow for method
+                let params_raw = serde_json::value::to_raw_value(&params_clone).map_err(|e| {
+                    ProviderError::Other(format!("Failed to serialize params: {e}"))
+                })?;
+
+                let result = provider
+                    .raw_request_dyn(std::borrow::Cow::Owned(method), &params_raw)
+                    .await
+                    .map_err(ProviderError::from)?;
+
+                // Convert RawValue back to Value
+                serde_json::from_str(result.get())
+                    .map_err(|e| ProviderError::Other(format!("Failed to deserialize result: {e}")))
+            }
+        };
+
+        if best_effort {
+            self.retry_rpc_call_best_effort(operation_name, operation)
+                .await
+        } else {
+            self.retry_rpc_call(operation_name, operation).await
+        }
+    }
+}
+
+/// Builds an `alloy_reqwest::Client` for EVM RPC transport with all the
+/// hardening that `services::provider::mod::base_rpc_client_builder` applies:
+/// connect/request timeouts, pool tuning, TCP+HTTP/2 keepalive, rustls TLS,
+/// and a same-host HTTP→HTTPS-only redirect policy (SSRF defense).
+///
+/// We can't simply call `base_rpc_client_builder()` because under nightly cargo
+/// updates alloy may pull in a different reqwest minor than the direct dep, so
+/// the `Client` type would mismatch at `Http::set_client`. The redirect policy
+/// logic is shared via [`crate::utils::evaluate_redirect_decision`] — both
+/// builders make the same security decision from the same pure core.
+fn build_alloy_rpc_http_client(
+    timeout_seconds: u64,
+) -> Result<alloy_reqwest::Client, ProviderError> {
+    use crate::utils::{evaluate_redirect_decision, RedirectDecision};
+    use alloy_reqwest::redirect::{Attempt, Policy};
+
+    let redirect_policy = Policy::custom(|attempt: Attempt| {
+        match evaluate_redirect_decision(attempt.url(), attempt.previous()) {
+            RedirectDecision::Follow => attempt.follow(),
+            RedirectDecision::Stop => attempt.stop(),
+        }
+    });
+
+    alloy_reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            crate::constants::DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
+        ))
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .pool_max_idle_per_host(crate::constants::DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(std::time::Duration::from_secs(
+            crate::constants::DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS,
+        ))
+        .tcp_keepalive(std::time::Duration::from_secs(
+            crate::constants::DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS,
+        ))
+        .http2_keep_alive_interval(Some(std::time::Duration::from_secs(
+            crate::constants::DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
+        )))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(
+            crate::constants::DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
+        ))
+        .use_rustls_tls()
+        .redirect(redirect_policy)
+        .build()
+        .map_err(|e| {
+            ProviderError::NetworkConfiguration(format!("Failed to build RPC HTTP client: {e}"))
+        })
 }
 
 impl AsRef<EvmProvider> for EvmProvider {
@@ -474,22 +600,53 @@ impl EvmProviderTrait for EvmProvider {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
-        self.retry_rpc_call("raw_request_dyn", move |provider| {
-            let params_clone = params.clone();
+        self.raw_request_dyn_inner("raw_request_dyn", method, params, false)
+            .await
+    }
+
+    async fn raw_request_dyn_best_effort(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.raw_request_dyn_inner("raw_request_dyn_best_effort", method, params, true)
+            .await
+    }
+
+    async fn get_call_revert_data(
+        &self,
+        tx: &TransactionRequest,
+        block_number: u64,
+    ) -> Result<Option<Bytes>, ProviderError> {
+        // A revert surfaces as an `ErrorResp` carrying the payload in its `data` field; we extract
+        // it directly here, before the lossy `From<RpcError>` conversion would drop it. Error
+        // responses that carry no revert data (rate limits, internal errors, etc.) are forwarded as
+        // `Err` so the selector can retry/failover on retriable codes instead of mistaking a
+        // transient failure for "no revert data". Best-effort recovery must not mark the provider
+        // as failed, so this uses the non-marking retry path.
+        self.retry_rpc_call_best_effort("get_call_revert_data", move |provider| {
+            let tx_req = tx.clone();
             async move {
-                // Convert params to RawValue and use Cow for method
-                let params_raw = serde_json::value::to_raw_value(&params_clone).map_err(|e| {
-                    ProviderError::Other(format!("Failed to serialize params: {e}"))
-                })?;
-
-                let result = provider
-                    .raw_request_dyn(std::borrow::Cow::Owned(method.to_string()), &params_raw)
+                match provider
+                    .call(tx_req.into())
+                    .block(block_number.into())
                     .await
-                    .map_err(ProviderError::from)?;
-
-                // Convert RawValue back to Value
-                serde_json::from_str(result.get())
-                    .map_err(|e| ProviderError::Other(format!("Failed to deserialize result: {e}")))
+                {
+                    // The call unexpectedly succeeded: no revert data to surface.
+                    Ok(_) => Ok(None),
+                    Err(e) => {
+                        // A reverting call returns a JSON-RPC error whose `data` holds the payload.
+                        let revert_data = match &e {
+                            RpcError::ErrorResp(payload) => payload.as_revert_data(),
+                            _ => None,
+                        };
+                        match revert_data {
+                            Some(data) => Ok(Some(data)),
+                            // Not an actual revert: surface as an error so retry/failover applies.
+                            None => Err(ProviderError::from(e)),
+                        }
+                    }
+                }
             }
         })
         .await
@@ -499,19 +656,18 @@ impl EvmProviderTrait for EvmProvider {
 impl TryFrom<&EvmTransactionData> for TransactionRequest {
     type Error = TransactionError;
     fn try_from(tx: &EvmTransactionData) -> Result<Self, Self::Error> {
+        let to = match tx.to.as_ref() {
+            Some(address) => TxKind::Call(address.parse().map_err(|_| {
+                TransactionError::InvalidType("Invalid address format".to_string())
+            })?),
+            None => TxKind::Create,
+        };
+
         Ok(TransactionRequest {
             from: Some(tx.from.clone().parse().map_err(|_| {
                 TransactionError::InvalidType("Invalid address format".to_string())
             })?),
-            to: Some(TxKind::Call(
-                tx.to
-                    .clone()
-                    .unwrap_or("".to_string())
-                    .parse()
-                    .map_err(|_| {
-                        TransactionError::InvalidType("Invalid address format".to_string())
-                    })?,
-            )),
+            to: Some(to),
             gas_price: tx
                 .gas_price
                 .map(|gp| {
@@ -562,6 +718,7 @@ mod tests {
     use lazy_static::lazy_static;
     use std::str::FromStr;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     lazy_static! {
         static ref EVM_TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -616,15 +773,13 @@ mod tests {
 
         assert!(
             err.is_timeout(),
-            "The reqwest error should be a timeout. Actual error: {:?}",
-            err
+            "The reqwest error should be a timeout. Actual error: {err:?}"
         );
 
         let provider_error = ProviderError::from(err);
         assert!(
             matches!(provider_error, ProviderError::Timeout),
-            "ProviderError should be Timeout. Actual: {:?}",
-            provider_error
+            "ProviderError should be Timeout. Actual: {provider_error:?}"
         );
     }
 
@@ -893,6 +1048,59 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_transaction_request_conversion_contract_creation() {
+        let tx_data = EvmTransactionData {
+            from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+            to: None,
+            gas_price: Some(1000000000),
+            value: Uint::<256, 4>::from(0),
+            data: Some("0x6080604052348015600f57600080fd5b".to_string()),
+            nonce: Some(1),
+            chain_id: 1,
+            gas_limit: None,
+            hash: None,
+            signature: None,
+            speed: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            raw: None,
+        };
+
+        let result = TransactionRequest::try_from(&tx_data);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to, Some(TxKind::Create));
+    }
+
+    #[test]
+    fn test_transaction_request_conversion_invalid_to_address() {
+        let tx_data = EvmTransactionData {
+            from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+            to: Some("invalid-address".to_string()),
+            gas_price: Some(1000000000),
+            value: Uint::<256, 4>::from(0),
+            data: Some("0x".to_string()),
+            nonce: Some(1),
+            chain_id: 1,
+            gas_limit: None,
+            hash: None,
+            signature: None,
+            speed: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            raw: None,
+        };
+
+        let result = TransactionRequest::try_from(&tx_data);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(TransactionError::InvalidType(ref msg)) if msg == "Invalid address format"
+        ));
+    }
+
     #[tokio::test]
     async fn test_mock_additional_methods() {
         let mut mock = MockEvmProviderTrait::new();
@@ -970,8 +1178,7 @@ mod tests {
             };
             assert!(
                 is_retriable_error(&error),
-                "Error code {} should be retriable",
-                code
+                "Error code {code} should be retriable"
             );
         }
     }
@@ -1001,9 +1208,7 @@ mod tests {
             };
             assert!(
                 !is_retriable_error(&error),
-                "Error code {} with message '{}' should NOT be retriable",
-                code,
-                message
+                "Error code {code} with message '{message}' should NOT be retriable"
             );
         }
     }
@@ -1090,5 +1295,43 @@ mod tests {
             hex::encode(data),
             "0000000000000000000000000000000000000000000000000000000000000001"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_call_revert_data_returns_payload() {
+        let mut mock = MockEvmProviderTrait::new();
+
+        let tx = TransactionRequest::default();
+        let revert_bytes = Bytes::from(
+            hex::decode("5592f1b2000000000000000000000000be437b1a0b08a09a283713882a6ca75fd2acf4fd")
+                .unwrap(),
+        );
+        let expected = revert_bytes.clone();
+
+        mock.expect_get_call_revert_data()
+            .with(mockall::predicate::always(), mockall::predicate::eq(123u64))
+            .times(1)
+            .returning(move |_, _| {
+                let bytes = revert_bytes.clone();
+                async move { Ok(Some(bytes)) }.boxed()
+            });
+
+        let result = mock.get_call_revert_data(&tx, 123).await;
+        assert_eq!(result.unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn test_get_call_revert_data_no_revert_returns_none() {
+        let mut mock = MockEvmProviderTrait::new();
+
+        let tx = TransactionRequest::default();
+
+        mock.expect_get_call_revert_data()
+            .with(mockall::predicate::always(), mockall::predicate::always())
+            .times(1)
+            .returning(|_, _| async { Ok(None) }.boxed());
+
+        let result = mock.get_call_revert_data(&tx, 456).await;
+        assert_eq!(result.unwrap(), None);
     }
 }

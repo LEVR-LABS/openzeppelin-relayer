@@ -40,7 +40,7 @@ impl InMemoryNetworkRepository {
         }
     }
 
-    async fn acquire_lock<T>(lock: &Mutex<T>) -> Result<MutexGuard<T>, RepositoryError> {
+    async fn acquire_lock<T>(lock: &Mutex<T>) -> Result<MutexGuard<'_, T>, RepositoryError> {
         Ok(lock.lock().await)
     }
 
@@ -366,7 +366,7 @@ mod tests {
 
         // Create multiple networks
         for i in 0..5 {
-            let network = create_test_network(format!("network-{}", i), NetworkType::Evm);
+            let network = create_test_network(format!("network-{i}"), NetworkType::Evm);
             repo.create(network).await.unwrap();
         }
 

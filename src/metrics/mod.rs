@@ -8,6 +8,48 @@ use lazy_static::lazy_static;
 use prometheus::{
     CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
+
+// Stage labels for TRANSACTION_PROCESSING_TIME histogram.
+pub const STAGE_REQUEST_QUEUE_DWELL: &str = "request_queue_dwell";
+pub const STAGE_PREPARE_DURATION: &str = "prepare_duration";
+pub const STAGE_SUBMISSION_QUEUE_DWELL: &str = "submission_queue_dwell";
+pub const STAGE_SUBMIT_DURATION: &str = "submit_duration";
+
+/// Observe a duration on the `TRANSACTION_PROCESSING_TIME` histogram.
+pub fn observe_processing_time(relayer_id: &str, network_type: &str, stage: &str, secs: f64) {
+    TRANSACTION_PROCESSING_TIME
+        .with_label_values(&[relayer_id, network_type, stage])
+        .observe(secs);
+}
+
+/// Observe queue pickup latency (time from send to consumer pickup).
+pub fn observe_queue_pickup_latency(queue_type: &str, backend: &str, secs: f64) {
+    QUEUE_PICKUP_LATENCY
+        .with_label_values(&[queue_type, backend])
+        .observe(secs);
+}
+
+/// Set the current backlog depth for a queue.
+///
+/// Labeled by `backend` (e.g. "pubsub") and `queue_type`. Fed by the backend's
+/// low-frequency, batched backlog read. Depth that is unavailable (e.g. under
+/// the emulator) is intentionally NOT reported here so it cannot read as 0.
+pub fn set_queue_depth(backend: &str, queue_type: &str, depth: f64) {
+    QUEUE_DEPTH
+        .with_label_values(&[backend, queue_type])
+        .set(depth);
+}
+
+/// Record the effective worker-thread count for a runtime at startup.
+///
+/// Labeled by `runtime`: "pipeline" (the multi-thread tokio runtime hosting the
+/// transaction pipeline) and "http" (the actix HTTP worker count). Backs the
+/// container-sizing observability contract (SC-003/SC-004).
+pub fn set_worker_threads(runtime: &str, count: usize) {
+    WORKER_THREADS
+        .with_label_values(&[runtime])
+        .set(count as f64);
+}
 use sysinfo::{Disks, System};
 
 lazy_static! {
@@ -122,11 +164,196 @@ lazy_static! {
         gauge
     };
 
+    // Gauge for effective runtime worker-thread counts (labeled by runtime: "pipeline"/"http").
+    pub static ref WORKER_THREADS: GaugeVec = {
+        let gauge_vec = GaugeVec::new(
+            Opts::new("worker_threads", "Effective worker-thread count per runtime"),
+            &["runtime"]
+        ).unwrap();
+        REGISTRY.register(Box::new(gauge_vec.clone())).unwrap();
+        gauge_vec
+    };
+
     // Gauge for CLOSE_WAIT socket count.
     pub static ref CLOSE_WAIT_SOCKETS: Gauge = {
         let gauge = Gauge::new("close_wait_sockets_count", "Number of CLOSE_WAIT sockets").unwrap();
         REGISTRY.register(Box::new(gauge.clone())).unwrap();
         gauge
+    };
+
+    // Counter for successful transactions (Confirmed status).
+    pub static ref TRANSACTIONS_SUCCESS: CounterVec = {
+        let opts = Opts::new("transactions_success_total", "Total number of successful transactions");
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for failed transactions (Failed, Expired, Canceled statuses).
+    // Labels: relayer_id, network_type, failure_reason, previous_status.
+    // Note: `previous_status` label added to track the pipeline stage before the failure
+    // (e.g. "pending", "sent", "submitted"), enabling pre- vs post-submission attribution.
+    pub static ref TRANSACTIONS_FAILED: CounterVec = {
+        let opts = Opts::new("transactions_failed_total", "Total number of failed transactions");
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type", "failure_reason", "previous_status"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for RPC failures during API requests (before transaction creation).
+    // This tracks failures that occur during operations like get_status, get_balance, etc.
+    // that happen before a transaction is created.
+    pub static ref API_RPC_FAILURES: CounterVec = {
+        let opts = Opts::new("api_rpc_failures_total", "Total number of RPC failures during API requests (before transaction creation)");
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type", "operation_name", "error_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transaction creation (when a transaction is successfully created in the repository).
+    pub static ref TRANSACTIONS_CREATED: CounterVec = {
+        let opts = Opts::new("transactions_created_total", "Total number of transactions created");
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transaction submissions (when status changes to Submitted).
+    pub static ref TRANSACTIONS_SUBMITTED: CounterVec = {
+        let opts = Opts::new("transactions_submitted_total", "Total number of transactions submitted to the network");
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Gauge for transaction status distribution (current count of transactions in each status).
+    pub static ref TRANSACTIONS_BY_STATUS: GaugeVec = {
+        let gauge_vec = GaugeVec::new(
+            Opts::new("transactions_by_status", "Current number of transactions by status"),
+            &["relayer_id", "network_type", "status"]
+        ).unwrap();
+        REGISTRY.register(Box::new(gauge_vec.clone())).unwrap();
+        gauge_vec
+    };
+
+    // Histogram for transaction processing times (creation to submission).
+    pub static ref TRANSACTION_PROCESSING_TIME: HistogramVec = {
+        let histogram_opts = HistogramOpts::new("transaction_processing_seconds", "Transaction processing time in seconds")
+            .buckets(vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]);
+        let histogram_vec = HistogramVec::new(histogram_opts, &["relayer_id", "network_type", "stage"]).unwrap();
+        REGISTRY.register(Box::new(histogram_vec.clone())).unwrap();
+        histogram_vec
+    };
+
+    // Histogram for queue pickup latency (time from send to consumer pickup).
+    pub static ref QUEUE_PICKUP_LATENCY: HistogramVec = {
+        let histogram_opts = HistogramOpts::new("queue_pickup_latency_seconds", "Queue pickup latency in seconds (send to consumer pickup)")
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 14400.0, 86400.0]);
+        let histogram_vec = HistogramVec::new(histogram_opts, &["queue_type", "backend"]).unwrap();
+        REGISTRY.register(Box::new(histogram_vec.clone())).unwrap();
+        histogram_vec
+    };
+
+    // Gauge for queue backlog depth. Labeled by backend and
+    // queue type. Currently emitted by the Pub/Sub backend (the first compliant
+    // backend); Redis/SQS do not yet populate it.
+    pub static ref QUEUE_DEPTH: GaugeVec = {
+        let opts = Opts::new("queue_depth", "Current queue backlog depth (undelivered messages)");
+        let gauge_vec = GaugeVec::new(opts, &["backend", "queue_type"]).unwrap();
+        REGISTRY.register(Box::new(gauge_vec.clone())).unwrap();
+        gauge_vec
+    };
+
+    // Histogram for RPC call latency.
+    pub static ref RPC_CALL_LATENCY: HistogramVec = {
+        let histogram_opts = HistogramOpts::new("rpc_call_latency_seconds", "RPC call latency in seconds")
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]);
+        let histogram_vec = HistogramVec::new(histogram_opts, &["relayer_id", "network_type", "operation_name"]).unwrap();
+        REGISTRY.register(Box::new(histogram_vec.clone())).unwrap();
+        histogram_vec
+    };
+
+    // Counter for Stellar transaction submission failures with decoded result codes.
+    pub static ref STELLAR_SUBMISSION_FAILURES: CounterVec = {
+        let opts = Opts::new("stellar_submission_failures_total",
+            "Stellar transaction submission failures by status and result code");
+        let counter_vec = CounterVec::new(opts, &["submit_status", "result_code"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for plugin calls (tracks requests to /api/v1/plugins/{plugin_id}/call endpoints).
+    pub static ref PLUGIN_CALLS: CounterVec = {
+        let opts = Opts::new("plugin_calls_total", "Total number of plugin calls");
+        let counter_vec = CounterVec::new(opts, &["plugin_id", "method", "status"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for Stellar submit responses with TRY_AGAIN_LATER status.
+    pub static ref STELLAR_TRY_AGAIN_LATER: CounterVec = {
+        let opts = Opts::new(
+            "stellar_try_again_later_total",
+            "Total number of Stellar transaction submit responses with TRY_AGAIN_LATER"
+        );
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "tx_status"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transactions confirmed after experiencing TRY_AGAIN_LATER.
+    pub static ref TRANSACTIONS_TRY_AGAIN_LATER_SUCCESS: CounterVec = {
+        let opts = Opts::new(
+            "transactions_try_again_later_success_total",
+            "Total number of transactions confirmed after experiencing TRY_AGAIN_LATER"
+        );
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transactions that failed after experiencing TRY_AGAIN_LATER.
+    pub static ref TRANSACTIONS_TRY_AGAIN_LATER_FAILED: CounterVec = {
+        let opts = Opts::new(
+            "transactions_try_again_later_failed_total",
+            "Total number of transactions that failed after experiencing TRY_AGAIN_LATER"
+        );
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transactions that encountered an insufficient fee error.
+    pub static ref TRANSACTIONS_INSUFFICIENT_FEE: CounterVec = {
+        let opts = Opts::new(
+            "transactions_insufficient_fee_total",
+            "Total number of transactions that encountered an insufficient fee error"
+        );
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transactions confirmed after experiencing insufficient fee.
+    pub static ref TRANSACTIONS_INSUFFICIENT_FEE_SUCCESS: CounterVec = {
+        let opts = Opts::new(
+            "transactions_insufficient_fee_success_total",
+            "Total number of transactions confirmed after experiencing insufficient fee"
+        );
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
+    };
+
+    // Counter for transactions that failed after experiencing insufficient fee.
+    pub static ref TRANSACTIONS_INSUFFICIENT_FEE_FAILED: CounterVec = {
+        let opts = Opts::new(
+            "transactions_insufficient_fee_failed_total",
+            "Total number of transactions that failed after experiencing insufficient fee"
+        );
+        let counter_vec = CounterVec::new(opts, &["relayer_id", "network_type"]).unwrap();
+        REGISTRY.register(Box::new(counter_vec.clone())).unwrap();
+        counter_vec
     };
 }
 
@@ -327,6 +554,31 @@ mod actix_tests {
             .with_label_values(&["/test", "GET", "500"])
             .inc();
 
+        // Touch insufficient fee metrics to ensure they appear in output
+        TRANSACTIONS_INSUFFICIENT_FEE
+            .with_label_values(&["test-relayer", "stellar"])
+            .inc();
+        TRANSACTIONS_INSUFFICIENT_FEE_SUCCESS
+            .with_label_values(&["test-relayer", "stellar"])
+            .inc();
+        TRANSACTIONS_INSUFFICIENT_FEE_FAILED
+            .with_label_values(&["test-relayer", "stellar"])
+            .inc();
+
+        // Touch TRY_AGAIN_LATER metrics to ensure they appear in output
+        TRANSACTIONS_TRY_AGAIN_LATER_SUCCESS
+            .with_label_values(&["test-relayer", "stellar"])
+            .inc();
+        TRANSACTIONS_TRY_AGAIN_LATER_FAILED
+            .with_label_values(&["test-relayer", "stellar"])
+            .inc();
+
+        // Queue pickup latency
+        observe_queue_pickup_latency("transaction-request", "sqs", 0.5);
+
+        // Queue depth gauge
+        set_queue_depth("pubsub", "status-check-evm", 7.0);
+
         let metrics = gather_metrics().expect("failed to gather metrics");
         let output = String::from_utf8(metrics).expect("metrics output is not valid UTF-8");
 
@@ -344,6 +596,22 @@ mod actix_tests {
         assert!(output.contains("raw_requests_total"));
         assert!(output.contains("request_latency_seconds"));
         assert!(output.contains("error_requests_total"));
+
+        // Insufficient fee metrics
+        assert!(output.contains("transactions_insufficient_fee_total"));
+        assert!(output.contains("transactions_insufficient_fee_success_total"));
+        assert!(output.contains("transactions_insufficient_fee_failed_total"));
+
+        // TRY_AGAIN_LATER metrics
+        assert!(output.contains("transactions_try_again_later_success_total"));
+        assert!(output.contains("transactions_try_again_later_failed_total"));
+
+        // Queue pickup latency
+        assert!(output.contains("queue_pickup_latency_seconds"));
+
+        // Queue depth gauge
+        assert!(output.contains("queue_depth"));
+        assert!(output.contains(r#"queue_depth{backend="pubsub",queue_type="status-check-evm"} 7"#));
     }
 
     #[actix_rt::test]
@@ -364,57 +632,49 @@ mod actix_tests {
         let cpu_usage = CPU_USAGE.get();
         assert!(
             (0.0..=100.0).contains(&cpu_usage),
-            "CPU usage should be between 0-100%, got {}",
-            cpu_usage
+            "CPU usage should be between 0-100%, got {cpu_usage}"
         );
 
         let memory_usage = MEMORY_USAGE.get();
         assert!(
             memory_usage >= 0.0,
-            "Memory usage should be >= 0, got {}",
-            memory_usage
+            "Memory usage should be >= 0, got {memory_usage}"
         );
 
         let memory_percent = MEMORY_USAGE_PERCENT.get();
         assert!(
             (0.0..=100.0).contains(&memory_percent),
-            "Memory usage percentage should be between 0-100%, got {}",
-            memory_percent
+            "Memory usage percentage should be between 0-100%, got {memory_percent}"
         );
 
         let total_memory = TOTAL_MEMORY.get();
         assert!(
             total_memory > 0.0,
-            "Total memory should be > 0, got {}",
-            total_memory
+            "Total memory should be > 0, got {total_memory}"
         );
 
         let available_memory = AVAILABLE_MEMORY.get();
         assert!(
             available_memory >= 0.0,
-            "Available memory should be >= 0, got {}",
-            available_memory
+            "Available memory should be >= 0, got {available_memory}"
         );
 
         let disk_usage = DISK_USAGE.get();
         assert!(
             disk_usage >= 0.0,
-            "Disk usage should be >= 0, got {}",
-            disk_usage
+            "Disk usage should be >= 0, got {disk_usage}"
         );
 
         let disk_percent = DISK_USAGE_PERCENT.get();
         assert!(
             (0.0..=100.0).contains(&disk_percent),
-            "Disk usage percentage should be between 0-100%, got {}",
-            disk_percent
+            "Disk usage percentage should be between 0-100%, got {disk_percent}"
         );
 
         // Verify that memory usage doesn't exceed total memory
         assert!(
             memory_usage <= total_memory,
-            "Memory usage should be <= total memory, got {}",
-            memory_usage
+            "Memory usage should be <= total memory, got {memory_usage}"
         );
 
         // Verify that available memory plus used memory doesn't exceed total memory
@@ -542,6 +802,95 @@ mod property_tests {
                 prop_assert!(!label.is_empty());
                 prop_assert!(label.len() < 1024);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod processing_time_tests {
+    use super::*;
+
+    #[test]
+    fn test_observe_processing_time_records_to_histogram() {
+        let before = TRANSACTION_PROCESSING_TIME
+            .with_label_values(&["test-relayer", "evm", "request_queue_dwell"])
+            .get_sample_count();
+
+        observe_processing_time("test-relayer", "evm", "request_queue_dwell", 1.5);
+
+        let after = TRANSACTION_PROCESSING_TIME
+            .with_label_values(&["test-relayer", "evm", "request_queue_dwell"])
+            .get_sample_count();
+
+        assert_eq!(after, before + 1, "sample count should increase by 1");
+    }
+
+    #[test]
+    fn test_observe_processing_time_accumulates_sum() {
+        let label = "test_sum_stage";
+        let before_sum = TRANSACTION_PROCESSING_TIME
+            .with_label_values(&["test-relayer-sum", "stellar", label])
+            .get_sample_sum();
+
+        observe_processing_time("test-relayer-sum", "stellar", label, 2.0);
+        observe_processing_time("test-relayer-sum", "stellar", label, 3.0);
+
+        let after_sum = TRANSACTION_PROCESSING_TIME
+            .with_label_values(&["test-relayer-sum", "stellar", label])
+            .get_sample_sum();
+
+        let delta = after_sum - before_sum;
+        assert!(
+            (delta - 5.0).abs() < 0.001,
+            "sum should increase by 5.0, got delta {delta}"
+        );
+    }
+
+    #[test]
+    fn test_stage_constants_are_distinct() {
+        let stages = [
+            STAGE_REQUEST_QUEUE_DWELL,
+            STAGE_PREPARE_DURATION,
+            STAGE_SUBMISSION_QUEUE_DWELL,
+            STAGE_SUBMIT_DURATION,
+        ];
+        let unique: std::collections::HashSet<&str> = stages.iter().copied().collect();
+        assert_eq!(stages.len(), unique.len(), "stage constants must be unique");
+    }
+
+    #[test]
+    fn test_observe_queue_pickup_latency_records_to_histogram() {
+        let before = QUEUE_PICKUP_LATENCY
+            .with_label_values(&["notification", "sqs"])
+            .get_sample_count();
+
+        observe_queue_pickup_latency("notification", "sqs", 1.5);
+
+        let after = QUEUE_PICKUP_LATENCY
+            .with_label_values(&["notification", "sqs"])
+            .get_sample_count();
+
+        assert_eq!(after, before + 1, "sample count should increase by 1");
+    }
+
+    #[test]
+    fn test_observe_queue_pickup_latency_both_backends() {
+        for backend in &["sqs", "redis"] {
+            let before = QUEUE_PICKUP_LATENCY
+                .with_label_values(&["relayer-health-check", backend])
+                .get_sample_count();
+
+            observe_queue_pickup_latency("relayer-health-check", backend, 0.25);
+
+            let after = QUEUE_PICKUP_LATENCY
+                .with_label_values(&["relayer-health-check", backend])
+                .get_sample_count();
+
+            assert_eq!(
+                after,
+                before + 1,
+                "sample count should increase by 1 for backend {backend}"
+            );
         }
     }
 }

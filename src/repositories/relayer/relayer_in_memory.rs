@@ -30,7 +30,7 @@ impl InMemoryRelayerRepository {
             store: Mutex::new(HashMap::new()),
         }
     }
-    async fn acquire_lock<T>(lock: &Mutex<T>) -> Result<MutexGuard<T>, RepositoryError> {
+    async fn acquire_lock<T>(lock: &Mutex<T>) -> Result<MutexGuard<'_, T>, RepositoryError> {
         Ok(lock.lock().await)
     }
 }
@@ -166,6 +166,8 @@ impl RelayerRepository for InMemoryRelayerRepository {
     fn is_persistent_storage(&self) -> bool {
         false
     }
+
+    // Uses the trait default implementation which returns None
 }
 
 #[async_trait]
@@ -280,6 +282,7 @@ mod tests {
             paused: false,
             network_type: NetworkType::Evm,
             policies: RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+                include_revert_data: None,
                 gas_price_cap: None,
                 whitelist_receivers: None,
                 eip1559_pricing: Some(false),
@@ -462,6 +465,7 @@ mod tests {
 
         // Create a new policy to update
         let new_policy = RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+            include_revert_data: None,
             gas_price_cap: Some(50000000000),
             whitelist_receivers: Some(vec!["0x1234".to_string()]),
             eip1559_pricing: Some(true),

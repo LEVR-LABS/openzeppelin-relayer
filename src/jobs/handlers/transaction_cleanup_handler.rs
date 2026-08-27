@@ -12,7 +12,6 @@
 //! ensuring the lock expires before the next scheduled run.
 
 use actix_web::web::ThinData;
-use apalis::prelude::{Attempt, Data, *};
 use chrono::{DateTime, Utc};
 use eyre::Result;
 use std::sync::Arc;
@@ -20,13 +19,18 @@ use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    constants::{FINAL_TRANSACTION_STATUSES, WORKER_TRANSACTION_CLEANUP_RETRIES},
+    config::ServerConfig,
+    constants::{
+        FINAL_TRANSACTION_STATUSES, TRANSACTION_CLEANUP_LOCK_TTL_SECS,
+        WORKER_TRANSACTION_CLEANUP_RETRIES,
+    },
     jobs::handle_result,
     models::{
         DefaultAppState, NetworkTransactionData, PaginationQuery, RelayerRepoModel,
-        TransactionRepoModel,
+        TransactionRepoModel, TransactionStatus,
     },
-    repositories::{PaginatedResult, Repository, TransactionDeleteRequest, TransactionRepository},
+    queues::{HandlerError, WorkerContext},
+    repositories::{Repository, TransactionDeleteRequest, TransactionRepository},
     utils::DistributedLock,
 };
 
@@ -40,25 +44,14 @@ const CLEANUP_PAGE_SIZE: u32 = 100;
 /// This prevents overwhelming Redis with very large pipelines.
 const DELETE_BATCH_SIZE: usize = 100;
 
+/// Maximum page iterations per status before stopping.
+/// Prevents unbounded cleanup from exceeding the lock TTL.
+/// With CLEANUP_PAGE_SIZE=100, allows up to 150,000 transactions per status per run.
+const MAX_CLEANUP_ITERATIONS_PER_STATUS: u32 = 1500;
+
 /// Distributed lock name for transaction cleanup.
 /// Only one instance across the cluster should run cleanup at a time.
 const CLEANUP_LOCK_NAME: &str = "transaction_cleanup";
-
-/// TTL for the distributed lock (9 minutes).
-///
-/// This value should be:
-/// 1. Greater than the worst-case cleanup runtime to prevent concurrent execution
-/// 2. Less than the cron interval (10 minutes) to ensure availability for the next run
-///
-/// If cleanup consistently takes longer than this TTL, another instance may acquire
-/// the lock and run concurrently. In that case, consider:
-/// - Increasing the TTL (and cron interval accordingly)
-/// - Optimizing the cleanup process
-/// - Implementing lock refresh during long-running operations
-///
-/// The lock is automatically released when processing completes (via Drop),
-/// so the TTL primarily serves as a safety net for crashed instances.
-const CLEANUP_LOCK_TTL_SECS: u64 = 9 * 60;
 
 /// Handles periodic transaction cleanup jobs from the queue.
 ///
@@ -72,29 +65,29 @@ const CLEANUP_LOCK_TTL_SECS: u64 = 9 * 60;
 /// # Arguments
 /// * `job` - The cron reminder job triggering the cleanup
 /// * `data` - Application state containing repositories
-/// * `attempt` - Current attempt number for retry logic
+/// * `ctx` - Worker context with attempt number and task ID
 ///
 /// # Returns
-/// * `Result<(), Error>` - Success or failure of cleanup processing
+/// * `Result<(), HandlerError>` - Success or failure of cleanup processing
 #[instrument(
     level = "debug",
     skip(job, data),
     fields(
         job_type = "transaction_cleanup",
-        attempt = %attempt.current(),
+        attempt = %ctx.attempt,
     ),
     err
 )]
 pub async fn transaction_cleanup_handler(
     job: TransactionCleanupCronReminder,
-    data: Data<ThinData<DefaultAppState>>,
-    attempt: Attempt,
-) -> Result<(), Error> {
-    let result = handle_request(job, data, attempt.clone()).await;
+    data: ThinData<DefaultAppState>,
+    ctx: WorkerContext,
+) -> Result<(), HandlerError> {
+    let result = handle_request(job, &data).await;
 
     handle_result(
         result,
-        attempt,
+        &ctx,
         "TransactionCleanup",
         WORKER_TRANSACTION_CLEANUP_RETRIES,
     )
@@ -113,49 +106,53 @@ pub struct TransactionCleanupCronReminder();
 /// # Arguments
 /// * `_job` - The cron reminder job (currently unused)
 /// * `data` - Application state containing repositories
-/// * `_attempt` - Current attempt number (currently unused)
 ///
 /// # Returns
 /// * `Result<()>` - Success or failure of the cleanup operation
 async fn handle_request(
     _job: TransactionCleanupCronReminder,
-    data: Data<ThinData<DefaultAppState>>,
-    _attempt: Attempt,
+    data: &ThinData<DefaultAppState>,
 ) -> Result<()> {
     let transaction_repo = data.transaction_repository();
 
-    // Attempt to acquire distributed lock to prevent multiple instances from
-    // running cleanup simultaneously. This is necessary because CronStream
-    // is local to each instance, not distributed via Redis queues.
-    // The lock key includes the relayer prefix to support multi-tenant deployments.
-    // Key format: {prefix}:lock:{name} (e.g., "oz-relayer:lock:transaction_cleanup")
-    let lock_guard = if let Some((conn, prefix)) = transaction_repo.connection_info() {
-        let lock_key = format!("{prefix}:lock:{CLEANUP_LOCK_NAME}");
-        let lock =
-            DistributedLock::new(conn, &lock_key, Duration::from_secs(CLEANUP_LOCK_TTL_SECS));
+    // In distributed mode, acquire a lock to prevent multiple instances from
+    // running cleanup simultaneously. In single-instance mode, skip locking.
+    let lock_guard = if ServerConfig::get_distributed_mode() {
+        if let Some((connections, prefix)) = transaction_repo.connection_info() {
+            let conn = connections.primary().clone();
+            let lock_key = format!("{prefix}:lock:{CLEANUP_LOCK_NAME}");
+            let lock = DistributedLock::new(
+                conn,
+                &lock_key,
+                Duration::from_secs(TRANSACTION_CLEANUP_LOCK_TTL_SECS),
+            );
 
-        match lock.try_acquire().await {
-            Ok(Some(guard)) => {
-                debug!(lock_key = %lock_key, "acquired distributed lock for transaction cleanup");
-                Some(guard)
+            match lock.try_acquire().await {
+                Ok(Some(guard)) => {
+                    debug!(lock_key = %lock_key, "acquired distributed lock for transaction cleanup");
+                    Some(guard)
+                }
+                Ok(None) => {
+                    info!(lock_key = %lock_key, "transaction cleanup skipped - another instance is processing");
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Fail closed: skip cleanup if we can't communicate with Redis for locking,
+                    // to prevent concurrent execution across multiple instances
+                    warn!(
+                        error = %e,
+                        lock_key = %lock_key,
+                        "failed to acquire distributed lock, skipping cleanup"
+                    );
+                    return Ok(());
+                }
             }
-            Ok(None) => {
-                info!(lock_key = %lock_key, "transaction cleanup skipped - another instance is processing");
-                return Ok(());
-            }
-            Err(e) => {
-                // If we can't communicate with Redis for locking, log warning but proceed
-                // This maintains backwards compatibility and handles Redis connection issues
-                warn!(
-                    error = %e,
-                    lock_key = %lock_key,
-                    "failed to acquire distributed lock, proceeding with cleanup anyway"
-                );
-                None
-            }
+        } else {
+            debug!("in-memory repository detected, skipping distributed lock");
+            None
         }
     } else {
-        debug!("in-memory repository detected, skipping distributed lock");
+        debug!("distributed mode disabled, skipping lock acquisition");
         None
     };
 
@@ -205,7 +202,7 @@ async fn handle_request(
 /// * `Vec<RelayerCleanupResult>` - Results from processing each relayer
 async fn process_relayers_in_batches(
     relayers: Vec<RelayerRepoModel>,
-    transaction_repo: Arc<impl TransactionRepository>,
+    transaction_repo: Arc<impl TransactionRepository + Sync>,
     now: DateTime<Utc>,
 ) -> Vec<RelayerCleanupResult> {
     use futures::stream::{self, StreamExt};
@@ -231,10 +228,10 @@ struct RelayerCleanupResult {
     error: Option<String>,
 }
 
-/// Processes cleanup for a single relayer using pagination.
+/// Processes cleanup for a single relayer by iterating over each final status independently.
 ///
-/// Iterates through pages of final transactions to avoid loading all
-/// transactions into memory at once.
+/// Each status is processed separately to use efficient single-key Redis ZRANGE pagination
+/// instead of the multi-status merge path which fetches all IDs into memory.
 ///
 /// # Arguments
 /// * `relayer` - The relayer to process
@@ -245,7 +242,7 @@ struct RelayerCleanupResult {
 /// * `RelayerCleanupResult` - Result of processing this relayer
 async fn process_single_relayer(
     relayer: RelayerRepoModel,
-    transaction_repo: Arc<impl TransactionRepository>,
+    transaction_repo: Arc<impl TransactionRepository + Sync>,
     now: DateTime<Utc>,
 ) -> RelayerCleanupResult {
     debug!(
@@ -254,61 +251,56 @@ async fn process_single_relayer(
     );
 
     let mut total_cleaned = 0usize;
-    let mut current_page = 1u32;
 
-    loop {
-        let query = PaginationQuery {
-            page: current_page,
-            per_page: CLEANUP_PAGE_SIZE,
-        };
-
-        match fetch_final_transactions_paginated(&relayer.id, &transaction_repo, query).await {
-            Ok(page_result) => {
-                let page_count = page_result.items.len();
-
-                if page_count == 0 {
-                    // No more transactions to process
-                    break;
-                }
-
-                debug!(
-                    page = current_page,
-                    page_count = page_count,
-                    total = page_result.total,
+    // Reconcile before deleting so ghosts repaired into a final index are
+    // reaped in this run instead of waiting for the next cron cycle.
+    // A reconcile failure must not block deletion, so the error is only
+    // recorded and surfaced after the cleanup loop.
+    let reconcile_error = match transaction_repo
+        .reconcile_stale_status_indexes(&relayer.id)
+        .await
+    {
+        Ok(repaired_count) => {
+            if repaired_count > 0 {
+                info!(
+                    repaired_count,
                     relayer_id = %relayer.id,
-                    "processing page of final transactions"
+                    "repaired stale transaction status indexes"
                 );
-
-                let cleaned_count = process_transactions_for_cleanup(
-                    page_result.items,
-                    &transaction_repo,
-                    &relayer.id,
-                    now,
-                )
-                .await;
-
-                total_cleaned += cleaned_count;
-
-                // Check if we've processed all pages
-                let total_pages =
-                    (page_result.total as f64 / CLEANUP_PAGE_SIZE as f64).ceil() as u32;
-                if current_page >= total_pages {
-                    break;
-                }
-
-                current_page += 1;
             }
+            None
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                relayer_id = %relayer.id,
+                "failed to reconcile stale transaction status indexes"
+            );
+            Some(e.to_string())
+        }
+    };
+
+    for status in FINAL_TRANSACTION_STATUSES {
+        match process_status_cleanup(&relayer.id, status, &transaction_repo, now).await {
+            Ok(cleaned) => total_cleaned += cleaned,
             Err(e) => {
                 error!(
                     error = %e,
                     relayer_id = %relayer.id,
-                    page = current_page,
-                    "failed to fetch final transactions page"
+                    status = ?status,
+                    "failed to cleanup transactions for status"
                 );
+                // Preserve a reconcile failure alongside the cleanup failure so
+                // neither error is lost in the combined-failure path.
                 return RelayerCleanupResult {
                     relayer_id: relayer.id,
                     cleaned_count: total_cleaned,
-                    error: Some(e.to_string()),
+                    error: Some(match &reconcile_error {
+                        Some(reconcile_error) => {
+                            format!("{reconcile_error}; status cleanup failed: {e}")
+                        }
+                        None => e.to_string(),
+                    }),
                 };
             }
         }
@@ -325,24 +317,113 @@ async fn process_single_relayer(
     RelayerCleanupResult {
         relayer_id: relayer.id,
         cleaned_count: total_cleaned,
-        error: None,
+        error: reconcile_error,
     }
 }
 
-/// Fetches a page of transactions with final statuses for a specific relayer.
+/// Processes cleanup for a single status of a single relayer.
+///
+/// Uses stable pagination: when items are deleted, the same page is re-queried
+/// because deletions shift subsequent items into the current page's range.
+/// Only advances the page when no deletions occurred (items remain in place).
 ///
 /// # Arguments
 /// * `relayer_id` - ID of the relayer
+/// * `status` - The transaction status to process
 /// * `transaction_repo` - Reference to the transaction repository
-/// * `query` - Pagination query specifying page and page size
+/// * `now` - Current UTC timestamp for comparison
 ///
 /// # Returns
-/// * `Result<PaginatedResult<TransactionRepoModel>>` - Paginated transactions with final statuses
+/// * `Result<usize>` - Number of transactions cleaned up for this status
+async fn process_status_cleanup(
+    relayer_id: &str,
+    status: &TransactionStatus,
+    transaction_repo: &Arc<impl TransactionRepository + Sync>,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let mut current_page = 1u32;
+    let mut total_cleaned = 0usize;
+    let mut iterations = 0u32;
+
+    loop {
+        if iterations >= MAX_CLEANUP_ITERATIONS_PER_STATUS {
+            warn!(
+                relayer_id = %relayer_id,
+                status = ?status,
+                iterations,
+                total_cleaned,
+                "reached max cleanup iterations, stopping"
+            );
+            break;
+        }
+        iterations += 1;
+
+        let query = PaginationQuery {
+            page: current_page,
+            per_page: CLEANUP_PAGE_SIZE,
+        };
+
+        let page_result = transaction_repo
+            .find_by_status_paginated(relayer_id, std::slice::from_ref(status), query, true)
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "Failed to fetch {:?} transactions for relayer {}: {}",
+                    status,
+                    relayer_id,
+                    e
+                )
+            })?;
+
+        if page_result.items.is_empty() {
+            break;
+        }
+
+        debug!(
+            page = current_page,
+            page_count = page_result.items.len(),
+            total = page_result.total,
+            relayer_id = %relayer_id,
+            status = ?status,
+            "processing page of transactions for cleanup"
+        );
+
+        let cleaned_count =
+            process_transactions_for_cleanup(page_result.items, transaction_repo, relayer_id, now)
+                .await;
+
+        total_cleaned += cleaned_count;
+
+        if cleaned_count == 0 {
+            // No items were deleted on this page, so items remain in place.
+            // Advance to the next page to check further items.
+            current_page += 1;
+        }
+        // When items were deleted, stay on the same page: deletions shift
+        // subsequent items into the current page range, so re-querying
+        // the same page picks up previously-unreachable items.
+    }
+
+    if total_cleaned > 0 {
+        debug!(
+            total_cleaned,
+            relayer_id = %relayer_id,
+            status = ?status,
+            "status cleanup completed"
+        );
+    }
+
+    Ok(total_cleaned)
+}
+
+/// Fetches a page of transactions with final statuses for a specific relayer.
+/// Used in tests to verify pagination behavior across all final statuses.
+#[cfg(test)]
 async fn fetch_final_transactions_paginated(
     relayer_id: &str,
-    transaction_repo: &Arc<impl TransactionRepository>,
+    transaction_repo: &Arc<impl TransactionRepository + Sync>,
     query: PaginationQuery,
-) -> Result<PaginatedResult<TransactionRepoModel>> {
+) -> Result<crate::repositories::PaginatedResult<TransactionRepoModel>> {
     transaction_repo
         .find_by_status_paginated(relayer_id, FINAL_TRANSACTION_STATUSES, query, true)
         .await
@@ -392,7 +473,7 @@ async fn process_transactions_for_cleanup(
         .filter(|tx| {
             // Must be in a final state
             if !FINAL_TRANSACTION_STATUSES.contains(&tx.status) {
-                warn!(
+                debug!(
                     tx_id = %tx.id,
                     status = ?tx.status,
                     "skipping transaction not in final state"
@@ -572,15 +653,18 @@ async fn report_cleanup_results(cleanup_results: Vec<RelayerCleanupResult>) -> R
 mod tests {
 
     use super::*;
+    use chrono::{Duration, Utc};
+
     use crate::{
         models::{
-            NetworkType, RelayerEvmPolicy, RelayerNetworkPolicy, RelayerRepoModel,
+            NetworkType, RelayerEvmPolicy, RelayerNetworkPolicy, RelayerRepoModel, RepositoryError,
             TransactionRepoModel, TransactionStatus,
         },
-        repositories::{InMemoryTransactionRepository, Repository},
+        repositories::{
+            InMemoryTransactionRepository, MockTransactionRepository, PaginatedResult, Repository,
+        },
         utils::mocks::mockutils::create_mock_transaction,
     };
-    use chrono::{Duration, Utc};
 
     fn create_test_transaction(
         id: &str,
@@ -726,7 +810,7 @@ mod tests {
 
         for i in 0..5 {
             let tx = create_test_transaction(
-                &format!("expired-tx-{}", i),
+                &format!("expired-tx-{i}"),
                 relayer_id,
                 TransactionStatus::Confirmed,
                 Some(expired_delete_at.clone()),
@@ -738,7 +822,7 @@ mod tests {
         assert_eq!(transaction_repo.count().await.unwrap(), 5);
 
         // Delete them using batch delete
-        let ids: Vec<String> = (0..5).map(|i| format!("expired-tx-{}", i)).collect();
+        let ids: Vec<String> = (0..5).map(|i| format!("expired-tx-{i}")).collect();
         let result = transaction_repo.delete_by_ids(ids).await.unwrap();
 
         assert_eq!(result.deleted_count, 5);
@@ -964,6 +1048,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_single_relayer_surfaces_reconcile_error() {
+        let mut transaction_repo = MockTransactionRepository::new();
+        transaction_repo
+            .expect_find_by_status_paginated()
+            .times(FINAL_TRANSACTION_STATUSES.len())
+            .returning(|_, _, query, _| {
+                Ok(PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: query.page,
+                    per_page: query.per_page,
+                })
+            });
+        transaction_repo
+            .expect_reconcile_stale_status_indexes()
+            .times(1)
+            .returning(|_| Err(RepositoryError::Other("reconcile failed".to_string())));
+
+        let relayer = RelayerRepoModel {
+            id: "test-relayer".to_string(),
+            name: "Test Relayer".to_string(),
+            network: "ethereum".to_string(),
+            paused: false,
+            network_type: NetworkType::Evm,
+            signer_id: "test-signer".to_string(),
+            policies: RelayerNetworkPolicy::Evm(RelayerEvmPolicy::default()),
+            address: "0x1234567890123456789012345678901234567890".to_string(),
+            notification_id: None,
+            system_disabled: false,
+            custom_rpc_urls: None,
+            ..Default::default()
+        };
+
+        let result =
+            process_single_relayer(relayer.clone(), Arc::new(transaction_repo), Utc::now()).await;
+
+        assert_eq!(result.relayer_id, relayer.id);
+        assert_eq!(result.cleaned_count, 0);
+        assert_eq!(
+            result.error,
+            Some("Other error: reconcile failed".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_transactions_with_empty_list() {
         let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
         let relayer_id = "test-relayer";
@@ -1135,7 +1264,7 @@ mod tests {
         // Create 5 confirmed transactions
         for i in 1..=5 {
             let mut tx = create_test_transaction(
-                &format!("tx-{}", i),
+                &format!("tx-{i}"),
                 relayer_id,
                 TransactionStatus::Confirmed,
                 None,
@@ -1182,5 +1311,149 @@ mod tests {
         assert_eq!(result.total, 5);
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.page, 3);
+    }
+
+    #[tokio::test]
+    async fn test_process_status_cleanup_deletes_expired() {
+        let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
+        let relayer_id = "test-relayer";
+        let now = Utc::now();
+
+        // Create expired and non-expired transactions of the same status
+        let expired_tx = create_test_transaction(
+            "expired-tx",
+            relayer_id,
+            TransactionStatus::Confirmed,
+            Some((now - Duration::hours(1)).to_rfc3339()),
+        );
+        let future_tx = create_test_transaction(
+            "future-tx",
+            relayer_id,
+            TransactionStatus::Confirmed,
+            Some((now + Duration::hours(1)).to_rfc3339()),
+        );
+
+        transaction_repo.create(expired_tx).await.unwrap();
+        transaction_repo.create(future_tx).await.unwrap();
+
+        let cleaned = process_status_cleanup(
+            relayer_id,
+            &TransactionStatus::Confirmed,
+            &transaction_repo,
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cleaned, 1);
+
+        // Expired one deleted, future one remains
+        assert!(transaction_repo
+            .get_by_id("expired-tx".to_string())
+            .await
+            .is_err());
+        assert!(transaction_repo
+            .get_by_id("future-tx".to_string())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_status_cleanup_no_transactions() {
+        let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
+        let relayer_id = "test-relayer";
+        let now = Utc::now();
+
+        let cleaned = process_status_cleanup(
+            relayer_id,
+            &TransactionStatus::Confirmed,
+            &transaction_repo,
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cleaned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_status_cleanup_skips_other_statuses() {
+        let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
+        let relayer_id = "test-relayer";
+        let now = Utc::now();
+
+        // Create expired transaction with Failed status
+        let tx = create_test_transaction(
+            "failed-tx",
+            relayer_id,
+            TransactionStatus::Failed,
+            Some((now - Duration::hours(1)).to_rfc3339()),
+        );
+        transaction_repo.create(tx).await.unwrap();
+
+        // Cleanup for Confirmed status should not touch Failed transactions
+        let cleaned = process_status_cleanup(
+            relayer_id,
+            &TransactionStatus::Confirmed,
+            &transaction_repo,
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cleaned, 0);
+        assert!(transaction_repo
+            .get_by_id("failed-tx".to_string())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_single_relayer_processes_all_final_statuses() {
+        let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
+        let relayer = RelayerRepoModel {
+            id: "test-relayer".to_string(),
+            name: "Test Relayer".to_string(),
+            network: "ethereum".to_string(),
+            paused: false,
+            network_type: NetworkType::Evm,
+            signer_id: "test-signer".to_string(),
+            policies: RelayerNetworkPolicy::Evm(RelayerEvmPolicy::default()),
+            address: "0x1234567890123456789012345678901234567890".to_string(),
+            notification_id: None,
+            system_disabled: false,
+            custom_rpc_urls: None,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        let expired_at = (now - Duration::hours(1)).to_rfc3339();
+
+        // Create one expired transaction per final status
+        for (i, status) in [
+            TransactionStatus::Confirmed,
+            TransactionStatus::Failed,
+            TransactionStatus::Canceled,
+            TransactionStatus::Expired,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let tx = create_test_transaction(
+                &format!("tx-{}", i),
+                &relayer.id,
+                status.clone(),
+                Some(expired_at.clone()),
+            );
+            transaction_repo.create(tx).await.unwrap();
+        }
+
+        let result = process_single_relayer(relayer.clone(), transaction_repo.clone(), now).await;
+
+        assert_eq!(result.relayer_id, relayer.id);
+        assert_eq!(result.cleaned_count, 4);
+        assert!(result.error.is_none());
+
+        // All should be deleted
+        assert_eq!(transaction_repo.count().await.unwrap(), 0);
     }
 }

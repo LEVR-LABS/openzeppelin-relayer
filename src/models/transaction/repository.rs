@@ -23,7 +23,10 @@ use crate::{
         RelayerError, RelayerRepoModel, SignerError, StellarNetwork, StellarValidationError,
         TransactionError, U256,
     },
-    utils::{deserialize_optional_u128, serialize_optional_u128},
+    utils::{
+        deserialize_i64, deserialize_optional_i64, deserialize_optional_u128, serialize_i64,
+        serialize_optional_i64, serialize_optional_u128,
+    },
 };
 use alloy::{
     consensus::{TxEip1559, TxLegacy},
@@ -33,15 +36,14 @@ use alloy::{
 
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use soroban_rs::xdr::{TransactionEnvelope, TransactionV1Envelope, VecM};
 use std::{convert::TryFrom, str::FromStr};
 use strum::Display;
 
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use soroban_rs::xdr::{
-    Transaction as SorobanTransaction, TransactionEnvelope, TransactionV1Envelope, VecM,
-};
+use soroban_rs::xdr::Transaction as SorobanTransaction;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema, Display)]
 #[serde(rename_all = "lowercase")]
@@ -56,23 +58,68 @@ pub enum TransactionStatus {
     Expired,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+/// Metadata for a transaction
+pub struct TransactionMetadata {
+    /// Number of consecutive failures
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub total_failures: u32,
+    /// Number of submission retries triggered by Stellar insufficient-fee errors
+    #[serde(default)]
+    pub insufficient_fee_retries: u32,
+    /// Number of submission retries triggered by Stellar TRY_AGAIN_LATER responses
+    #[serde(default)]
+    pub try_again_later_retries: u32,
+    /// Number of submission retries triggered by EVM "nonce too high" errors
+    #[serde(default)]
+    pub nonce_too_high_retries: u32,
+}
+
+impl TransactionMetadata {
+    /// Returns a copy with `nonce_too_high_retries` reset to 0, or `None` if already 0.
+    pub fn with_nonce_retries_reset(&self) -> Option<Self> {
+        if self.nonce_too_high_retries == 0 {
+            return None;
+        }
+        Some(Self {
+            nonce_too_high_retries: 0,
+            ..self.clone()
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TransactionUpdateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<TransactionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub network_data: Option<NetworkTransactionData>,
     /// Timestamp when gas price was determined
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub priced_at: Option<String>,
     /// History of transaction hashes
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hashes: Option<Vec<String>>,
     /// Number of no-ops in the transaction
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub noop_count: Option<u32>,
     /// Whether the transaction is canceled
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_canceled: Option<bool>,
     /// Timestamp when this transaction should be deleted (for final states)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_at: Option<String>,
+    /// Status check metadata (failure counters for circuit breaker)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<TransactionMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +142,9 @@ pub struct TransactionRepoModel {
     pub network_type: NetworkType,
     pub noop_count: Option<u32>,
     pub is_canceled: Option<bool>,
+    /// Status check metadata (failure counters for circuit breaker)
+    #[serde(default)]
+    pub metadata: Option<TransactionMetadata>,
 }
 
 impl TransactionRepoModel {
@@ -164,6 +214,9 @@ impl TransactionRepoModel {
         if let Some(delete_at) = update.delete_at {
             self.delete_at = Some(delete_at);
         }
+        if let Some(metadata) = update.metadata {
+            self.metadata = Some(metadata);
+        }
     }
 
     /// Creates a TransactionUpdateRequest to reset this transaction to its pre-prepare state.
@@ -198,6 +251,7 @@ impl TransactionRepoModel {
             noop_count: None,
             is_canceled: None,
             delete_at: None,
+            metadata: None,
         })
     }
 }
@@ -418,6 +472,7 @@ impl Default for TransactionRepoModel {
             hashes: Vec::new(),
             noop_count: None,
             is_canceled: Some(false),
+            metadata: None,
         }
     }
 }
@@ -469,7 +524,20 @@ pub enum TransactionInput {
     /// Pre-built unsigned XDR that needs signing
     UnsignedXdr(String),
     /// Pre-built signed XDR that needs fee-bumping
-    SignedXdr { xdr: String, max_fee: i64 },
+    SignedXdr {
+        xdr: String,
+        // String-encoded like `sequence_number` to stay precise through storage
+        // serialization; see `serialize_i64`.
+        #[serde(serialize_with = "serialize_i64", deserialize_with = "deserialize_i64")]
+        max_fee: i64,
+    },
+    /// Soroban gas abstraction: FeeForwarder transaction with user's signed auth entry
+    /// The XDR is the FeeForwarder transaction from /build, and the signed_auth_entry
+    /// contains the user's signed SorobanAuthorizationEntry to be injected.
+    SorobanGasAbstraction {
+        xdr: String,
+        signed_auth_entry: String,
+    },
 }
 
 impl Default for TransactionInput {
@@ -483,6 +551,24 @@ impl TransactionInput {
     pub fn from_stellar_request(
         request: &StellarTransactionRequest,
     ) -> Result<Self, TransactionError> {
+        // Handle Soroban gas abstraction mode (XDR + signed_auth_entry)
+        if let (Some(xdr), Some(signed_auth_entry)) =
+            (&request.transaction_xdr, &request.signed_auth_entry)
+        {
+            // Validation: signed_auth_entry and fee_bump are mutually exclusive
+            // (already validated in StellarTransactionRequest::validate(), but double-check here)
+            if request.fee_bump == Some(true) {
+                return Err(TransactionError::ValidationError(
+                    "Cannot use both signed_auth_entry and fee_bump".to_string(),
+                ));
+            }
+
+            return Ok(TransactionInput::SorobanGasAbstraction {
+                xdr: xdr.clone(),
+                signed_auth_entry: signed_auth_entry.clone(),
+            });
+        }
+
         // Handle XDR mode
         if let Some(xdr) = &request.transaction_xdr {
             let envelope = parse_transaction_xdr(xdr, false)
@@ -549,6 +635,13 @@ impl TransactionInput {
 pub struct StellarTransactionData {
     pub source_account: String,
     pub fee: Option<u32>,
+    // String-encoded to keep large i64s precise through storage serialization;
+    // see `serialize_optional_i64`.
+    #[serde(
+        serialize_with = "serialize_optional_i64",
+        deserialize_with = "deserialize_optional_i64",
+        default
+    )]
     pub sequence_number: Option<i64>,
     pub memo: Option<MemoSpec>,
     pub valid_until: Option<String>,
@@ -641,6 +734,10 @@ impl StellarTransactionData {
                 // Parse the inner transaction (for fee-bump cases)
                 self.parse_xdr_envelope(xdr)
             }
+            TransactionInput::SorobanGasAbstraction { xdr, .. } => {
+                // Parse the FeeForwarder transaction XDR
+                self.parse_xdr_envelope(xdr)
+            }
         }
     }
 
@@ -682,6 +779,12 @@ impl StellarTransactionData {
             TransactionInput::SignedXdr { xdr, .. } => {
                 // Already signed
                 self.parse_xdr_envelope(xdr)
+            }
+            TransactionInput::SorobanGasAbstraction { xdr, .. } => {
+                // For Soroban gas abstraction, the signed auth entry is injected during prepare
+                // Parse and attach the relayer's signature
+                let envelope = self.parse_xdr_envelope(xdr)?;
+                self.attach_signatures_to_envelope(envelope)
             }
         }
     }
@@ -888,6 +991,7 @@ impl
                     hashes: Vec::new(),
                     noop_count: None,
                     is_canceled: Some(false),
+                    metadata: None,
                 })
             }
             NetworkTransactionRequest::Solana(solana_request) => Ok(Self {
@@ -910,12 +1014,16 @@ impl
                 hashes: Vec::new(),
                 noop_count: None,
                 is_canceled: Some(false),
+                metadata: None,
             }),
             NetworkTransactionRequest::Stellar(stellar_request) => {
                 // Store the source account before consuming the request
                 let source_account = stellar_request.source_account.clone();
 
                 let valid_until = extract_stellar_valid_until(stellar_request, Utc::now());
+
+                let transaction_input = TransactionInput::from_stellar_request(stellar_request)
+                    .map_err(|e| RelayerError::ValidationError(e.to_string()))?;
 
                 let stellar_data = StellarTransactionData {
                     source_account: source_account.unwrap_or_else(|| relayer_model.address.clone()),
@@ -927,8 +1035,7 @@ impl
                     fee: None,
                     sequence_number: None,
                     simulation_transaction_data: None,
-                    transaction_input: TransactionInput::from_stellar_request(stellar_request)
-                        .map_err(|e| RelayerError::ValidationError(e.to_string()))?,
+                    transaction_input,
                     signed_envelope_xdr: None,
                     transaction_result_xdr: None,
                 };
@@ -949,6 +1056,7 @@ impl
                     hashes: Vec::new(),
                     noop_count: None,
                     is_canceled: Some(false),
+                    metadata: None,
                 })
             }
         }
@@ -1156,6 +1264,66 @@ mod tests {
     }
 
     #[test]
+    fn test_transaction_metadata_nonce_too_high_retries_default() {
+        let metadata = TransactionMetadata::default();
+        assert_eq!(metadata.nonce_too_high_retries, 0);
+        assert_eq!(metadata.consecutive_failures, 0);
+        assert_eq!(metadata.total_failures, 0);
+        assert_eq!(metadata.insufficient_fee_retries, 0);
+        assert_eq!(metadata.try_again_later_retries, 0);
+    }
+
+    #[test]
+    fn test_transaction_metadata_backward_compatibility() {
+        // Simulate an old JSON payload without the nonce_too_high_retries field
+        let old_json = r#"{
+            "consecutive_failures": 1,
+            "total_failures": 2,
+            "insufficient_fee_retries": 3,
+            "try_again_later_retries": 4
+        }"#;
+
+        let metadata: TransactionMetadata = serde_json::from_str(old_json).unwrap();
+        assert_eq!(metadata.consecutive_failures, 1);
+        assert_eq!(metadata.total_failures, 2);
+        assert_eq!(metadata.insufficient_fee_retries, 3);
+        assert_eq!(metadata.try_again_later_retries, 4);
+        // Missing field should default to 0
+        assert_eq!(metadata.nonce_too_high_retries, 0);
+    }
+
+    #[test]
+    fn test_with_nonce_retries_reset_returns_none_when_zero() {
+        let metadata = TransactionMetadata {
+            consecutive_failures: 2,
+            total_failures: 5,
+            insufficient_fee_retries: 1,
+            try_again_later_retries: 3,
+            nonce_too_high_retries: 0,
+        };
+        assert!(metadata.with_nonce_retries_reset().is_none());
+    }
+
+    #[test]
+    fn test_with_nonce_retries_reset_returns_reset_metadata() {
+        let metadata = TransactionMetadata {
+            consecutive_failures: 2,
+            total_failures: 5,
+            insufficient_fee_retries: 1,
+            try_again_later_retries: 3,
+            nonce_too_high_retries: 3,
+        };
+        let result = metadata.with_nonce_retries_reset();
+        assert!(result.is_some());
+        let reset = result.unwrap();
+        assert_eq!(reset.nonce_too_high_retries, 0);
+        assert_eq!(reset.consecutive_failures, 2);
+        assert_eq!(reset.total_failures, 5);
+        assert_eq!(reset.insufficient_fee_retries, 1);
+        assert_eq!(reset.try_again_later_retries, 3);
+    }
+
+    #[test]
     fn test_stellar_transaction_data_reset_to_pre_prepare_state() {
         let stellar_data = StellarTransactionData {
             source_account: "GTEST".to_string(),
@@ -1235,6 +1403,7 @@ mod tests {
             noop_count: None,
             is_canceled: None,
             delete_at: None,
+            metadata: None,
         };
 
         let update_req = tx.create_reset_update_request().unwrap();
@@ -1598,6 +1767,106 @@ mod tests {
     }
 
     #[test]
+    fn test_stellar_sequence_number_serializes_as_string() {
+        // sequence_number must serialize as a JSON string so it survives a
+        // Redis/Lua cjson decode->encode round-trip. Lua 5.1 (bundled by
+        // Redis) has no integer type, so a large i64 stored as a bare JSON
+        // number is re-emitted as a float (e.g. 643918676885760.0), which
+        // then fails to deserialize back into i64. A quoted string is opaque
+        // to cjson and round-trips untouched.
+        let mut tx = test_stellar_tx_data();
+        tx.sequence_number = Some(643918676885760);
+
+        let json = serde_json::to_string(&tx).unwrap();
+
+        assert!(
+            json.contains(r#""sequence_number":"643918676885760""#),
+            "sequence_number should serialize as a string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_stellar_sequence_number_deserializes_from_corrupted_float() {
+        // Regression for the GCP crash: transactions already stored in Redis
+        // hold sequence_number as a float (643918676885760.0) after a cjson
+        // round-trip. Deserialization must recover the integer value rather
+        // than erroring with "invalid type: floating point ..., expected i64".
+        let mut value = serde_json::to_value(test_stellar_tx_data()).unwrap();
+        value["sequence_number"] = serde_json::json!(643918676885760.0);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(tx.sequence_number, Some(643918676885760));
+    }
+
+    #[test]
+    fn test_stellar_sequence_number_deserializes_from_legacy_integer() {
+        // Backward compat: records written before this fix hold a bare integer.
+        // (Passes today; guards us against regressing the legacy on-disk form.)
+        let mut value = serde_json::to_value(test_stellar_tx_data()).unwrap();
+        value["sequence_number"] = serde_json::json!(643918676885760_i64);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(tx.sequence_number, Some(643918676885760));
+    }
+
+    fn signed_xdr_tx_data(max_fee: i64) -> StellarTransactionData {
+        let mut tx = test_stellar_tx_data();
+        tx.transaction_input = TransactionInput::SignedXdr {
+            xdr: "AAAA".to_string(),
+            max_fee,
+        };
+        tx
+    }
+
+    #[test]
+    fn test_stellar_signed_xdr_max_fee_serializes_as_string() {
+        // SignedXdr.max_fee is an i64 stored in Redis and re-encoded by the
+        // partial_update Lua script, so it has the same cjson float-corruption
+        // exposure as sequence_number and must serialize as a string too.
+        let json = serde_json::to_string(&signed_xdr_tx_data(643918676885760)).unwrap();
+
+        assert!(
+            json.contains(r#""max_fee":"643918676885760""#),
+            "max_fee should serialize as a string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_stellar_signed_xdr_max_fee_deserializes_from_corrupted_float() {
+        // Regression: a SignedXdr tx whose max_fee was floatified by a cjson
+        // round-trip must still deserialize.
+        let mut value = serde_json::to_value(signed_xdr_tx_data(643918676885760)).unwrap();
+        value["transaction_input"]["SignedXdr"]["max_fee"] = serde_json::json!(643918676885760.0);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        match tx.transaction_input {
+            TransactionInput::SignedXdr { max_fee, .. } => assert_eq!(max_fee, 643918676885760),
+            other => panic!("expected SignedXdr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stellar_signed_xdr_max_fee_deserializes_from_legacy_integer() {
+        // Backward compat with bare-integer records written before this fix.
+        let mut value = serde_json::to_value(signed_xdr_tx_data(35014)).unwrap();
+        value["transaction_input"]["SignedXdr"]["max_fee"] = serde_json::json!(35014_i64);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let tx: StellarTransactionData = serde_json::from_str(&json).unwrap();
+
+        match tx.transaction_input {
+            TransactionInput::SignedXdr { max_fee, .. } => assert_eq!(max_fee, 35014),
+            other => panic!("expected SignedXdr, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_get_envelope_for_simulation() {
         let tx = test_stellar_tx_data();
         let env = tx.get_envelope_for_simulation();
@@ -1870,6 +2139,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         });
 
         let relayer_model = RelayerRepoModel {
@@ -2314,6 +2584,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2342,6 +2613,7 @@ mod tests {
             transaction_xdr: Some(unsigned_xdr.to_string()),
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2426,6 +2698,7 @@ mod tests {
             transaction_xdr: Some(signed_xdr.to_string()),
             fee_bump: Some(true),
             max_fee: Some(20000000),
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2455,6 +2728,7 @@ mod tests {
             transaction_xdr: Some(signed_xdr.clone()),
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2481,6 +2755,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: Some(true),
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2514,6 +2789,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2546,6 +2822,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2557,8 +2834,7 @@ mod tests {
                 let err_str = err.to_string();
                 assert!(
                     err_str.contains("Soroban operations must be exclusive"),
-                    "Expected error about Soroban operation exclusivity, got: {}",
-                    err_str
+                    "Expected error about Soroban operation exclusivity, got: {err_str}"
                 );
             }
         }
@@ -2590,6 +2866,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2601,8 +2878,7 @@ mod tests {
                 let err_str = err.to_string();
                 assert!(
                     err_str.contains("Transaction can contain at most one Soroban operation"),
-                    "Expected error about multiple Soroban operations, got: {}",
-                    err_str
+                    "Expected error about multiple Soroban operations, got: {err_str}"
                 );
             }
         }
@@ -2632,6 +2908,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2658,6 +2935,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2669,8 +2947,7 @@ mod tests {
                 let err_str = err.to_string();
                 assert!(
                     err_str.contains("Soroban operations cannot have a memo"),
-                    "Expected error about memo restriction, got: {}",
-                    err_str
+                    "Expected error about memo restriction, got: {err_str}"
                 );
             }
         }
@@ -2693,6 +2970,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2720,6 +2998,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2747,6 +3026,7 @@ mod tests {
             transaction_xdr: None,
             fee_bump: None,
             max_fee: None,
+            signed_auth_entry: None,
         };
 
         let request = NetworkTransactionRequest::Stellar(stellar_request);
@@ -2845,8 +3125,7 @@ mod tests {
             // Should set delete_at for final status
             assert!(
                 transaction.delete_at.is_some(),
-                "delete_at should be set for status: {:?}",
-                status
+                "delete_at should be set for status: {status:?}"
             );
 
             // Verify the timestamp is reasonable
@@ -2866,8 +3145,7 @@ mod tests {
             assert!(
                 duration_from_before >= expected_duration - tolerance &&
                 duration_from_before <= expected_duration + tolerance,
-                "delete_at should be approximately 3 hours from now for status: {:?}. Duration from start: {:?}, Expected: {:?}, Config hours at runtime: {}",
-                status, duration_from_before, expected_duration, actual_hours_at_runtime
+                "delete_at should be approximately 3 hours from now for status: {status:?}. Duration from start: {duration_from_before:?}, Expected: {expected_duration:?}, Config hours at runtime: {actual_hours_at_runtime}"
             );
         }
 
@@ -2911,8 +3189,7 @@ mod tests {
         assert!(
             duration_from_before >= expected_duration - tolerance &&
             duration_from_before <= expected_duration + tolerance,
-            "delete_at should be approximately 4 hours from now (default). Duration from start: {:?}, Expected: {:?}",
-            duration_from_before, expected_duration
+            "delete_at should be approximately 4 hours from now (default). Duration from start: {duration_from_before:?}, Expected: {expected_duration:?}"
         );
     }
 
@@ -2941,8 +3218,7 @@ mod tests {
 
             assert!(
                 transaction.delete_at.is_some(),
-                "delete_at should be set for {} hours",
-                expiration_hours
+                "delete_at should be set for {expiration_hours} hours"
             );
 
             let delete_at_str = transaction.delete_at.unwrap();
@@ -2957,8 +3233,7 @@ mod tests {
             assert!(
                 duration_from_before >= expected_duration - tolerance &&
                 duration_from_before <= expected_duration + tolerance,
-                "delete_at should be approximately {} hours from now. Duration from start: {:?}, Expected: {:?}",
-                expiration_hours, duration_from_before, expected_duration
+                "delete_at should be approximately {expiration_hours} hours from now. Duration from start: {duration_from_before:?}, Expected: {expected_duration:?}"
             );
         }
 
@@ -2979,8 +3254,7 @@ mod tests {
 
             assert!(
                 result.is_some(),
-                "calculate_delete_at should return Some for {} hours",
-                hours
+                "calculate_delete_at should return Some for {hours} hours"
             );
 
             let delete_at_str = result.unwrap();
@@ -2995,8 +3269,7 @@ mod tests {
 
             assert!(
                 delete_at >= expected_min && delete_at <= expected_max,
-                "Calculated delete_at should be approximately {} hours from now. Got: {}, Expected between: {} and {}",
-                hours, delete_at, expected_min, expected_max
+                "Calculated delete_at should be approximately {hours} hours from now. Got: {delete_at}, Expected between: {expected_min} and {expected_max}"
             );
         }
     }
@@ -3066,6 +3339,7 @@ mod tests {
             network_type: NetworkType::Evm,
             noop_count: None,
             is_canceled: None,
+            metadata: None,
         }
     }
 
@@ -3131,6 +3405,7 @@ mod tests {
             network_type: NetworkType::Evm,
             noop_count: Some(5),
             is_canceled: Some(true),
+            metadata: None,
         };
 
         // Create a partial update that only changes status
@@ -3211,6 +3486,7 @@ mod tests {
                 transaction_xdr,
                 fee_bump: None,
                 max_fee: None,
+                signed_auth_entry: None,
             }
         }
 

@@ -13,13 +13,20 @@ ENV PKG_CONFIG_PATH=/usr/lib/pkgconfig
 
 WORKDIR /usr/app
 
+# Optional: set to "redis-tls-native" or "redis-tls-rustls" to enable Redis TLS support
+ARG CARGO_FEATURES=""
+
 # Copy
 COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/app/target \
-    cargo install --root /usr/app --path . --debug --locked
+    if [ -n "$CARGO_FEATURES" ]; then \
+      cargo install --root /usr/app --path . --debug --locked --features "$CARGO_FEATURES"; \
+    else \
+      cargo install --root /usr/app --path . --debug --locked; \
+    fi
 
 # Setting up build directories
 FROM cgr.dev/chainguard/wolfi-base
@@ -27,6 +34,8 @@ FROM cgr.dev/chainguard/wolfi-base
 WORKDIR /app
 
 COPY --from=base --chown=nonroot:nonroot /usr/app/bin/openzeppelin-relayer /app/openzeppelin-relayer
+COPY --from=base /usr/lib/libssl.so.3 /usr/lib/libssl.so.3
+COPY --from=base /usr/lib/libcrypto.so.3 /usr/lib/libcrypto.so.3
 
 # Install plugin dependencies
 ARG TARGETARCH
@@ -38,8 +47,7 @@ RUN apk add --no-cache nodejs=~${NODE_VERSION} npm
 
 ENV PATH="/usr/local/bin:$PATH"
 
-# Install pnpm and ts-node
-RUN npm install -g pnpm ts-node typescript
+RUN npm install -g pnpm
 
 # removes apk and unneeded wolfi-base tools.
 RUN apk del wolfi-base apk-tools
@@ -49,10 +57,16 @@ COPY --chown=nonroot:nonroot ./plugins /app/plugins
 
 USER nonroot
 WORKDIR /app/plugins
-RUN pnpm install --frozen-lockfile
+# Full install so postinstall can compile pool-executor.js with the
+# lockfile's ts-node/typescript. prune --prod then drops the dev
+# tree; --ignore-scripts is required because prune re-runs
+# postinstall after ts-node is already gone.
+RUN pnpm install --frozen-lockfile \
+ && pnpm prune --prod --ignore-scripts
 
 # Return to app root
 WORKDIR /app
+ENV PATH="/app/plugins/node_modules/.bin:/usr/local/bin:$PATH"
 
 ENV APP_PORT=8080
 ENV METRICS_PORT=8081

@@ -4,6 +4,9 @@
 //! - Transaction processing
 //! - Status monitoring
 //! - Notifications
+use crate::constants::{
+    HEALTH_CHECK_ACTION_KEY, HEALTH_CHECK_ACTION_NONCE_HEALTH, HEALTH_CHECK_NONCE_HINT_KEY,
+};
 use crate::models::{NetworkType, WebhookNotification};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -21,6 +24,12 @@ pub struct Job<T> {
     pub data: T,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Unix epoch (seconds) when this job is intended to become available for
+    /// processing. Set by the producer when `scheduled_on` is provided; absent
+    /// for immediate jobs. Consumers use this to compute queue pickup latency
+    /// that excludes intentional scheduling delay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<String>,
 }
 
 impl<T> Job<T> {
@@ -32,10 +41,15 @@ impl<T> Job<T> {
             job_type,
             data,
             request_id: None,
+            available_at: None,
         }
     }
     pub fn with_request_id(mut self, id: Option<String>) -> Self {
         self.request_id = id;
+        self
+    }
+    pub fn with_scheduled_on(mut self, scheduled_on: Option<i64>) -> Self {
+        self.available_at = scheduled_on.map(|ts| ts.to_string());
         self
     }
 }
@@ -57,6 +71,12 @@ pub enum JobType {
 pub struct TransactionRequest {
     pub transaction_id: String,
     pub relayer_id: String,
+    /// Network type for this transaction request.
+    /// Used by SQS backend to choose the FIFO message group strategy:
+    /// EVM uses relayer_id (nonce ordering), others use transaction_id (parallelism).
+    /// Optional for backward compatibility with older queued messages.
+    #[serde(default)]
+    pub network_type: Option<NetworkType>,
     pub metadata: Option<HashMap<String, String>>,
 }
 
@@ -65,8 +85,14 @@ impl TransactionRequest {
         Self {
             transaction_id: transaction_id.into(),
             relayer_id: relayer_id.into(),
+            network_type: None,
             metadata: None,
         }
+    }
+
+    pub fn with_network_type(mut self, network_type: NetworkType) -> Self {
+        self.network_type = Some(network_type);
+        self
     }
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
@@ -89,19 +115,28 @@ pub struct TransactionSend {
     pub transaction_id: String,
     pub relayer_id: String,
     pub command: TransactionCommand,
+    /// Network type for this transaction submission.
+    /// Used by SQS backend to choose the FIFO message group strategy:
+    /// EVM uses relayer_id (nonce ordering), others use transaction_id (parallelism).
+    /// Optional for backward compatibility with older queued messages.
+    #[serde(default)]
+    pub network_type: Option<NetworkType>,
     pub metadata: Option<HashMap<String, String>>,
 }
 
 impl TransactionSend {
+    // Submit a transaction to the relayer
     pub fn submit(transaction_id: impl Into<String>, relayer_id: impl Into<String>) -> Self {
         Self {
             transaction_id: transaction_id.into(),
             relayer_id: relayer_id.into(),
             command: TransactionCommand::Submit,
+            network_type: None,
             metadata: None,
         }
     }
 
+    // Cancel a transaction
     pub fn cancel(
         transaction_id: impl Into<String>,
         relayer_id: impl Into<String>,
@@ -113,28 +148,40 @@ impl TransactionSend {
             command: TransactionCommand::Cancel {
                 reason: reason.into(),
             },
+            network_type: None,
             metadata: None,
         }
     }
 
+    // Resubmit a transaction
     pub fn resubmit(transaction_id: impl Into<String>, relayer_id: impl Into<String>) -> Self {
         Self {
             transaction_id: transaction_id.into(),
             relayer_id: relayer_id.into(),
             command: TransactionCommand::Resubmit,
+            network_type: None,
             metadata: None,
         }
     }
 
+    // Resend a transaction
     pub fn resend(transaction_id: impl Into<String>, relayer_id: impl Into<String>) -> Self {
         Self {
             transaction_id: transaction_id.into(),
             relayer_id: relayer_id.into(),
             command: TransactionCommand::Resend,
+            network_type: None,
             metadata: None,
         }
     }
 
+    // Set the network type for this transaction submission
+    pub fn with_network_type(mut self, network_type: NetworkType) -> Self {
+        self.network_type = Some(network_type);
+        self
+    }
+
+    // Set the metadata for this transaction submission
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = Some(metadata);
         self
@@ -154,6 +201,7 @@ pub struct TransactionStatusCheck {
 }
 
 impl TransactionStatusCheck {
+    // Create a new transaction status check
     pub fn new(
         transaction_id: impl Into<String>,
         relayer_id: impl Into<String>,
@@ -167,6 +215,7 @@ impl TransactionStatusCheck {
         }
     }
 
+    // Set the metadata for this transaction status check
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = Some(metadata);
         self
@@ -203,6 +252,10 @@ impl TokenSwapRequest {
 pub struct RelayerHealthCheck {
     pub relayer_id: String,
     pub retry_count: u32,
+    /// Optional metadata for targeted health actions (e.g., nonce health).
+    /// Backwards-compatible: old messages without this field deserialize as `None`.
+    #[serde(default)]
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 impl RelayerHealthCheck {
@@ -210,6 +263,7 @@ impl RelayerHealthCheck {
         Self {
             relayer_id,
             retry_count: 0,
+            metadata: None,
         }
     }
 
@@ -217,7 +271,38 @@ impl RelayerHealthCheck {
         Self {
             relayer_id,
             retry_count,
+            metadata: None,
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Creates a nonce health check job for the given relayer.
+    /// Pre-populates metadata with the nonce health action key.
+    pub fn nonce_health(relayer_id: String) -> Self {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            HEALTH_CHECK_ACTION_KEY.to_string(),
+            HEALTH_CHECK_ACTION_NONCE_HEALTH.to_string(),
+        );
+        Self::new(relayer_id).with_metadata(metadata)
+    }
+
+    /// Creates a nonce health check job with a nonce hint.
+    /// The hint tells `resolve_nonce_gaps` to raise the counter to cover
+    /// this nonce, even if the counter was reset below it (e.g., after restart).
+    pub fn nonce_health_with_hint(relayer_id: String, nonce_hint: u64) -> Self {
+        let mut job = Self::nonce_health(relayer_id);
+        if let Some(ref mut metadata) = job.metadata {
+            metadata.insert(
+                HEALTH_CHECK_NONCE_HINT_KEY.to_string(),
+                nonce_hint.to_string(),
+            );
+        }
+        job
     }
 }
 
@@ -345,6 +430,35 @@ mod tests {
     }
 
     #[test]
+    fn test_job_with_scheduled_on_sets_available_at() {
+        let tx_request = TransactionRequest::new("tx123", "relayer-1");
+        let job = Job::new(JobType::TransactionRequest, tx_request).with_scheduled_on(Some(12345));
+
+        assert_eq!(job.available_at.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn test_job_serialization_preserves_available_at() {
+        let tx_request = TransactionRequest::new("tx123", "relayer-1");
+        let job = Job::new(JobType::TransactionRequest, tx_request).with_scheduled_on(Some(12345));
+
+        let serialized = serde_json::to_string(&job).unwrap();
+        let deserialized: Job<TransactionRequest> = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.available_at.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn test_job_serialization_omits_available_at_when_not_scheduled() {
+        let tx_request = TransactionRequest::new("tx123", "relayer-1");
+        let job = Job::new(JobType::TransactionRequest, tx_request);
+
+        let serialized = serde_json::to_string(&job).unwrap();
+
+        assert!(!serialized.contains("available_at"));
+    }
+
+    #[test]
     fn test_notification_send_serialization() {
         let payload = WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
             EvmTransactionResponse {
@@ -372,6 +486,7 @@ mod tests {
                     sig: "0x123".to_string(),
                 }),
                 speed: Some(Speed::Fast),
+                is_canceled: None,
             },
         )));
 
@@ -386,7 +501,7 @@ mod tests {
                 assert_eq!(notification_send, deserialized);
             }
             Err(e) => {
-                panic!("Deserialization error: {}", e);
+                panic!("Deserialization error: {e}");
             }
         }
     }
@@ -414,6 +529,7 @@ mod tests {
                 max_priority_fee_per_gas: None,
                 signature: None,
                 speed: None,
+                is_canceled: None,
             },
         )));
 
@@ -428,7 +544,7 @@ mod tests {
                 assert_eq!(notification_send, deserialized);
             }
             Err(e) => {
-                panic!("Deserialization error: {}", e);
+                panic!("Deserialization error: {e}");
             }
         }
     }
@@ -447,6 +563,35 @@ mod tests {
 
         assert_eq!(health_check.relayer_id, "relayer-1");
         assert_eq!(health_check.retry_count, 5);
+    }
+
+    #[test]
+    fn test_relayer_health_check_nonce_health() {
+        let job = RelayerHealthCheck::nonce_health("relayer-1".to_string());
+
+        assert_eq!(job.relayer_id, "relayer-1");
+        let metadata = job.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata.get(HEALTH_CHECK_ACTION_KEY),
+            Some(&HEALTH_CHECK_ACTION_NONCE_HEALTH.to_string())
+        );
+        assert!(!metadata.contains_key(HEALTH_CHECK_NONCE_HINT_KEY));
+    }
+
+    #[test]
+    fn test_relayer_health_check_nonce_health_with_hint() {
+        let job = RelayerHealthCheck::nonce_health_with_hint("relayer-1".to_string(), 274);
+
+        assert_eq!(job.relayer_id, "relayer-1");
+        let metadata = job.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata.get(HEALTH_CHECK_ACTION_KEY),
+            Some(&HEALTH_CHECK_ACTION_NONCE_HEALTH.to_string())
+        );
+        assert_eq!(
+            metadata.get(HEALTH_CHECK_NONCE_HINT_KEY),
+            Some(&"274".to_string())
+        );
     }
 
     #[test]
@@ -518,5 +663,72 @@ mod tests {
             deserialized.data.retry_count,
             original_health_check.retry_count
         );
+    }
+
+    #[test]
+    fn test_relayer_health_check_with_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "health_check_action".to_string(),
+            "nonce_health".to_string(),
+        );
+
+        let health_check =
+            RelayerHealthCheck::new("relayer-1".to_string()).with_metadata(metadata.clone());
+
+        assert_eq!(health_check.relayer_id, "relayer-1");
+        assert_eq!(health_check.retry_count, 0);
+        assert!(health_check.metadata.is_some());
+        assert_eq!(
+            health_check
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("health_check_action"),
+            Some(&"nonce_health".to_string())
+        );
+        assert_eq!(health_check.metadata.unwrap(), metadata);
+    }
+
+    #[test]
+    fn test_relayer_health_check_metadata_serialization() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "health_check_action".to_string(),
+            "nonce_health".to_string(),
+        );
+
+        let original = RelayerHealthCheck::with_retry_count("relayer-2".to_string(), 2)
+            .with_metadata(metadata.clone());
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: RelayerHealthCheck = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.relayer_id, original.relayer_id);
+        assert_eq!(deserialized.retry_count, original.retry_count);
+        assert_eq!(deserialized.metadata, original.metadata);
+        assert_eq!(
+            deserialized
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("health_check_action"),
+            Some(&"nonce_health".to_string())
+        );
+    }
+
+    #[test]
+    fn test_relayer_health_check_backward_compatibility() {
+        // Simulate an old message without the metadata field
+        let old_json = r#"{
+            "relayer_id": "relayer-legacy",
+            "retry_count": 3
+        }"#;
+
+        let deserialized: RelayerHealthCheck = serde_json::from_str(old_json).unwrap();
+
+        assert_eq!(deserialized.relayer_id, "relayer-legacy");
+        assert_eq!(deserialized.retry_count, 3);
+        assert!(deserialized.metadata.is_none());
     }
 }

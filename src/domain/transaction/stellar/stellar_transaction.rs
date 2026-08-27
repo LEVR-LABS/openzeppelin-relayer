@@ -6,11 +6,11 @@
 use crate::{
     constants::DEFAULT_STELLAR_CONCURRENT_TRANSACTIONS,
     domain::transaction::{stellar::fetch_next_sequence_from_chain, Transaction},
-    jobs::{JobProducer, JobProducerTrait, TransactionRequest},
+    jobs::{JobProducer, JobProducerTrait, StatusCheckContext, TransactionRequest},
     models::{
-        produce_transaction_update_notification_payload, NetworkTransactionRequest,
-        PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel, TransactionError,
-        TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
+        produce_transaction_update_notification_payload, NetworkTransactionData,
+        NetworkTransactionRequest, PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel,
+        TransactionError, TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{
         RelayerRepositoryStorage, Repository, TransactionCounterRepositoryStorage,
@@ -18,14 +18,14 @@ use crate::{
     },
     services::{
         provider::{StellarProvider, StellarProviderTrait},
-        signer::{Signer, StellarSigner},
-        stellar_dex::{OrderBookService, StellarDexServiceTrait},
+        signer::{Signer, StellarSignTrait, StellarSigner},
+        stellar_dex::{StellarDexService, StellarDexServiceTrait},
     },
     utils::calculate_scheduled_timestamp,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::lane_gate;
 
@@ -35,7 +35,7 @@ where
     R: Repository<RelayerRepoModel, String>,
     T: TransactionRepository,
     J: JobProducerTrait,
-    S: Signer,
+    S: Signer + StellarSignTrait,
     P: StellarProviderTrait,
     C: TransactionCounterTrait,
     D: StellarDexServiceTrait + Send + Sync + 'static,
@@ -56,7 +56,7 @@ where
     R: Repository<RelayerRepoModel, String>,
     T: TransactionRepository,
     J: JobProducerTrait,
-    S: Signer,
+    S: Signer + StellarSignTrait,
     P: StellarProviderTrait,
     C: TransactionCounterTrait,
     D: StellarDexServiceTrait + Send + Sync + 'static,
@@ -244,17 +244,167 @@ where
         // Use the shared helper to fetch the next sequence
         let next_usable_seq = fetch_next_sequence_from_chain(self.provider(), relayer_address)
             .await
-            .map_err(TransactionError::UnexpectedError)?;
+            .map_err(|e| {
+                warn!(
+                    address = %relayer_address,
+                    error = %e,
+                    "failed to fetch sequence from chain in sync_sequence_from_chain"
+                );
+                TransactionError::UnexpectedError(format!(
+                    "Failed to sync sequence from chain: {e}"
+                ))
+            })?;
 
-        // Update the local counter to the next usable sequence
-        self.transaction_counter_service()
-            .set(&self.relayer().id, relayer_address, next_usable_seq)
+        // Raise the local counter to the on-chain floor *monotonically*: a blind `set` here
+        // would rewind the counter when concurrent allocations have already advanced it past
+        // the chain value, causing duplicate/gapped sequences and a TxBadSeq cascade
+        // (Constitution III: live chain sequence is a floor, never the authoritative next
+        // assignment). `sync_floor` only advances when the chain is ahead.
+        let effective_seq = self
+            .transaction_counter_service()
+            .sync_floor(&self.relayer().id, relayer_address, next_usable_seq)
             .await
             .map_err(|e| {
                 TransactionError::UnexpectedError(format!("Failed to update sequence counter: {e}"))
             })?;
 
-        info!(sequence = %next_usable_seq, "updated local sequence counter");
+        info!(
+            chain_sequence = %next_usable_seq,
+            effective_sequence = %effective_seq,
+            "synced local sequence counter to chain floor"
+        );
+
+        // The floor sync only raises. A failure between `get_and_increment` and the
+        // tx-record persist burns the sequence and leaves the counter above the chain;
+        // without a downward reconcile the tx re-prepares at ever-higher sequences and
+        // thrashes TxBadSeq forever, so also try to rewind over the burned region.
+        if effective_seq > next_usable_seq {
+            self.try_rewind_sequence_counter(relayer_address, next_usable_seq, effective_seq)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Trims the burned head of the sequence counter down to on-chain reality.
+    ///
+    /// Rewinds the counter from `observed` to `target`, where `target` is the highest of:
+    /// - `next_usable_from_chain`,
+    /// - one past the highest `sequence_number` held by an active (Pending/Sent/Submitted)
+    ///   transaction of this relayer,
+    /// - one past the newest Confirmed transaction's sequence — a Confirmed record proves
+    ///   consumption even when the chain read comes from a lagging node, so this guards
+    ///   the rewind against a stale `next_usable_from_chain`.
+    ///
+    /// Transactions reset via `reset_to_pre_prepare_state` have their `sequence_number`
+    /// cleared, so they never bound the rewind and their burned sequences are reclaimed.
+    /// Failed records never bound it either: on Stellar a rejected submission consumes
+    /// nothing, and a landed-but-failed transaction under a stale chain read self-heals
+    /// in one TxBadSeq cycle.
+    ///
+    /// The nonce occupancy index is EVM-only, so occupancy is derived by reading the
+    /// Stellar `sequence_number` from the active transaction records directly.
+    ///
+    /// The write is a CAS against `observed`; if the counter moved concurrently the
+    /// write is a no-op — an under-rewind or missed rewind self-heals on the next
+    /// TxBadSeq recovery cycle.
+    async fn try_rewind_sequence_counter(
+        &self,
+        relayer_address: &str,
+        next_usable_from_chain: u64,
+        observed: u64,
+    ) -> Result<(), TransactionError> {
+        if observed <= next_usable_from_chain {
+            return Ok(());
+        }
+
+        let active_txs = self
+            .transaction_repository()
+            .find_by_status(
+                &self.relayer().id,
+                &[
+                    TransactionStatus::Pending,
+                    TransactionStatus::Sent,
+                    TransactionStatus::Submitted,
+                ],
+            )
+            .await
+            .map_err(TransactionError::from)?;
+
+        let highest_active_seq = active_txs
+            .iter()
+            .filter_map(|tx| match &tx.network_data {
+                NetworkTransactionData::Stellar(data) => data.sequence_number,
+                _ => None,
+            })
+            .filter_map(|seq| u64::try_from(seq).ok())
+            .max();
+
+        // One newest-first page is enough for the Confirmed bound: for a single account,
+        // sequences strictly increase in confirmation order, so the newest Confirmed tx
+        // carries the highest consumed sequence. A full Confirmed scan would walk the
+        // relayer's entire history.
+        let newest_confirmed_seq = self
+            .transaction_repository()
+            .find_by_status_paginated(
+                &self.relayer().id,
+                &[TransactionStatus::Confirmed],
+                PaginationQuery {
+                    page: 1,
+                    per_page: 1,
+                },
+                false, // newest first
+            )
+            .await
+            .map_err(TransactionError::from)?
+            .items
+            .first()
+            .and_then(|tx| match &tx.network_data {
+                NetworkTransactionData::Stellar(data) => data.sequence_number,
+                _ => None,
+            })
+            .and_then(|seq| u64::try_from(seq).ok());
+
+        let target = match highest_active_seq
+            .into_iter()
+            .chain(newest_confirmed_seq)
+            .max()
+        {
+            Some(seq) => std::cmp::max(next_usable_from_chain, seq + 1),
+            None => next_usable_from_chain,
+        };
+
+        if target >= observed {
+            return Ok(());
+        }
+
+        let applied = self
+            .transaction_counter_service()
+            .set_if_equals(&self.relayer().id, relayer_address, observed, target)
+            .await
+            .map_err(|e| {
+                TransactionError::UnexpectedError(format!("Failed to rewind sequence counter: {e}"))
+            })?;
+
+        if applied {
+            info!(
+                relayer_id = %self.relayer().id,
+                observed = observed,
+                target = target,
+                next_usable_from_chain = next_usable_from_chain,
+                "rewound sequence counter over burned region"
+            );
+        } else {
+            // warn, not debug: repeated misses are the only visible signal that the
+            // rewind is being starved by concurrent counter movement.
+            warn!(
+                relayer_id = %self.relayer().id,
+                observed = observed,
+                target = target,
+                "counter moved concurrently; skipping rewind, next TxBadSeq recovery will retry"
+            );
+        }
+
         Ok(())
     }
 
@@ -286,7 +436,7 @@ where
     R: Repository<RelayerRepoModel, String> + Send + Sync,
     T: TransactionRepository + Send + Sync,
     J: JobProducerTrait + Send + Sync,
-    S: Signer + Send + Sync,
+    S: Signer + StellarSignTrait + Send + Sync,
     P: StellarProviderTrait + Send + Sync,
     C: TransactionCounterTrait + Send + Sync,
     D: StellarDexServiceTrait + Send + Sync + 'static,
@@ -315,8 +465,9 @@ where
     async fn handle_transaction_status(
         &self,
         tx: TransactionRepoModel,
+        context: Option<StatusCheckContext>,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        self.handle_transaction_status_impl(tx).await
+        self.handle_transaction_status_impl(tx, context).await
     }
 
     async fn cancel_transaction(
@@ -356,17 +507,21 @@ pub type DefaultStellarTransaction = StellarRelayerTransaction<
     StellarSigner,
     StellarProvider,
     TransactionCounterRepositoryStorage,
-    OrderBookService<StellarProvider, StellarSigner>,
+    StellarDexService<StellarProvider, StellarSigner>,
 >;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repositories::transaction::RedisTransactionRepository;
+    use crate::utils::RedisConnections;
     use crate::{
         models::{NetworkTransactionData, RepositoryError},
         services::provider::ProviderError,
     };
+    use deadpool_redis::{Config, Runtime};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use crate::domain::transaction::stellar::test_helpers::*;
 
@@ -519,7 +674,7 @@ mod tests {
                 statuses == [TransactionStatus::Pending]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == true
+                    && *oldest_first
             })
             .times(1)
             .returning(move |_, _, _, _| {
@@ -562,7 +717,7 @@ mod tests {
                 statuses == [TransactionStatus::Pending]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == true
+                    && *oldest_first
             })
             .times(1)
             .returning(|_, _, _, _| {
@@ -620,15 +775,15 @@ mod tests {
                 })
             });
 
-        // Mock counter set to verify it's called with next usable sequence (101)
+        // Mock counter sync_floor to verify it's called with next usable sequence (101)
         mocks
             .counter
-            .expect_set()
-            .withf(|relayer_id, addr, seq| {
-                relayer_id == "relayer-1" && addr == TEST_PK && *seq == 101
+            .expect_sync_floor()
+            .withf(|relayer_id, addr, floor| {
+                relayer_id == "relayer-1" && addr == TEST_PK && *floor == 101
             })
             .times(1)
-            .returning(|_, _, _| Box::pin(async { Ok(()) }));
+            .returning(|_, _, floor| Box::pin(async move { Ok(floor) }));
 
         let handler = make_stellar_tx_handler(relayer.clone(), mocks);
 
@@ -691,14 +846,18 @@ mod tests {
             })
         });
 
-        // Mock counter set to fail
-        mocks.counter.expect_set().times(1).returning(|_, _, _| {
-            Box::pin(async {
-                Err(RepositoryError::Unknown(
-                    "Counter update failed".to_string(),
-                ))
-            })
-        });
+        // Mock counter sync_floor to fail
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| {
+                Box::pin(async {
+                    Err(RepositoryError::Unknown(
+                        "Counter update failed".to_string(),
+                    ))
+                })
+            });
 
         let handler = make_stellar_tx_handler(relayer.clone(), mocks);
 
@@ -710,6 +869,393 @@ mod tests {
             }
             _ => panic!("Expected UnexpectedError"),
         }
+    }
+
+    /// Builds an `AccountEntry` for the test relayer with the given on-chain sequence.
+    fn test_account_entry(seq: i64) -> soroban_rs::xdr::AccountEntry {
+        use soroban_rs::xdr::{
+            AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, String32,
+            Thresholds, Uint256,
+        };
+        use stellar_strkey::ed25519;
+
+        let pk = ed25519::PublicKey::from_string(TEST_PK).unwrap();
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
+
+        AccountEntry {
+            account_id,
+            balance: 1000000,
+            seq_num: SequenceNumber(seq),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 1, 1, 1]),
+            signers: Default::default(),
+            ext: AccountEntryExt::V0,
+        }
+    }
+
+    /// Rewind (a): no active tx holds a sequence — the drifted counter rewinds to the chain floor.
+    #[tokio::test]
+    async fn test_sync_sequence_rewind_empty_region_rewinds_to_chain_floor() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        // Chain sequence 100 → next usable 101.
+        mocks
+            .provider
+            .expect_get_account()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(test_account_entry(100)) }));
+
+        // Counter sits at 150, well above the chain floor.
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(150) }));
+
+        // Only reset txs remain: sequence_number is cleared, so nothing bounds the rewind.
+        let mut reset_tx = create_test_transaction(&relayer.id);
+        if let NetworkTransactionData::Stellar(ref mut data) = reset_tx.network_data {
+            data.sequence_number = None;
+        }
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .withf(|relayer_id, statuses| {
+                relayer_id == "relayer-1"
+                    && statuses
+                        == [
+                            TransactionStatus::Pending,
+                            TransactionStatus::Sent,
+                            TransactionStatus::Submitted,
+                        ]
+            })
+            .times(1)
+            .returning(move |_, _| Ok(vec![reset_tx.clone()]));
+
+        // No Confirmed txs to bound the rewind
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(crate::repositories::PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        // Empty drift region → CAS lowers 150 → 101.
+        mocks
+            .counter
+            .expect_set_if_equals()
+            .withf(|relayer_id, addr, expected, value| {
+                relayer_id == "relayer-1" && addr == TEST_PK && *expected == 150 && *value == 101
+            })
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(true) }));
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+        let result = handler.sync_sequence_from_chain(&relayer.address).await;
+        assert!(result.is_ok());
+    }
+
+    /// Rewind (b): an active tx holding a sequence bounds the rewind to one past it.
+    #[tokio::test]
+    async fn test_sync_sequence_rewind_bounded_by_active_tx() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        mocks
+            .provider
+            .expect_get_account()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(test_account_entry(100)) }));
+
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(150) }));
+
+        // An active Submitted tx holds sequence 120; a reset tx (None) is skipped.
+        let mut active_tx = create_test_transaction(&relayer.id);
+        active_tx.status = TransactionStatus::Submitted;
+        if let NetworkTransactionData::Stellar(ref mut data) = active_tx.network_data {
+            data.sequence_number = Some(120);
+        }
+        let mut reset_tx = create_test_transaction(&relayer.id);
+        reset_tx.id = "tx-2".to_string();
+        if let NetworkTransactionData::Stellar(ref mut data) = reset_tx.network_data {
+            data.sequence_number = None;
+        }
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .times(1)
+            .returning(move |_, _| Ok(vec![active_tx.clone(), reset_tx.clone()]));
+
+        // No Confirmed txs to bound the rewind
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(crate::repositories::PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        // Highest active sequence 120 → target 121; CAS lowers 150 → 121.
+        mocks
+            .counter
+            .expect_set_if_equals()
+            .withf(|_, _, expected, value| *expected == 150 && *value == 121)
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(true) }));
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+        let result = handler.sync_sequence_from_chain(&relayer.address).await;
+        assert!(result.is_ok());
+    }
+
+    /// Rewind (d): an active tx at `observed - 1` makes the target equal `observed` —
+    /// no CAS write is attempted (either mock call would panic as unexpected).
+    #[tokio::test]
+    async fn test_sync_sequence_rewind_noop_when_active_tx_at_observed() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        mocks
+            .provider
+            .expect_get_account()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(test_account_entry(100)) }));
+
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(150) }));
+
+        // An active tx holds 149 → target = 150 = observed → rewind is a no-op.
+        // No set_if_equals expectation: a CAS attempt panics the test.
+        let mut active_tx = create_test_transaction(&relayer.id);
+        active_tx.status = TransactionStatus::Sent;
+        if let NetworkTransactionData::Stellar(ref mut data) = active_tx.network_data {
+            data.sequence_number = Some(149);
+        }
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .times(1)
+            .returning(move |_, _| Ok(vec![active_tx.clone()]));
+
+        // No Confirmed txs to bound the rewind
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(crate::repositories::PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+        let result = handler.sync_sequence_from_chain(&relayer.address).await;
+        assert!(result.is_ok());
+    }
+
+    /// Rewind (e): an active tx whose sequence is below the chain floor does not drag
+    /// the target under it — the chain floor wins the max().
+    #[tokio::test]
+    async fn test_sync_sequence_rewind_chain_floor_wins_over_stale_active_seq() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        mocks
+            .provider
+            .expect_get_account()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(test_account_entry(100)) }));
+
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(150) }));
+
+        // A stale active tx holds 42, below the chain floor of 101.
+        let mut active_tx = create_test_transaction(&relayer.id);
+        active_tx.status = TransactionStatus::Sent;
+        if let NetworkTransactionData::Stellar(ref mut data) = active_tx.network_data {
+            data.sequence_number = Some(42);
+        }
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .times(1)
+            .returning(move |_, _| Ok(vec![active_tx.clone()]));
+
+        // No Confirmed txs to bound the rewind
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(crate::repositories::PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        // target = max(101, 42 + 1) = 101; CAS lowers 150 → 101.
+        mocks
+            .counter
+            .expect_set_if_equals()
+            .withf(|_, _, expected, value| *expected == 150 && *value == 101)
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(true) }));
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+        let result = handler.sync_sequence_from_chain(&relayer.address).await;
+        assert!(result.is_ok());
+    }
+
+    /// Rewind (f): the newest Confirmed tx bounds the rewind — a Confirmed record proves
+    /// consumption even when the chain read is stale, so the target never goes below it.
+    #[tokio::test]
+    async fn test_sync_sequence_rewind_bounded_by_newest_confirmed() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        // Stale chain read: seq 100 → next usable 101.
+        mocks
+            .provider
+            .expect_get_account()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(test_account_entry(100)) }));
+
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(150) }));
+
+        // No active tx holds a sequence.
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .times(1)
+            .returning(|_, _| Ok(vec![]));
+
+        // The newest Confirmed tx consumed sequence 130 — one newest-first page.
+        let mut confirmed_tx = create_test_transaction(&relayer.id);
+        confirmed_tx.status = TransactionStatus::Confirmed;
+        if let NetworkTransactionData::Stellar(ref mut data) = confirmed_tx.network_data {
+            data.sequence_number = Some(130);
+        }
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .withf(|relayer_id, statuses, query, oldest_first| {
+                relayer_id == "relayer-1"
+                    && statuses == [TransactionStatus::Confirmed]
+                    && query.page == 1
+                    && query.per_page == 1
+                    && !*oldest_first
+            })
+            .times(1)
+            .returning(move |_, _, _, _| {
+                Ok(crate::repositories::PaginatedResult {
+                    items: vec![confirmed_tx.clone()],
+                    total: 1,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        // target = max(101, 130 + 1) = 131; CAS lowers 150 → 131.
+        mocks
+            .counter
+            .expect_set_if_equals()
+            .withf(|_, _, expected, value| *expected == 150 && *value == 131)
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(true) }));
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+        let result = handler.sync_sequence_from_chain(&relayer.address).await;
+        assert!(result.is_ok());
+    }
+
+    /// Rewind (c): the CAS returns false (counter moved concurrently) — no error is surfaced.
+    #[tokio::test]
+    async fn test_sync_sequence_rewind_cas_miss_is_ok() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        mocks
+            .provider
+            .expect_get_account()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(test_account_entry(100)) }));
+
+        mocks
+            .counter
+            .expect_sync_floor()
+            .times(1)
+            .returning(|_, _, _| Box::pin(async { Ok(150) }));
+
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .times(1)
+            .returning(|_, _| Ok(vec![]));
+
+        // No Confirmed txs to bound the rewind
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(crate::repositories::PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        // Counter moved since observed; rewind is skipped without error.
+        mocks
+            .counter
+            .expect_set_if_equals()
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(false) }));
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+        let result = handler.sync_sequence_from_chain(&relayer.address).await;
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -825,22 +1371,24 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires active Redis instance"]
     async fn test_find_oldest_pending_for_relayer_with_redis() {
-        use crate::repositories::transaction::RedisTransactionRepository;
-        use redis::Client;
-        use uuid::Uuid;
-
         // Setup Redis repository
         let redis_url = std::env::var("REDIS_TEST_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let client = Client::open(redis_url).expect("Failed to create Redis client");
-        let connection_manager = redis::aio::ConnectionManager::new(client)
-            .await
-            .expect("Failed to create connection manager");
+        let pool = Arc::new(
+            Config::from_url(&redis_url)
+                .builder()
+                .expect("Failed to create Redis pool builder")
+                .max_size(16)
+                .runtime(Runtime::Tokio1)
+                .build()
+                .expect("Failed to build Redis pool"),
+        );
+        let connections = Arc::new(RedisConnections::new_single_pool(pool));
 
         let random_id = Uuid::new_v4().to_string();
-        let key_prefix = format!("test_stellar:{}", random_id);
+        let key_prefix = format!("test_stellar:{random_id}");
         let tx_repo = Arc::new(
-            RedisTransactionRepository::new(Arc::new(connection_manager), key_prefix)
+            RedisTransactionRepository::new(connections, key_prefix)
                 .expect("Failed to create RedisTransactionRepository"),
         );
 

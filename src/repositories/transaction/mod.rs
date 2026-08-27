@@ -21,7 +21,6 @@
 mod transaction_in_memory;
 mod transaction_redis;
 
-use redis::aio::ConnectionManager;
 pub use transaction_in_memory::*;
 pub use transaction_redis::*;
 
@@ -30,6 +29,7 @@ use crate::{
         NetworkTransactionData, TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{BatchDeleteResult, TransactionDeleteRequest, *},
+    utils::RedisConnections,
 };
 use async_trait::async_trait;
 use eyre::Result;
@@ -38,6 +38,13 @@ use std::sync::Arc;
 /// A trait defining transaction repository operations
 #[async_trait]
 pub trait TransactionRepository: Repository<TransactionRepoModel, String> {
+    /// Returns underlying storage Redis connections when available.
+    ///
+    /// In-memory implementations return `None`.
+    fn connection_info(&self) -> Option<(Arc<RedisConnections>, String)> {
+        None
+    }
+
     /// Find transactions by relayer ID with pagination
     async fn find_by_relayer_id(
         &self,
@@ -74,12 +81,40 @@ pub trait TransactionRepository: Repository<TransactionRepoModel, String> {
         oldest_first: bool,
     ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError>;
 
+    /// Like [`find_by_status_paginated`], but when `exclude_canceled` is true,
+    /// transactions flagged `is_canceled` are removed BEFORE counting and pagination,
+    /// so the returned page and `total` stay consistent (no short/empty pages).
+    ///
+    /// Used by the listing API to hide cancelled-in-progress transactions from
+    /// active-status queries; internal callers use the unfiltered variant so they
+    /// still see the still-active replacement NOOP.
+    async fn find_by_status_paginated_filtered(
+        &self,
+        relayer_id: &str,
+        statuses: &[TransactionStatus],
+        query: PaginationQuery,
+        oldest_first: bool,
+        exclude_canceled: bool,
+    ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError>;
+
     /// Find a transaction by relayer ID and nonce
     async fn find_by_nonce(
         &self,
         relayer_id: &str,
         nonce: u64,
     ) -> Result<Option<TransactionRepoModel>, RepositoryError>;
+
+    /// Returns the transaction status for each nonce in `[from_nonce, to_nonce)`.
+    ///
+    /// For each nonce, returns `Some(status)` if a transaction exists at that slot,
+    /// or `None` if the slot is empty. Implementations should batch I/O where possible
+    /// (e.g., Redis MGET) to minimize round trips.
+    async fn get_nonce_occupancy(
+        &self,
+        relayer_id: &str,
+        from_nonce: u64,
+        to_nonce: u64,
+    ) -> Result<Vec<(u64, Option<TransactionStatus>)>, RepositoryError>;
 
     /// Update the status of a transaction
     async fn update_status(
@@ -95,6 +130,18 @@ pub trait TransactionRepository: Repository<TransactionRepoModel, String> {
         update: TransactionUpdateRequest,
     ) -> Result<TransactionRepoModel, RepositoryError>;
 
+    /// Repairs stale Redis status-index entries whose indexed status diverged from
+    /// the persisted transaction body.
+    ///
+    /// Backends where status indexes cannot diverge from transaction bodies should
+    /// use the default no-op implementation.
+    async fn reconcile_stale_status_indexes(
+        &self,
+        _relayer_id: &str,
+    ) -> Result<usize, RepositoryError> {
+        Ok(0)
+    }
+
     /// Update the network data of a transaction
     async fn update_network_data(
         &self,
@@ -104,6 +151,32 @@ pub trait TransactionRepository: Repository<TransactionRepoModel, String> {
 
     /// Set the sent_at timestamp of a transaction
     async fn set_sent_at(
+        &self,
+        tx_id: String,
+        sent_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError>;
+
+    /// Atomically increments status-check failure counters using the latest stored metadata.
+    async fn increment_status_check_failures(
+        &self,
+        tx_id: String,
+    ) -> Result<TransactionRepoModel, RepositoryError>;
+
+    /// Atomically resets consecutive status-check failures to zero while preserving other counters.
+    async fn reset_status_check_consecutive_failures(
+        &self,
+        tx_id: String,
+    ) -> Result<TransactionRepoModel, RepositoryError>;
+
+    /// Atomically sets `sent_at` and increments Stellar insufficient-fee retries.
+    async fn record_stellar_insufficient_fee_retry(
+        &self,
+        tx_id: String,
+        sent_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError>;
+
+    /// Atomically sets `sent_at` and increments Stellar try-again-later retries.
+    async fn record_stellar_try_again_later_retry(
         &self,
         tx_id: String,
         sent_at: String,
@@ -176,14 +249,22 @@ mockall::mock! {
 
   #[async_trait]
   impl TransactionRepository for TransactionRepository {
+      fn connection_info(&self) -> Option<(Arc<RedisConnections>, String)>;
       async fn find_by_relayer_id(&self, relayer_id: &str, query: PaginationQuery) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError>;
       async fn find_by_status(&self, relayer_id: &str, statuses: &[TransactionStatus]) -> Result<Vec<TransactionRepoModel>, RepositoryError>;
       async fn find_by_status_paginated(&self, relayer_id: &str, statuses: &[TransactionStatus], query: PaginationQuery, oldest_first: bool) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError>;
+      async fn find_by_status_paginated_filtered(&self, relayer_id: &str, statuses: &[TransactionStatus], query: PaginationQuery, oldest_first: bool, exclude_canceled: bool) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError>;
       async fn find_by_nonce(&self, relayer_id: &str, nonce: u64) -> Result<Option<TransactionRepoModel>, RepositoryError>;
+      async fn get_nonce_occupancy(&self, relayer_id: &str, from_nonce: u64, to_nonce: u64) -> Result<Vec<(u64, Option<TransactionStatus>)>, RepositoryError>;
       async fn update_status(&self, tx_id: String, status: TransactionStatus) -> Result<TransactionRepoModel, RepositoryError>;
       async fn partial_update(&self, tx_id: String, update: TransactionUpdateRequest) -> Result<TransactionRepoModel, RepositoryError>;
+      async fn reconcile_stale_status_indexes(&self, relayer_id: &str) -> Result<usize, RepositoryError>;
       async fn update_network_data(&self, tx_id: String, network_data: NetworkTransactionData) -> Result<TransactionRepoModel, RepositoryError>;
       async fn set_sent_at(&self, tx_id: String, sent_at: String) -> Result<TransactionRepoModel, RepositoryError>;
+      async fn increment_status_check_failures(&self, tx_id: String) -> Result<TransactionRepoModel, RepositoryError>;
+      async fn reset_status_check_consecutive_failures(&self, tx_id: String) -> Result<TransactionRepoModel, RepositoryError>;
+      async fn record_stellar_insufficient_fee_retry(&self, tx_id: String, sent_at: String) -> Result<TransactionRepoModel, RepositoryError>;
+      async fn record_stellar_try_again_later_retry(&self, tx_id: String, sent_at: String) -> Result<TransactionRepoModel, RepositoryError>;
       async fn set_confirmed_at(&self, tx_id: String, confirmed_at: String) -> Result<TransactionRepoModel, RepositoryError>;
       async fn count_by_status(&self, relayer_id: &str, statuses: &[TransactionStatus]) -> Result<u64, RepositoryError>;
       async fn delete_by_ids(&self, ids: Vec<String>) -> Result<BatchDeleteResult, RepositoryError>;
@@ -203,36 +284,48 @@ impl TransactionRepositoryStorage {
         Self::InMemory(InMemoryTransactionRepository::new())
     }
     pub fn new_redis(
-        connection_manager: Arc<ConnectionManager>,
+        connections: Arc<RedisConnections>,
         key_prefix: String,
     ) -> Result<Self, RepositoryError> {
         Ok(Self::Redis(RedisTransactionRepository::new(
-            connection_manager,
+            connections,
             key_prefix,
         )?))
     }
 
-    /// Returns the underlying connection manager and key prefix if this is a persistent storage backend.
+    /// Returns underlying Redis connections if this is a persistent storage backend.
     ///
     /// This is useful for operations that need direct storage access, such as
-    /// distributed locking. The key prefix is used to namespace keys for multi-tenant
-    /// deployments. Currently supports Redis, but the design allows for future backends.
+    /// distributed locking and health checks.
     ///
     /// # Returns
-    /// * `Some((connection, prefix))` - If using persistent storage (e.g., Redis)
+    /// * `Some((connections, key_prefix))` - If using persistent Redis storage
     /// * `None` - If using in-memory storage
-    pub fn connection_info(&self) -> Option<(Arc<ConnectionManager>, &str)> {
+    pub fn connection_info(&self) -> Option<(Arc<RedisConnections>, &str)> {
         match self {
             TransactionRepositoryStorage::InMemory(_) => None,
             TransactionRepositoryStorage::Redis(repo) => {
-                Some((repo.client.clone(), &repo.key_prefix))
+                Some((repo.connections.clone(), &repo.key_prefix))
             }
+        }
+    }
+
+    /// Returns key prefix used by persistent storage backends.
+    pub fn key_prefix(&self) -> Option<&str> {
+        match self {
+            TransactionRepositoryStorage::InMemory(_) => None,
+            TransactionRepositoryStorage::Redis(repo) => Some(&repo.key_prefix),
         }
     }
 }
 
 #[async_trait]
 impl TransactionRepository for TransactionRepositoryStorage {
+    fn connection_info(&self) -> Option<(Arc<RedisConnections>, String)> {
+        TransactionRepositoryStorage::connection_info(self)
+            .map(|(connections, key_prefix)| (connections, key_prefix.to_string()))
+    }
+
     async fn find_by_relayer_id(
         &self,
         relayer_id: &str,
@@ -282,6 +375,38 @@ impl TransactionRepository for TransactionRepositoryStorage {
         }
     }
 
+    async fn find_by_status_paginated_filtered(
+        &self,
+        relayer_id: &str,
+        statuses: &[TransactionStatus],
+        query: PaginationQuery,
+        oldest_first: bool,
+        exclude_canceled: bool,
+    ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.find_by_status_paginated_filtered(
+                    relayer_id,
+                    statuses,
+                    query,
+                    oldest_first,
+                    exclude_canceled,
+                )
+                .await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.find_by_status_paginated_filtered(
+                    relayer_id,
+                    statuses,
+                    query,
+                    oldest_first,
+                    exclude_canceled,
+                )
+                .await
+            }
+        }
+    }
+
     async fn find_by_nonce(
         &self,
         relayer_id: &str,
@@ -293,6 +418,24 @@ impl TransactionRepository for TransactionRepositoryStorage {
             }
             TransactionRepositoryStorage::Redis(repo) => {
                 repo.find_by_nonce(relayer_id, nonce).await
+            }
+        }
+    }
+
+    async fn get_nonce_occupancy(
+        &self,
+        relayer_id: &str,
+        from_nonce: u64,
+        to_nonce: u64,
+    ) -> Result<Vec<(u64, Option<TransactionStatus>)>, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.get_nonce_occupancy(relayer_id, from_nonce, to_nonce)
+                    .await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.get_nonce_occupancy(relayer_id, from_nonce, to_nonce)
+                    .await
             }
         }
     }
@@ -321,6 +464,20 @@ impl TransactionRepository for TransactionRepositoryStorage {
         }
     }
 
+    async fn reconcile_stale_status_indexes(
+        &self,
+        relayer_id: &str,
+    ) -> Result<usize, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.reconcile_stale_status_indexes(relayer_id).await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.reconcile_stale_status_indexes(relayer_id).await
+            }
+        }
+    }
+
     async fn update_network_data(
         &self,
         tx_id: String,
@@ -344,6 +501,68 @@ impl TransactionRepository for TransactionRepositoryStorage {
         match self {
             TransactionRepositoryStorage::InMemory(repo) => repo.set_sent_at(tx_id, sent_at).await,
             TransactionRepositoryStorage::Redis(repo) => repo.set_sent_at(tx_id, sent_at).await,
+        }
+    }
+
+    async fn increment_status_check_failures(
+        &self,
+        tx_id: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.increment_status_check_failures(tx_id).await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.increment_status_check_failures(tx_id).await
+            }
+        }
+    }
+
+    async fn reset_status_check_consecutive_failures(
+        &self,
+        tx_id: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.reset_status_check_consecutive_failures(tx_id).await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.reset_status_check_consecutive_failures(tx_id).await
+            }
+        }
+    }
+
+    async fn record_stellar_insufficient_fee_retry(
+        &self,
+        tx_id: String,
+        sent_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.record_stellar_insufficient_fee_retry(tx_id, sent_at)
+                    .await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.record_stellar_insufficient_fee_retry(tx_id, sent_at)
+                    .await
+            }
+        }
+    }
+
+    async fn record_stellar_try_again_later_retry(
+        &self,
+        tx_id: String,
+        sent_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        match self {
+            TransactionRepositoryStorage::InMemory(repo) => {
+                repo.record_stellar_try_again_later_retry(tx_id, sent_at)
+                    .await
+            }
+            TransactionRepositoryStorage::Redis(repo) => {
+                repo.record_stellar_try_again_later_retry(tx_id, sent_at)
+                    .await
+            }
         }
     }
 
@@ -475,7 +694,7 @@ impl Repository<TransactionRepoModel, String> for TransactionRepositoryStorage {
 mod tests {
     use chrono::Utc;
     use color_eyre::Result;
-    use redis::Client;
+    use deadpool_redis::{Config, Runtime};
 
     use super::*;
     use crate::models::{
@@ -525,6 +744,7 @@ mod tests {
             noop_count: None,
             is_canceled: None,
             delete_at: None,
+            metadata: None,
         }
     }
 
@@ -555,21 +775,25 @@ mod tests {
     async fn test_connection_info_returns_some_for_redis() -> Result<()> {
         let redis_url = std::env::var("REDIS_TEST_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let client = Client::open(redis_url)?;
-        let connection_manager = ConnectionManager::new(client).await?;
-        let connection_manager = Arc::new(connection_manager);
+        let cfg = Config::from_url(&redis_url);
+        let pool = Arc::new(
+            cfg.builder()
+                .map_err(|e| eyre::eyre!("Failed to create Redis pool builder: {}", e))?
+                .max_size(16)
+                .runtime(Runtime::Tokio1)
+                .build()
+                .map_err(|e| eyre::eyre!("Failed to build Redis pool: {}", e))?,
+        );
+        let connections = Arc::new(RedisConnections::new_single_pool(pool.clone()));
         let key_prefix = "test_prefix".to_string();
 
-        let storage = TransactionRepositoryStorage::new_redis(
-            connection_manager.clone(),
-            key_prefix.clone(),
-        )?;
+        let storage = TransactionRepositoryStorage::new_redis(connections, key_prefix.clone())?;
 
         let (returned_connection, returned_prefix) = storage
             .connection_info()
             .expect("Expected Redis connection info");
 
-        assert!(Arc::ptr_eq(&connection_manager, &returned_connection));
+        assert!(Arc::ptr_eq(&pool, returned_connection.primary()));
         assert_eq!(returned_prefix, key_prefix);
 
         Ok(())
@@ -646,7 +870,7 @@ mod tests {
 
         // Add test transactions
         for i in 1..=5 {
-            let tx = create_test_transaction(&format!("tx-{}", i), "test-relayer");
+            let tx = create_test_transaction(&format!("tx-{i}"), "test-relayer");
             storage.create(tx).await?;
         }
 
@@ -808,7 +1032,7 @@ mod tests {
 
         // Add multiple transactions
         for i in 1..=5 {
-            let tx = create_test_transaction(&format!("tx-{}", i), "test-relayer");
+            let tx = create_test_transaction(&format!("tx-{i}"), "test-relayer");
             storage.create(tx).await?;
         }
 
@@ -1194,7 +1418,7 @@ mod tests {
 
         // Add many transactions for one relayer
         for i in 1..=10 {
-            let tx = create_test_transaction(&format!("tx-{}", i), "test-relayer");
+            let tx = create_test_transaction(&format!("tx-{i}"), "test-relayer");
             storage.create(tx).await?;
         }
 
@@ -1256,6 +1480,92 @@ mod tests {
             result.iter().map(|tx| tx.status.clone()).collect();
         assert!(found_statuses.contains(&TransactionStatus::Pending));
         assert!(found_statuses.contains(&TransactionStatus::Sent));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_stellar_try_again_later_retry_in_memory() -> Result<()> {
+        let storage = TransactionRepositoryStorage::new_in_memory();
+        let mut transaction = create_test_transaction("test-tx", "test-relayer");
+        transaction.status = TransactionStatus::Sent;
+        storage.create(transaction).await?;
+
+        let sent_at = "2025-03-18T10:00:00Z".to_string();
+        let updated = storage
+            .record_stellar_try_again_later_retry("test-tx".to_string(), sent_at.clone())
+            .await?;
+
+        assert_eq!(updated.id, "test-tx");
+        assert_eq!(updated.sent_at, Some(sent_at));
+        let meta = updated.metadata.expect("metadata should be set");
+        assert_eq!(meta.try_again_later_retries, 1);
+        assert_eq!(meta.consecutive_failures, 0);
+        assert_eq!(meta.total_failures, 0);
+        assert_eq!(meta.insufficient_fee_retries, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_stellar_try_again_later_retry_accumulates_in_memory() -> Result<()> {
+        let storage = TransactionRepositoryStorage::new_in_memory();
+        let mut transaction = create_test_transaction("test-tx", "test-relayer");
+        transaction.status = TransactionStatus::Sent;
+        storage.create(transaction).await?;
+
+        storage
+            .record_stellar_try_again_later_retry(
+                "test-tx".to_string(),
+                "2025-03-18T10:00:00Z".to_string(),
+            )
+            .await?;
+
+        let updated = storage
+            .record_stellar_try_again_later_retry(
+                "test-tx".to_string(),
+                "2025-03-18T10:01:00Z".to_string(),
+            )
+            .await?;
+
+        assert_eq!(updated.sent_at.as_deref(), Some("2025-03-18T10:01:00Z"));
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.try_again_later_retries, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_stellar_try_again_later_retry_noop_on_final_state_in_memory() -> Result<()>
+    {
+        let storage = TransactionRepositoryStorage::new_in_memory();
+        let mut transaction = create_test_transaction("test-tx", "test-relayer");
+        transaction.status = TransactionStatus::Confirmed;
+        transaction.sent_at = Some("old-time".to_string());
+        storage.create(transaction).await?;
+
+        let result = storage
+            .record_stellar_try_again_later_retry("test-tx".to_string(), "new-time".to_string())
+            .await?;
+
+        assert_eq!(result.sent_at.as_deref(), Some("old-time"));
+        assert!(result.metadata.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_record_stellar_try_again_later_retry_not_found_in_memory() -> Result<()> {
+        let storage = TransactionRepositoryStorage::new_in_memory();
+
+        let result = storage
+            .record_stellar_try_again_later_retry(
+                "nonexistent".to_string(),
+                "2025-03-18T10:00:00Z".to_string(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
 
         Ok(())
     }

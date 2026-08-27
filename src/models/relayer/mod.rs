@@ -314,6 +314,8 @@ pub struct RelayerEvmPolicy {
     pub eip1559_pricing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_transactions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_revert_data: Option<bool>,
 }
 
 /// Solana token swap configuration
@@ -653,6 +655,11 @@ impl RelayerStellarPolicy {
     /// Get swap configuration for this policy
     pub fn get_swap_config(&self) -> Option<RelayerStellarSwapConfig> {
         self.swap_config.clone()
+    }
+
+    /// Check if user fee payment strategy is enabled (gas abstraction requires this + STELLAR_FEE_FORWARDER_ADDRESS env var)
+    pub fn is_user_fee_payment(&self) -> bool {
+        self.fee_payment_strategy == Some(StellarFeePaymentStrategy::User)
     }
 }
 
@@ -1042,12 +1049,9 @@ impl Relayer {
 
         // Check if it's a contract address (StrKey format starting with 'C')
         if asset.starts_with('C') && asset.len() == 56 && !asset.contains(':') {
-            return Err(RelayerValidationError::InvalidPolicy(
-                "Contract addresses are not supported. Soroban will be supported soon.".into(),
-            ));
-            // // Basic validation - contract addresses are 56 characters starting with 'C'
-            // // Full validation would require StrKey decoding, but this catches most invalid formats
-            // return Ok(());
+            // Basic validation - contract addresses are 56 characters starting with 'C'
+            // Full validation would require StrKey decoding, but this catches most invalid formats
+            return Ok(());
         }
 
         // Check if it's a classic asset format "CODE:ISSUER"
@@ -1664,6 +1668,7 @@ mod tests {
     #[test]
     fn test_relayer_evm_policy_serialization() {
         let policy = RelayerEvmPolicy {
+            include_revert_data: None,
             min_balance: Some(1000000000000000000),
             gas_limit_estimation: Some(true),
             gas_price_cap: Some(50000000000),
@@ -2889,6 +2894,7 @@ mod tests {
             paused: false,
             network_type: RelayerNetworkType::Evm,
             policies: Some(RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+                include_revert_data: None,
                 min_balance: Some(1000000000000000000),
                 gas_limit_estimation: Some(true),
                 gas_price_cap: Some(50000000000),

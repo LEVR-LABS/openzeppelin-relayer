@@ -20,6 +20,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod config;
+pub use config::*;
+
+pub mod health;
+pub use health::*;
+
+pub mod protocol;
+pub use protocol::*;
+
+pub mod connection;
+pub use connection::*;
+
 pub mod runner;
 pub use runner::*;
 
@@ -29,8 +41,11 @@ pub use relayer_api::*;
 pub mod script_executor;
 pub use script_executor::*;
 
-pub mod socket;
-pub use socket::*;
+pub mod pool_executor;
+pub use pool_executor::*;
+
+pub mod shared_socket;
+pub use shared_socket::*;
 
 #[cfg(test)]
 use mockall::automock;
@@ -179,20 +194,20 @@ fn build_metadata(
     }
 }
 
-fn forward_logs_to_tracing(plugin_id: &str, logs: &[LogEntry], request_id: Option<String>) {
+fn forward_logs_to_tracing(plugin_id: &str, logs: &[LogEntry], request_id: &str) {
     for entry in logs {
         match entry.level {
             LogLevel::Error => {
-                tracing::error!(target: "plugin", plugin_id = %plugin_id, request_id = ?request_id, "{}", entry.message)
+                tracing::error!(target: "plugin", plugin_id = %plugin_id, request_id = %request_id, "{}", entry.message)
             }
             LogLevel::Warn => {
-                tracing::warn!(target: "plugin", plugin_id = %plugin_id, request_id = ?request_id, "{}", entry.message)
+                tracing::warn!(target: "plugin", plugin_id = %plugin_id, request_id = %request_id, "{}", entry.message)
             }
             LogLevel::Info | LogLevel::Log => {
-                tracing::info!(target: "plugin", plugin_id = %plugin_id, request_id = ?request_id, "{}", entry.message)
+                tracing::info!(target: "plugin", plugin_id = %plugin_id, request_id = %request_id, "{}", entry.message)
             }
             LogLevel::Debug => {
-                tracing::debug!(target: "plugin", plugin_id = %plugin_id, request_id = ?request_id, "{}", entry.message)
+                tracing::debug!(target: "plugin", plugin_id = %plugin_id, request_id = %request_id, "{}", entry.message)
             }
             LogLevel::Result => {}
         }
@@ -216,7 +231,7 @@ impl<R: PluginRunnerTrait> PluginService<R> {
         Self { runner }
     }
 
-    fn resolve_plugin_path(plugin_path: &str) -> String {
+    pub fn resolve_plugin_path(plugin_path: &str) -> String {
         if plugin_path.starts_with("plugins/") {
             plugin_path.to_string()
         } else {
@@ -262,7 +277,11 @@ impl<R: PluginRunnerTrait> PluginService<R> {
             .map(|q| serde_json::to_string(&q).unwrap_or_default());
 
         let request_id = get_request_id();
-        let request_id_for_logs = request_id.clone();
+        let request_id_for_logs: String = request_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let result = self
             .runner
             .run(
@@ -277,6 +296,7 @@ impl<R: PluginRunnerTrait> PluginService<R> {
                 config_json,
                 method,
                 query_json,
+                plugin.emit_traces,
                 state,
             )
             .await;
@@ -284,11 +304,7 @@ impl<R: PluginRunnerTrait> PluginService<R> {
         match result {
             Ok(script_result) => {
                 if plugin.forward_logs {
-                    forward_logs_to_tracing(
-                        &plugin.id,
-                        &script_result.logs,
-                        request_id_for_logs.clone(),
-                    );
+                    forward_logs_to_tracing(&plugin.id, &script_result.logs, &request_id_for_logs);
                 }
                 // Include logs/traces only if enabled via plugin config
                 let logs = if plugin.emit_logs {
@@ -317,7 +333,7 @@ impl<R: PluginRunnerTrait> PluginService<R> {
                 PluginError::HandlerError(payload) => {
                     if plugin.forward_logs {
                         if let Some(logs) = payload.logs.as_deref() {
-                            forward_logs_to_tracing(&plugin.id, logs, request_id_for_logs.clone());
+                            forward_logs_to_tracing(&plugin.id, logs, &request_id_for_logs);
                         }
                     }
                     let failure = payload.into_response(plugin.emit_logs, plugin.emit_traces);
@@ -343,6 +359,23 @@ impl<R: PluginRunnerTrait> PluginService<R> {
                     );
 
                     PluginCallResult::Handler(failure)
+                }
+                PluginError::ScriptTimeout(secs) => {
+                    let message = format!("Plugin execution timed out after {secs} seconds");
+                    tracing::warn!(
+                        timeout_secs = secs,
+                        plugin_id = %plugin.id,
+                        "Plugin execution timed out"
+                    );
+                    PluginCallResult::Handler(PluginHandlerResponse {
+                        status: 504,
+                        message,
+                        error: PluginHandlerError {
+                            code: Some("TIMEOUT".to_string()),
+                            details: None,
+                        },
+                        metadata: None,
+                    })
                 }
                 other => {
                     // This is an actual execution/infrastructure failure
@@ -461,7 +494,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Ok(ScriptResult {
                     logs: vec![LogEntry {
                         level: LogLevel::Log,
@@ -767,7 +800,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(move |_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(move |_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Err(PluginError::HandlerError(Box::new(PluginHandlerPayload {
                     status: 400,
                     message: "Plugin handler error".to_string(),
@@ -829,7 +862,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Err(PluginError::PluginExecutionError("Fatal error".to_string()))
             });
 
@@ -876,7 +909,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Ok(ScriptResult {
                     logs: vec![LogEntry {
                         level: LogLevel::Log,
@@ -973,7 +1006,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Ok(ScriptResult {
                     logs: vec![
                         LogEntry {
@@ -1033,6 +1066,32 @@ mod tests {
         assert!(captured.contains("plugin_id=test-plugin-levels"));
         assert!(captured.contains("ERROR"));
         assert!(captured.contains("WARN"));
+        let request_id_values: Vec<&str> = captured
+            .match_indices("request_id=")
+            .filter_map(|(idx, _)| {
+                let tail = &captured[idx + "request_id=".len()..];
+                tail.split_whitespace()
+                    .next()
+                    .map(|value| value.trim_matches(|c: char| c == ',' || c == '"' || c == '}'))
+            })
+            .collect();
+        assert!(
+            !request_id_values.is_empty(),
+            "expected forwarded plugin logs to include request_id field, captured: {}",
+            captured
+        );
+        assert!(
+            request_id_values.iter().all(|value| !value.is_empty()),
+            "expected non-empty request_id values, captured: {}",
+            captured
+        );
+        assert!(
+            request_id_values
+                .iter()
+                .all(|value| uuid::Uuid::parse_str(value).is_ok()),
+            "expected request_id fallback to be UUID when no span request id is set, captured: {}",
+            captured
+        );
     }
 
     #[tokio::test]
@@ -1059,7 +1118,7 @@ mod tests {
         let mut plugin_runner = MockPluginRunnerTrait::default();
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Ok(ScriptResult {
                     logs: vec![LogEntry {
                         level: LogLevel::Warn,
@@ -1087,9 +1146,11 @@ mod tests {
             .await;
 
         let captured = logs_buffer.lock().unwrap().join("\n");
+        // When forward_logs is disabled, plugin log messages should not appear in tracing output
+        // (internal framework logs like "Calling plugin" may still appear)
         assert!(
-            captured.is_empty(),
-            "logs should not be forwarded when disabled"
+            !captured.contains("should-not-emit"),
+            "plugin logs should not be forwarded when disabled, but found: {captured}"
         );
     }
 
@@ -1117,7 +1178,7 @@ mod tests {
         let mut plugin_runner = MockPluginRunnerTrait::default();
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Err(PluginError::HandlerError(Box::new(PluginHandlerPayload {
                     status: 400,
                     message: "handler failed".to_string(),
@@ -1172,7 +1233,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(|_, _, _, _, _, _, _, _, _, _, _, _| {
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
                 Ok(ScriptResult {
                     logs: vec![],
                     error: "".to_string(),
@@ -1233,7 +1294,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(move |_, _, _, _, _, _, headers_json, _, _, _, _, _| {
+            .returning(move |_, _, _, _, _, _, headers_json, _, _, _, _, _, _| {
                 // Capture the headers_json parameter
                 *captured_headers_clone.lock().unwrap() = headers_json;
                 Ok(ScriptResult {
@@ -1316,7 +1377,7 @@ mod tests {
 
         plugin_runner
             .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
-            .returning(move |_, _, _, _, _, _, headers_json, _, _, _, _, _| {
+            .returning(move |_, _, _, _, _, _, headers_json, _, _, _, _, _, _| {
                 *captured_headers_clone.lock().unwrap() = headers_json;
                 Ok(ScriptResult {
                     logs: vec![],
@@ -1347,5 +1408,59 @@ mod tests {
             captured.is_none(),
             "headers_json should be None when no headers provided"
         );
+    }
+
+    #[tokio::test]
+    async fn test_call_plugin_script_timeout_returns_504() {
+        let plugin = PluginModel {
+            id: "test-plugin".to_string(),
+            path: "test-path".to_string(),
+            timeout: Duration::from_secs(3),
+            emit_logs: false,
+            emit_traces: false,
+            raw_response: false,
+            allow_get_invocation: false,
+            config: None,
+            forward_logs: false,
+        };
+        let app_state =
+            create_mock_app_state(None, None, None, None, Some(vec![plugin.clone()]), None).await;
+
+        let mut plugin_runner = MockPluginRunnerTrait::default();
+
+        plugin_runner
+            .expect_run::<MockJobProducerTrait, RelayerRepositoryStorage, TransactionRepositoryStorage, NetworkRepositoryStorage, NotificationRepositoryStorage, SignerRepositoryStorage, TransactionCounterRepositoryStorage, PluginRepositoryStorage, ApiKeyRepositoryStorage>()
+            .returning(|_, _, _, _, _, _, _, _, _, _, _, _, _| {
+                Err(PluginError::ScriptTimeout(3))
+            });
+
+        let plugin_service = PluginService::<MockPluginRunnerTrait>::new(plugin_runner);
+        let outcome = plugin_service
+            .call_plugin(
+                plugin,
+                PluginCallRequest {
+                    params: serde_json::Value::Null,
+                    headers: None,
+                    route: None,
+                    method: Some("POST".to_string()),
+                    query: None,
+                },
+                Arc::new(web::ThinData(app_state)),
+            )
+            .await;
+
+        match outcome {
+            PluginCallResult::Handler(response) => {
+                assert_eq!(response.status, 504);
+                assert_eq!(
+                    response.message,
+                    "Plugin execution timed out after 3 seconds"
+                );
+                assert_eq!(response.error.code, Some("TIMEOUT".to_string()));
+                assert!(response.error.details.is_none());
+                assert!(response.metadata.is_none());
+            }
+            _ => panic!("Expected Handler result with 504 status for ScriptTimeout"),
+        }
     }
 }

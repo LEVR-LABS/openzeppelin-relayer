@@ -6,6 +6,7 @@
 pub mod common;
 pub mod fee_bump;
 pub mod operations;
+pub mod soroban_gas_abstraction;
 pub mod unsigned_xdr;
 
 use eyre::Result;
@@ -20,7 +21,10 @@ use crate::{
         TransactionUpdateRequest,
     },
     repositories::{Repository, TransactionCounterTrait, TransactionRepository},
-    services::{provider::StellarProviderTrait, signer::Signer},
+    services::{
+        provider::StellarProviderTrait,
+        signer::{Signer, StellarSignTrait},
+    },
 };
 
 use common::{sign_and_finalize_transaction, update_and_notify_transaction};
@@ -30,7 +34,7 @@ where
     R: Repository<RelayerRepoModel, String> + Send + Sync,
     T: TransactionRepository + Send + Sync,
     J: JobProducerTrait + Send + Sync,
-    S: Signer + Send + Sync,
+    S: Signer + StellarSignTrait + Send + Sync,
     P: StellarProviderTrait + Send + Sync,
     C: TransactionCounterTrait + Send + Sync,
     D: crate::services::stellar_dex::StellarDexServiceTrait + Send + Sync + 'static,
@@ -40,7 +44,12 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!(status = ?tx.status, "preparing stellar transaction");
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            status = ?tx.status,
+            "preparing stellar transaction"
+        );
 
         // Defensive check: if transaction is in a final state or unexpected state, don't retry
         if is_final_state(&tx.status) {
@@ -64,17 +73,30 @@ where
 
         if !self.concurrent_transactions_enabled() && !lane_gate::claim(&self.relayer().id, &tx.id)
         {
-            info!("relayer already has a transaction in flight, must wait");
+            info!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                "relayer already has a transaction in flight, must wait"
+            );
             return Ok(tx);
         }
 
-        debug!("preparing transaction {}", tx.id);
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            "preparing transaction"
+        );
 
         // Call core preparation logic with error handling
         match self.prepare_core(tx.clone()).await {
             Ok(prepared_tx) => Ok(prepared_tx),
             Err(error) => {
                 // Always cleanup on failure - this is the critical safety mechanism
+                warn!(
+                    tx_id = %tx.id,
+                    error = %error,
+                    "preparation error caught, calling handle_prepare_failure"
+                );
                 self.handle_prepare_failure(tx, error).await
             }
         }
@@ -91,7 +113,11 @@ where
         let policy = self.relayer().policies.get_stellar_policy();
         match &stellar_data.transaction_input {
             TransactionInput::Operations(_) => {
-                debug!("preparing operations-based transaction {}", tx.id);
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    "preparing operations-based transaction"
+                );
                 let stellar_data_with_sim = operations::process_operations(
                     self.transaction_counter_service(),
                     &self.relayer().id,
@@ -107,7 +133,11 @@ where
                     .await
             }
             TransactionInput::UnsignedXdr(_) => {
-                debug!("preparing unsigned xdr transaction {}", tx.id);
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    "preparing unsigned xdr transaction"
+                );
                 let stellar_data_with_sim = unsigned_xdr::process_unsigned_xdr(
                     self.transaction_counter_service(),
                     &self.relayer().id,
@@ -123,7 +153,7 @@ where
                     .await
             }
             TransactionInput::SignedXdr { .. } => {
-                debug!("preparing fee-bump transaction {}", tx.id);
+                debug!(tx_id = %tx.id, "preparing fee-bump transaction");
                 let stellar_data_with_fee_bump = fee_bump::process_fee_bump(
                     &self.relayer().address,
                     stellar_data,
@@ -141,6 +171,22 @@ where
                     self.relayer().notification_id.as_deref(),
                 )
                 .await
+            }
+            TransactionInput::SorobanGasAbstraction { .. } => {
+                debug!(tx_id = %tx.id, "preparing soroban gas abstraction transaction");
+                let stellar_data_with_auth =
+                    soroban_gas_abstraction::process_soroban_gas_abstraction(
+                        self.transaction_counter_service(),
+                        &self.relayer().id,
+                        &self.relayer().address,
+                        self.provider(),
+                        stellar_data,
+                        Some(&policy),
+                        self.dex_service(),
+                    )
+                    .await?;
+                self.finalize_with_signature(tx, stellar_data_with_auth)
+                    .await
             }
         }
     }
@@ -176,17 +222,25 @@ where
 
         // Step 1: Sync sequence from chain to recover from any potential sequence drift
         if let Ok(stellar_data) = tx.network_data.get_stellar_transaction_data() {
-            info!("syncing sequence from chain after failed transaction preparation");
+            info!(
+                tx_id = %tx_id,
+                source_account = %stellar_data.source_account,
+                "syncing sequence from chain after failed transaction preparation"
+            );
             // Always sync from chain on preparation failure to ensure correct sequence state
             match self
                 .sync_sequence_from_chain(&stellar_data.source_account)
                 .await
             {
                 Ok(()) => {
-                    info!("successfully synced sequence from chain");
+                    info!(tx_id = %tx_id, "successfully synced sequence from chain");
                 }
                 Err(sync_error) => {
-                    warn!(error = %sync_error, "failed to sync sequence from chain");
+                    warn!(
+                        tx_id = %tx_id,
+                        error = %sync_error,
+                        "failed to sync sequence from chain (non-fatal, transaction already marked as failed)"
+                    );
                 }
             }
         }
@@ -426,8 +480,8 @@ mod prepare_transaction_tests {
 
         mocks
             .counter
-            .expect_set()
-            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+            .expect_sync_floor()
+            .returning(|_, _, floor| Box::pin(ready(Ok(floor))));
 
         // Mock finalize_transaction_state for failure handling
         mocks
@@ -523,8 +577,8 @@ mod prepare_transaction_tests {
 
         mocks
             .counter
-            .expect_set()
-            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+            .expect_sync_floor()
+            .returning(|_, _, floor| Box::pin(ready(Ok(floor))));
 
         // signer fails
         mocks.signer.expect_sign_transaction().returning(|_| {
@@ -579,6 +633,116 @@ mod prepare_transaction_tests {
         let another_tx_id = "another-tx";
         assert!(lane_gate::claim(&relayer.id, another_tx_id));
         lane_gate::free(&relayer.id, another_tx_id); // cleanup
+    }
+
+    /// A prepare failure after the counter increment heals the drift at the origin: the
+    /// failing tx never persisted a sequence, so handle_prepare_failure's chain sync
+    /// rewinds the counter over the freshly burned sequence before any TxBadSeq occurs.
+    #[tokio::test]
+    async fn prepare_failure_rewinds_freshly_burned_sequence() {
+        let relayer = create_test_relayer();
+        let mut mocks = default_test_mocks();
+
+        // Allocation burns 149 and leaves the counter at 150
+        mocks
+            .counter
+            .expect_get_and_increment()
+            .returning(|_, _| Box::pin(ready(Ok(149))));
+
+        // Signer fails after the increment — the sequence is never persisted
+        mocks.signer.expect_sign_transaction().returning(|_| {
+            Box::pin(async {
+                Err(crate::models::SignerError::SigningError(
+                    "Signer failure".to_string(),
+                ))
+            })
+        });
+
+        // Chain sync in handle_prepare_failure: chain seq 100 → floor 101
+        mocks.provider.expect_get_account().returning(|_| {
+            Box::pin(async {
+                use soroban_rs::xdr::{
+                    AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, String32,
+                    Thresholds, Uint256,
+                };
+                use stellar_strkey::ed25519;
+
+                let pk = ed25519::PublicKey::from_string(TEST_PK).unwrap();
+                let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(pk.0)));
+
+                Ok(AccountEntry {
+                    account_id,
+                    balance: 1000000,
+                    seq_num: SequenceNumber(100),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32::default(),
+                    thresholds: Thresholds([1, 1, 1, 1]),
+                    signers: Default::default(),
+                    ext: AccountEntryExt::V0,
+                })
+            })
+        });
+
+        // Counter sits at 150, above the chain floor
+        mocks
+            .counter
+            .expect_sync_floor()
+            .returning(|_, _, _| Box::pin(ready(Ok(150))));
+
+        // No active tx holds a sequence (the failing tx never persisted one)
+        mocks
+            .tx_repo
+            .expect_find_by_status()
+            .times(1)
+            .returning(|_, _| Ok(vec![]));
+
+        // The burned head is rewound 150 → 101 before any TxBadSeq thrash starts
+        mocks
+            .counter
+            .expect_set_if_equals()
+            .withf(|relayer_id, addr, expected, value| {
+                relayer_id == "relayer-1" && addr == TEST_PK && *expected == 150 && *value == 101
+            })
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(ready(Ok(true))));
+
+        // Failure handling marks the tx Failed and notifies
+        mocks
+            .tx_repo
+            .expect_partial_update()
+            .withf(|_, upd| upd.status == Some(TransactionStatus::Failed))
+            .returning(|id, upd| {
+                let mut tx = create_test_transaction("relayer-1");
+                tx.id = id;
+                tx.status = upd.status.unwrap();
+                Ok::<_, RepositoryError>(tx)
+            });
+
+        mocks
+            .job_producer
+            .expect_produce_send_notification_job()
+            .times(1)
+            .returning(|_, _| Box::pin(async { Ok(()) }));
+
+        mocks
+            .tx_repo
+            .expect_find_by_status_paginated()
+            .returning(move |_, _, _, _| {
+                Ok(PaginatedResult {
+                    items: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 1,
+                })
+            });
+
+        let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+        let tx = create_test_transaction(&relayer.id);
+
+        let result = handler.prepare_transaction_impl(tx.clone()).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -649,10 +813,10 @@ mod prepare_transaction_tests {
 
         mocks
             .counter
-            .expect_set()
+            .expect_sync_floor()
             .times(1)
-            .withf(|_, _, seq| *seq == 42) // Next usable = 41 + 1
-            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+            .withf(|_, _, floor| *floor == 42) // Next usable = 41 + 1
+            .returning(|_, _, floor| Box::pin(ready(Ok(floor))));
 
         // Mock signer to fail after sequence is incremented
         mocks
@@ -755,9 +919,9 @@ mod prepare_transaction_tests {
 
         mocks
             .counter
-            .expect_set()
+            .expect_sync_floor()
             .times(1)
-            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+            .returning(|_, _, floor| Box::pin(ready(Ok(floor))));
 
         // Mock provider to fail simulation for Soroban operations
         mocks
@@ -862,9 +1026,9 @@ mod prepare_transaction_tests {
 
         mocks
             .counter
-            .expect_set()
+            .expect_sync_floor()
             .times(1)
-            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+            .returning(|_, _, floor| Box::pin(ready(Ok(floor))));
 
         // Mock transaction update for failure
         mocks
@@ -1039,8 +1203,8 @@ mod refactoring_tests {
 
         mocks
             .counter
-            .expect_set()
-            .returning(|_, _, _| Box::pin(ready(Ok(()))));
+            .expect_sync_floor()
+            .returning(|_, _, floor| Box::pin(ready(Ok(floor))));
 
         // Mock finalize_transaction_state for failure
         mocks.tx_repo.expect_partial_update().returning(|id, upd| {

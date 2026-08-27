@@ -9,13 +9,15 @@ use eyre::Result;
 use soroban_rs::stellar_rpc_client::Client;
 use soroban_rs::stellar_rpc_client::{
     Error as StellarClientError, EventStart, EventType, GetEventsResponse, GetLatestLedgerResponse,
-    GetLedgerEntriesResponse, GetNetworkResponse, GetTransactionResponse, GetTransactionsRequest,
-    GetTransactionsResponse, SimulateTransactionResponse,
+    GetLedgerEntriesResponse, GetNetworkResponse, GetTransactionResponse,
+    GetTransactionResponseRaw, GetTransactionsRequest, GetTransactionsResponse,
+    SendTransactionResponse, SimulateTransactionResponse,
 };
 use soroban_rs::xdr::{
     AccountEntry, ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
     LedgerKey, Limits, MuxedAccount, Operation, OperationBody, ReadXdr, ScAddress, ScSymbol, ScVal,
     SequenceNumber, Transaction, TransactionEnvelope, TransactionV1Envelope, Uint256, VecM,
+    WriteXdr,
 };
 #[cfg(test)]
 use soroban_rs::xdr::{AccountId, LedgerKeyAccount, PublicKey};
@@ -25,14 +27,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use mockall::automock;
 
-use crate::constants::{
-    DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS,
-    DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
-    DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
-    DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS, DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST,
-    DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS,
-};
+use once_cell::sync::Lazy;
+
 use crate::models::{JsonRpcId, RpcConfig};
+use crate::services::client_cache::SyncClientCache;
 use crate::services::provider::is_retriable_error;
 use crate::services::provider::retry::retry_rpc_call;
 use crate::services::provider::rpc_selector::RpcSelector;
@@ -41,7 +39,7 @@ use crate::services::provider::RetryConfig;
 use crate::services::provider::{ProviderConfig, ProviderError};
 // Reqwest client is used for raw JSON-RPC HTTP requests. Alias to avoid name clash with the
 // soroban `Client` type imported above.
-use crate::utils::{create_secure_redirect_policy, validate_safe_url};
+use crate::utils::validate_safe_url;
 use reqwest::Client as ReqwestClient;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +56,11 @@ fn generate_unique_rpc_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
+
+/// Cache for soroban_rs Stellar RPC clients, keyed by URL.
+/// Avoids recreating jsonrpsee HTTP clients on every retry attempt.
+static STELLAR_RPC_CLIENT_CACHE: Lazy<SyncClientCache<String, Client>> =
+    Lazy::new(SyncClientCache::new);
 
 /// Categorizes a Stellar client error into an appropriate `ProviderError` variant.
 ///
@@ -299,6 +302,26 @@ pub trait StellarProviderTrait: Send + Sync {
         &self,
         tx_envelope: &TransactionEnvelope,
     ) -> Result<Hash, ProviderError>;
+    /// Sends a transaction and returns the full response including the status field.
+    ///
+    /// # Why this method exists
+    ///
+    /// The `stellar-rpc-client` crate's `send_transaction` method only returns
+    /// `Result<Hash, Error>` and discards the status field for non-ERROR responses.
+    /// This means TRY_AGAIN_LATER is silently treated as success, which is problematic
+    /// for relayers that need to track transaction states precisely.
+    ///
+    /// This method calls the `sendTransaction` RPC directly to get the full
+    /// `SendTransactionResponse` including the status field:
+    /// - "PENDING": Transaction accepted for processing
+    /// - "DUPLICATE": Transaction already submitted
+    /// - "TRY_AGAIN_LATER": Transaction NOT queued (e.g., another tx from same account
+    ///   in mempool, fee too low and resubmitted too soon, or resource limits exceeded)
+    /// - "ERROR": Transaction validation failed
+    async fn send_transaction_with_status(
+        &self,
+        tx_envelope: &TransactionEnvelope,
+    ) -> Result<SendTransactionResponse, ProviderError>;
     async fn get_transaction(&self, tx_id: &Hash) -> Result<GetTransactionResponse, ProviderError>;
     async fn get_transactions(
         &self,
@@ -386,48 +409,35 @@ impl StellarProvider {
         self.selector.get_configs()
     }
 
-    /// Initialize a Stellar client for a given URL
-    fn initialize_provider(&self, url: &str) -> Result<Client, ProviderError> {
-        // Layer 2 validation: Re-validate URL security as a safety net
+    /// Get or create a cached Stellar RPC client for a given URL.
+    /// Reuses clients across retry attempts and provider instances.
+    fn initialize_provider(&self, url: &str) -> Result<Arc<Client>, ProviderError> {
         let allowed_hosts = crate::config::ServerConfig::get_rpc_allowed_hosts();
         let block_private_ips = crate::config::ServerConfig::get_rpc_block_private_ips();
         validate_safe_url(url, &allowed_hosts, block_private_ips).map_err(|e| {
             ProviderError::NetworkConfiguration(format!("RPC URL security validation failed: {e}"))
         })?;
 
-        Client::new(url).map_err(|e| {
-            ProviderError::NetworkConfiguration(format!(
-                "Failed to create Stellar RPC client: {e} - URL: '{url}'"
-            ))
+        STELLAR_RPC_CLIENT_CACHE.get_or_try_init(url.to_string(), || {
+            Client::new(url).map_err(|e| {
+                let safe_url = crate::utils::mask_url(url);
+                ProviderError::NetworkConfiguration(format!(
+                    "Failed to create Stellar RPC client: {e} - URL: '{safe_url}'"
+                ))
+            })
         })
     }
 
-    /// Initialize a reqwest client for raw HTTP JSON-RPC calls.
-    ///
-    /// This centralizes client creation so we can configure timeouts and other options in one place.
+    /// Get the shared reqwest client for raw HTTP JSON-RPC calls, after
+    /// validating the URL as an SSRF safety net.
     fn initialize_raw_provider(&self, url: &str) -> Result<ReqwestClient, ProviderError> {
-        ReqwestClient::builder()
-            .timeout(self.timeout_seconds)
-            .connect_timeout(Duration::from_secs(DEFAULT_HTTP_CLIENT_CONNECT_TIMEOUT_SECONDS))
-            .pool_max_idle_per_host(DEFAULT_HTTP_CLIENT_POOL_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(DEFAULT_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECONDS))
-            .tcp_keepalive(Duration::from_secs(DEFAULT_HTTP_CLIENT_TCP_KEEPALIVE_SECONDS))
-            .http2_keep_alive_interval(Some(Duration::from_secs(
-                DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS,
-            )))
-            .http2_keep_alive_timeout(Duration::from_secs(
-                DEFAULT_HTTP_CLIENT_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS,
-            ))
-            .use_rustls_tls()
-            // Allow only HTTP→HTTPS redirects on same host to handle legitimate protocol upgrades
-            // while preventing SSRF via redirect chains to different hosts
-            .redirect(create_secure_redirect_policy())
-            .build()
-            .map_err(|e| {
-                ProviderError::NetworkConfiguration(format!(
-                    "Failed to create HTTP client for raw RPC: {e} - URL: '{url}'"
-                ))
-            })
+        let allowed_hosts = crate::config::ServerConfig::get_rpc_allowed_hosts();
+        let block_private_ips = crate::config::ServerConfig::get_rpc_block_private_ips();
+        validate_safe_url(url, &allowed_hosts, block_private_ips).map_err(|e| {
+            ProviderError::NetworkConfiguration(format!("RPC URL security validation failed: {e}"))
+        })?;
+
+        super::get_shared_rpc_http_client()
     }
 
     /// Helper method to retry RPC calls with exponential backoff
@@ -437,7 +447,7 @@ impl StellarProvider {
         operation: F,
     ) -> Result<T, ProviderError>
     where
-        F: Fn(Client) -> Fut,
+        F: Fn(Arc<Client>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ProviderError>>,
     {
         let provider_url_raw = match self.selector.get_current_url() {
@@ -515,8 +525,27 @@ impl StellarProvider {
                         .await
                         .map_err(ProviderError::from)?;
 
+                    // Surface HTTP-level errors (429/5xx/...) with their status code so
+                    // `is_retriable_error` and `should_mark_provider_failed` classify them,
+                    // instead of losing the status as a JSON decode error on non-JSON bodies.
+                    // Read the body on failure so the provider's own error detail is
+                    // preserved for diagnosis rather than dropped by `error_for_status`.
+                    let status = response.status();
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(http_status_error_to_provider_error(status, body));
+                    }
+
                     let json_response: serde_json::Value =
                         response.json().await.map_err(ProviderError::from)?;
+
+                    // Map JSON-RPC error objects inside the retried operation so
+                    // retriable codes (e.g. -32005 rate limited) can retry/fail over.
+                    // Some non-strict providers send `"error": null` on success, so
+                    // skip null to avoid misclassifying a valid response as an error.
+                    if let Some(error) = json_response.get("error").filter(|e| !e.is_null()) {
+                        return Err(json_rpc_error_to_provider_error(error));
+                    }
 
                     Ok(json_response)
                 }
@@ -525,6 +554,81 @@ impl StellarProvider {
         )
         .await
     }
+
+    /// Executes a JSON-RPC request over the raw reqwest HTTP path and returns the
+    /// `result` field. HTTP status and JSON-RPC error objects are mapped to
+    /// `ProviderError` inside `retry_raw_request`, where they participate in
+    /// retry/failover.
+    ///
+    /// Unlike the `stellar-rpc-client` (jsonrpsee) client, the raw reqwest path
+    /// negotiates zstd response compression (`Accept-Encoding: zstd`), which
+    /// providers like QuickNode honor — significantly shrinking large responses.
+    async fn raw_json_rpc_request(
+        &self,
+        operation_name: &str,
+        method: &str,
+        params: serde_json::Value,
+        id: Option<JsonRpcId>,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let id_value = match id {
+            Some(id) => serde_json::to_value(id)
+                .map_err(|e| ProviderError::Other(format!("Failed to serialize id: {e}")))?,
+            None => serde_json::json!(generate_unique_rpc_id()),
+        };
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id_value,
+            "method": method,
+            "params": params,
+        });
+
+        let response = self.retry_raw_request(operation_name, request).await?;
+
+        // Extract result
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| ProviderError::Other("No result field in JSON-RPC response".to_string()))
+    }
+}
+
+/// Maps a non-success HTTP status and its response body to a `ProviderError`,
+/// keeping the status-based classification used by `is_retriable_error` and
+/// `should_mark_provider_failed` while preserving the provider's body text for
+/// diagnosis. The body is decompressed transparently when zstd-encoded.
+fn http_status_error_to_provider_error(status: reqwest::StatusCode, body: String) -> ProviderError {
+    match status.as_u16() {
+        429 => ProviderError::RateLimited,
+        502 => ProviderError::BadGateway,
+        code => {
+            let detail = if body.trim().is_empty() {
+                status.to_string()
+            } else {
+                body
+            };
+            ProviderError::RequestError {
+                error: detail,
+                status_code: code,
+            }
+        }
+    }
+}
+
+/// Maps a JSON-RPC `error` object to a `ProviderError`, preserving the error
+/// code so `is_retriable_error` can classify it.
+fn json_rpc_error_to_provider_error(error: &serde_json::Value) -> ProviderError {
+    if let Some(code) = error.get("code").and_then(|c| c.as_i64()) {
+        return ProviderError::RpcErrorCode {
+            code,
+            message: error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error")
+                .to_string(),
+        };
+    }
+    ProviderError::Other(format!("JSON-RPC error: {error}"))
 }
 
 #[async_trait]
@@ -629,18 +733,51 @@ impl StellarProviderTrait for StellarProvider {
         .await
     }
 
-    async fn get_transaction(&self, tx_id: &Hash) -> Result<GetTransactionResponse, ProviderError> {
-        let tx_id = Arc::new(tx_id.clone());
+    async fn send_transaction_with_status(
+        &self,
+        tx_envelope: &TransactionEnvelope,
+    ) -> Result<SendTransactionResponse, ProviderError> {
+        // Encode the transaction envelope to XDR base64
+        let tx_xdr = tx_envelope
+            .to_xdr_base64(Limits::none())
+            .map_err(|e| ProviderError::Other(format!("Failed to encode transaction XDR: {e}")))?;
 
-        self.retry_rpc_call("get_transaction", move |client| {
-            let tx_id = Arc::clone(&tx_id);
-            async move {
-                client.get_transaction(&tx_id).await.map_err(|e| {
-                    categorize_stellar_error_with_context(e, Some("Failed to get transaction"))
-                })
-            }
+        // Call sendTransaction RPC method directly to get the full response
+        let params = serde_json::json!({
+            "transaction": tx_xdr
+        });
+
+        let result = self
+            .raw_request_dyn("sendTransaction", params, None)
+            .await?;
+
+        // Deserialize the response
+        serde_json::from_value(result).map_err(|e| {
+            ProviderError::Other(format!(
+                "Failed to deserialize SendTransactionResponse: {e}"
+            ))
         })
-        .await
+    }
+
+    /// Fetches a transaction via the raw reqwest path rather than the
+    /// `stellar-rpc-client` (jsonrpsee) client: `getTransaction` responses carry
+    /// envelope/result/meta XDR that can reach hundreds of KB for Soroban
+    /// transactions, and jsonrpsee cannot decompress responses; the raw path
+    /// negotiates zstd compression.
+    async fn get_transaction(&self, tx_id: &Hash) -> Result<GetTransactionResponse, ProviderError> {
+        let params = serde_json::json!({ "hash": tx_id });
+
+        let result = self
+            .raw_json_rpc_request("get_transaction", "getTransaction", params, None)
+            .await?;
+
+        let raw: GetTransactionResponseRaw = serde_json::from_value(result).map_err(|e| {
+            ProviderError::Other(format!("Failed to deserialize GetTransactionResponse: {e}"))
+        })?;
+
+        raw.try_into().map_err(|e: soroban_rs::xdr::Error| {
+            ProviderError::Other(format!("Failed to decode getTransaction XDR: {e}"))
+        })
     }
 
     async fn get_transactions(
@@ -712,41 +849,8 @@ impl StellarProviderTrait for StellarProvider {
         params: serde_json::Value,
         id: Option<JsonRpcId>,
     ) -> Result<serde_json::Value, ProviderError> {
-        let id_value = match id {
-            Some(id) => serde_json::to_value(id)
-                .map_err(|e| ProviderError::Other(format!("Failed to serialize id: {e}")))?,
-            None => serde_json::json!(generate_unique_rpc_id()),
-        };
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id_value,
-            "method": method,
-            "params": params,
-        });
-
-        let response = self.retry_raw_request("raw_request_dyn", request).await?;
-
-        // Check for JSON-RPC error
-        if let Some(error) = response.get("error") {
-            if let Some(code) = error.get("code").and_then(|c| c.as_i64()) {
-                return Err(ProviderError::RpcErrorCode {
-                    code,
-                    message: error
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error")
-                        .to_string(),
-                });
-            }
-            return Err(ProviderError::Other(format!("JSON-RPC error: {error}")));
-        }
-
-        // Extract result
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| ProviderError::Other("No result field in JSON-RPC response".to_string()))
+        self.raw_json_rpc_request("raw_request_dyn", method, params, id)
+            .await
     }
 
     async fn call_contract(
@@ -1341,8 +1445,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to get account"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1358,8 +1461,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to simulate transaction"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1375,8 +1477,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to send transaction (polling)"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1391,8 +1492,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to get network"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1407,8 +1507,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to get latest ledger"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1424,8 +1523,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to send transaction"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1437,12 +1535,17 @@ mod stellar_rpc_tests {
             let hash: Hash = dummy_hash();
             let result = provider.get_transaction(&hash).await;
             assert!(result.is_err());
-            let err_str = result.unwrap_err().to_string();
-            // Should contain the "Failed to..." context message
+            // get_transaction uses the raw reqwest path, so connection failures
+            // surface as transport-level provider errors.
+            let err = result.unwrap_err();
             assert!(
-                err_str.contains("Failed to get transaction"),
-                "Unexpected error message: {}",
-                err_str
+                matches!(
+                    err,
+                    ProviderError::Other(_)
+                        | ProviderError::Timeout
+                        | ProviderError::NetworkConfiguration(_)
+                ),
+                "Unexpected error: {err}"
             );
         }
 
@@ -1461,8 +1564,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to get transactions"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1478,8 +1580,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to get ledger entries"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
 
@@ -1500,8 +1601,7 @@ mod stellar_rpc_tests {
             // Should contain the "Failed to..." context message
             assert!(
                 err_str.contains("Failed to get events"),
-                "Unexpected error message: {}",
-                err_str
+                "Unexpected error message: {err_str}"
             );
         }
     }
@@ -1907,6 +2007,213 @@ mod stellar_rpc_tests {
 
         // Should fail due to connection, but should handle the request properly
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_transaction_zstd_compressed_response() {
+        let _env_guard = setup_test_env();
+
+        let mut mock_server = mockito::Server::new_async().await;
+
+        let response_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "status": "NOT_FOUND",
+            }
+        });
+        let compressed = zstd::encode_all(response_body.to_string().as_bytes(), 3).unwrap();
+
+        let mock = mock_server
+            .mock("POST", "/")
+            // The raw reqwest path must advertise zstd support...
+            .match_header(
+                "accept-encoding",
+                mockito::Matcher::Regex("zstd".to_string()),
+            )
+            // ...and serialize the tx hash as a hex string.
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getTransaction",
+                "params": { "hash": "0".repeat(64) },
+            })))
+            .with_header("content-encoding", "zstd")
+            .with_body(compressed)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let response = provider.get_transaction(&dummy_hash()).await.unwrap();
+        assert_eq!(response.status, "NOT_FOUND");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_http_429_is_classified_and_retried() {
+        let _env_guard = setup_test_env();
+        // Two attempts on the same provider so the retry classification is observable.
+        std::env::set_var("PROVIDER_MAX_RETRIES", "2");
+
+        let mut mock_server = mockito::Server::new_async().await;
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_status(429)
+            .with_body("rate limited, non-JSON body")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let err = provider.get_transaction(&dummy_hash()).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::RateLimited),
+            "Unexpected error: {err}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_retriable_json_rpc_error_is_retried() {
+        let _env_guard = setup_test_env();
+        std::env::set_var("PROVIDER_MAX_RETRIES", "2");
+
+        let mut mock_server = mockito::Server::new_async().await;
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32005, "message": "limit exceeded" }
+                })
+                .to_string(),
+            )
+            .expect(2)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let err = provider.get_transaction(&dummy_hash()).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::RpcErrorCode { code: -32005, .. }),
+            "Unexpected error: {err}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_non_retriable_json_rpc_error_fails_fast() {
+        let _env_guard = setup_test_env();
+        std::env::set_var("PROVIDER_MAX_RETRIES", "2");
+
+        let mut mock_server = mockito::Server::new_async().await;
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32601, "message": "method not found" }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let err = provider.get_transaction(&dummy_hash()).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::RpcErrorCode { code: -32601, .. }),
+            "Unexpected error: {err}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_null_error_field_is_treated_as_success() {
+        let _env_guard = setup_test_env();
+
+        let mut mock_server = mockito::Server::new_async().await;
+        // Non-strict providers may include `"error": null` on a successful response.
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": null,
+                    "result": { "status": "NOT_FOUND" }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let response = provider.get_transaction(&dummy_hash()).await.unwrap();
+        assert_eq!(response.status, "NOT_FOUND");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_http_error_surfaces_provider_body() {
+        let _env_guard = setup_test_env();
+        // 400 is non-retriable, so a single attempt is enough to observe the body.
+        std::env::set_var("PROVIDER_MAX_RETRIES", "1");
+
+        let mut mock_server = mockito::Server::new_async().await;
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_status(400)
+            .with_body("provider says: bad params")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let err = provider.get_transaction(&dummy_hash()).await.unwrap_err();
+        match err {
+            ProviderError::RequestError { error, status_code } => {
+                assert_eq!(status_code, 400);
+                assert!(
+                    error.contains("provider says: bad params"),
+                    "Body detail not surfaced: {error}"
+                );
+            }
+            other => panic!("Unexpected error: {other}"),
+        }
+        mock.assert_async().await;
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub use jupiter::*;
 pub mod stellar_dex;
 pub use stellar_dex::*;
 
+pub mod stellar_fee_forwarder;
+pub use stellar_fee_forwarder::*;
+
 mod vault;
 pub use vault::*;
 
@@ -35,4 +38,12 @@ pub use google_cloud_kms::*;
 mod aws_kms;
 pub use aws_kms::*;
 
+mod azure_key_vault;
+pub use azure_key_vault::*;
+
 pub mod plugins;
+
+pub mod health;
+pub use health::*;
+
+pub(crate) mod client_cache;

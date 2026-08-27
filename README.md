@@ -53,10 +53,12 @@ The repository includes several ready-to-use examples to help you get started wi
 | ------------------------------------------------------------------------------------ | -------------------------------------------------------- |
 | [`basic-example`](./examples/basic-example/)                                         | Simple setup with Redis                                  |
 | [`redis-storage`](./examples/redis-storage/)                                         | Simple setup with Redis for storage                      |
+| [`redis-tls`](./examples/redis-tls/)                                                 | Redis with TLS encrypted connections                     |
 | [`basic-example-logging`](./examples/basic-example-logging/)                         | Configuration with file-based logging                    |
 | [`basic-example-metrics`](./examples/basic-example-metrics/)                         | Setup with Prometheus and Grafana metrics                |
 | [`vault-secret-signer`](./examples/vault-secret-signer/)                             | Using HashiCorp Vault for key management                 |
 | [`vault-transit-signer`](./examples/vault-transit-signer/)                           | Using Vault Transit for secure signing                   |
+| [`evm-azure-key-vault-signer`](./examples/evm-azure-key-vault-signer/)               | Using Azure Key Vault for EVM secure signing             |
 | [`evm-turnkey-signer`](./examples/evm-turnkey-signer/)                               | Using Turnkey Signer for EVM secure signing              |
 | [`solana-turnkey-signer`](./examples/solana-turnkey-signer/)                         | Using Turnkey Signer for Solana secure signing           |
 | [`solana-google-cloud-kms-signer`](./examples/solana-google-cloud-kms-signer/)       | Using Google Cloud KMS Signer for Solana secure signing  |
@@ -64,6 +66,10 @@ The repository includes several ready-to-use examples to help you get started wi
 | [`evm-cdp-signer`](./examples/evm-cdp-signer/)                                       | Using CDP Signer for EVM secure signing                  |
 | [`network-configuration-config-file`](./examples/network-configuration-config-file/) | Using Custom network configuration via config file       |
 | [`network-configuration-json-file`](./examples/network-configuration-json-file/)     | Using Custom network configuration via json file         |
+| [`aws-sqs-queue-storage`](./examples/aws-sqs-queue-storage/)                         | Local SQS queue backend setup using LocalStack           |
+| [`gcp-pubsub-queue-storage`](./examples/gcp-pubsub-queue-storage/)                   | GCP Pub/Sub queue backend setup (emulator or real GCP)   |
+| [`rabbitmq-queue-storage`](./examples/rabbitmq-queue-storage/)                       | RabbitMQ queue backend setup (real broker, one command)  |
+| [`x402-facilitator-plugin`](./examples/x402-facilitator-plugin/)                     | x402 Facilitator plugin                                  |
 
 Each example includes:
 
@@ -315,6 +321,98 @@ Create `.env` with correct values according to your needs from `.env.example` fi
 
 ```sh
 cp .env.example .env
+```
+
+### Queue backend configuration (Redis, SQS, Pub/Sub, or RabbitMQ)
+
+The relayer supports four queue backends:
+
+- `redis` (default): uses Apalis + Redis queues
+- `sqs`: uses AWS SQS workers/cron and minimizes Apalis queue usage
+- `pubsub` (alias `gcp-pubsub`): uses GCP Pub/Sub workers/cron; deferred jobs and
+  retry backoff are held in Redis and published when due
+- `rabbitmq`: uses RabbitMQ workers/cron; one durable classic queue per queue
+  type, publisher-confirmed durable publishes, automatic reconnect; deferred
+  jobs and retry backoff are held in Redis and published when due (no broker
+  plugins required)
+
+Set in `.env`:
+
+```bash
+QUEUE_BACKEND=redis
+# or
+# QUEUE_BACKEND=sqs
+# or
+# QUEUE_BACKEND=pubsub
+# or
+# QUEUE_BACKEND=rabbitmq
+```
+
+When using SQS:
+
+```bash
+QUEUE_BACKEND=sqs
+AWS_REGION=us-east-1
+AWS_ACCOUNT_ID=123456789012
+# Optional: "auto" (default), "standard", or "fifo"
+# SQS_QUEUE_TYPE=auto
+# Optional alternative to AWS_ACCOUNT_ID:
+# SQS_QUEUE_URL_PREFIX=https://sqs.us-east-1.amazonaws.com/123456789012/relayer-
+```
+
+By default (`SQS_QUEUE_TYPE=auto`), the relayer auto-detects whether queues are standard or FIFO at startup.
+
+When using Pub/Sub:
+
+```bash
+QUEUE_BACKEND=pubsub
+PUBSUB_PROJECT_ID=my-gcp-project
+# Optional: prefix applied to all topic/subscription names (default: relayer)
+# PUBSUB_TOPIC_PREFIX=relayer
+# Optional: target the emulator and skip auth (local dev/test)
+# PUBSUB_EMULATOR_HOST=localhost:8085
+```
+
+Pre-create the 8 topics/subscriptions (`{prefix}{queue}` / `{prefix}{queue}-sub`)
+via your infrastructure. Authentication uses Application Default Credentials; the
+on-demand backlog-depth read additionally needs `roles/monitoring.viewer`. No
+dead-letter topic is required. See the
+[`gcp-pubsub-queue-storage`](./examples/gcp-pubsub-queue-storage/) example for a
+local emulator setup.
+
+When using RabbitMQ:
+
+```bash
+QUEUE_BACKEND=rabbitmq
+# Full AMQP URI (use amqps:// for TLS). Embeds credentials, so it is redacted in
+# all logs/errors. Standard URI query params (e.g. ?heartbeat=20) pass through.
+RABBITMQ_URL=amqp://user:pass@host:5672/%2f
+# Optional: queue-name prefix (default: relayer); queues are {prefix}-{queue}
+# RABBITMQ_QUEUE_PREFIX=relayer
+# Optional: verify-only mode — never create queues, just check they exist
+# (for locked-down brokers or pre-provisioned quorum queues). Default: false
+# RABBITMQ_PASSIVE_QUEUES=false
+```
+
+By default the relayer declares its 8 durable queues at startup (needs
+`configure` + `write` + `read` on `^{prefix}-.*`). With
+`RABBITMQ_PASSIVE_QUEUES=true` it only verifies them (needs `write` + `read`) and
+fails fast naming anything missing. Deferred jobs and retry backoff are held in
+Redis and published when due. No broker plugins are required — works on
+self-hosted RabbitMQ 3.13+/4.x, Amazon MQ for RabbitMQ, and CloudAMQP. See the
+[`rabbitmq-queue-storage`](./examples/rabbitmq-queue-storage/) example for a
+one-command local broker setup.
+
+Use distributed mode for multi-instance deployments so scheduled workers use Redis-based distributed locks and avoid duplicate execution:
+
+```bash
+DISTRIBUTED_MODE=true
+```
+
+For single-instance local development, keep:
+
+```bash
+DISTRIBUTED_MODE=false
 ```
 
 > **Note**: After the service is running, all configuration components (relayers, signers, notifications) can also be managed via REST API endpoints for runtime changes. See the [Configuration Guide](https://docs.openzeppelin.com/relayer/configuration) for details on API-based configuration management.
@@ -593,10 +691,11 @@ See [`.env.example`](.env.example) for more configuration examples.
 
 If you have any questions, first see if the answer to your question can be found in the [User Documentation](https://docs.openzeppelin.com/relayer/).
 
-If the answer is not there:
+### Community Support
 
-- Join the [Telegram](https://t.me/openzeppelin_tg/2) to get help, or
-- Open an issue with [the bug](https://github.com/openzeppelin/openzeppelin-relayer/issues/new?assignees=&labels=T-bug%2CS-needs-triage&projects=&template=bug.yml)
+- **GitHub Issues**: Open a [bug report](https://github.com/openzeppelin/openzeppelin-relayer/issues/new?assignees=&labels=T-bug%2CS-needs-triage&projects=&template=bug.yml) or [feature request](https://github.com/openzeppelin/openzeppelin-relayer/issues/new?assignees=&labels=T-feature%2CS-needs-triage&projects=&template=feature.yml)
+- **Good First Issues**: [Find beginner-friendly issues](https://github.com/openzeppelin/openzeppelin-relayer/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue)
+- **GitHub Discussions**: For questions and community interaction
 
 We encourage you to reach out with any questions or feedback.
 

@@ -25,10 +25,8 @@ use crate::utils::{map_provider_error, sanitize_error_description};
 /// To use the `StellarRelayer`, create an instance using the `new` method, providing the necessary
 /// components. Then, call the appropriate methods to process transactions and manage the relayer's state.
 use crate::{
-    constants::{
-        transactions::PENDING_TRANSACTION_STATUSES, STELLAR_SMALLEST_UNIT_NAME,
-        STELLAR_STATUS_CHECK_INITIAL_DELAY_SECONDS,
-    },
+    config::ServerConfig,
+    constants::{transactions::PENDING_TRANSACTION_STATUSES, STELLAR_SMALLEST_UNIT_NAME},
     domain::{
         create_success_response, transaction::stellar::fetch_next_sequence_from_chain,
         BalanceResponse, SignDataRequest, SignDataResponse, SignTransactionExternalResponse,
@@ -42,6 +40,7 @@ use crate::{
         RelayerNetworkPolicy, RelayerRepoModel, RelayerStatus, RelayerStellarPolicy,
         RepositoryError, RpcErrorCodes, StellarAllowedTokensPolicy, StellarFeePaymentStrategy,
         StellarNetwork, StellarRpcRequest, TransactionRepoModel, TransactionStatus,
+        TransactionUpdateRequest,
     },
     repositories::{NetworkRepository, RelayerRepository, Repository, TransactionRepository},
     services::{
@@ -56,7 +55,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use futures::future::try_join_all;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::domain::relayer::stellar::xdr_utils::parse_transaction_xdr;
 use crate::domain::relayer::{Relayer, RelayerError, StellarRelayerDexTrait};
@@ -130,7 +129,7 @@ where
     D: StellarDexServiceTrait + Send + Sync + 'static,
 {
     pub(crate) relayer: RelayerRepoModel,
-    signer: Arc<S>,
+    pub(crate) signer: Arc<S>,
     pub(crate) network: StellarNetwork,
     pub(crate) provider: P,
     pub(crate) relayer_repository: Arc<RR>,
@@ -215,24 +214,40 @@ where
         })
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sync_sequence(&self) -> Result<(), RelayerError> {
         info!(
-            "Syncing sequence for relayer: {} ({})",
-            self.relayer.id, self.relayer.address
+            address = %self.relayer.address,
+            "syncing sequence from chain"
         );
 
         let next = fetch_next_sequence_from_chain(&self.provider, &self.relayer.address)
             .await
             .map_err(RelayerError::ProviderError)?;
 
-        info!(
-            "Setting next sequence {} for relayer {}",
-            next, self.relayer.id
-        );
-        self.transaction_counter_service
-            .set(next)
+        // Raise the local counter to the on-chain floor *monotonically*: a blind `set` here
+        // would rewind the counter when concurrent allocations have already advanced it past
+        // the chain value, causing duplicate/gapped sequences and a TxBadSeq cascade
+        // (the live chain sequence is a floor, never the authoritative next assignment).
+        // `sync_floor` only advances when the chain is ahead.
+        let effective = self
+            .transaction_counter_service
+            .sync_floor(next)
             .await
             .map_err(RelayerError::from)?;
+
+        info!(
+            chain_sequence = %next,
+            effective_sequence = %effective,
+            "synced local sequence counter to chain floor"
+        );
         Ok(())
     }
 
@@ -245,6 +260,14 @@ where
     ///
     /// If no allowed tokens are specified, it logs an informational message and returns the policy
     /// unchanged.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn populate_allowed_tokens_metadata(&self) -> Result<RelayerStellarPolicy, RelayerError> {
         let mut policy = self.relayer.policies.get_stellar_policy();
         // Check if allowed_tokens is specified; if not, return the policy unchanged.
@@ -295,6 +318,14 @@ where
     ///
     /// In-memory relayers don't need this migration as they are recreated from config.json
     /// on startup, which would have the policy set if using a newer version.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn migrate_fee_payment_strategy_if_needed(&self) -> Result<(), RelayerError> {
         // Only migrate if using persistent storage (Redis)
         // In-memory relayers are recreated from config.json on startup
@@ -347,6 +378,14 @@ where
     /// Checks the relayer's XLM balance and triggers token swap if it falls below the
     /// specified threshold. Only proceeds with swap if balance is below the configured
     /// min_balance_threshold.
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn check_balance_and_trigger_token_swap_if_needed(&self) -> Result<(), RelayerError> {
         let policy = self.relayer.policies.get_stellar_policy();
 
@@ -417,6 +456,15 @@ where
     TCS: TransactionCounterServiceTrait + Send + Sync + 'static,
     S: StellarSignTrait + Send + Sync + 'static,
 {
+    #[instrument(
+        level = "debug",
+        skip(self, network_transaction),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+            network_type = ?self.relayer.network_type,
+        )
+    )]
     async fn process_transaction_request(
         &self,
         network_transaction: NetworkTransactionRequest,
@@ -439,14 +487,11 @@ where
             .await
             .map_err(|e| RepositoryError::TransactionFailure(e.to_string()))?;
 
-        self.job_producer
-            .produce_transaction_request_job(
-                TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
-                None,
-            )
-            .await?;
-
-        self.job_producer
+        // Status check FIRST - this is our safety net for monitoring.
+        // If this fails, mark transaction as failed and don't proceed.
+        // This ensures we never have an unmonitored transaction.
+        if let Err(e) = self
+            .job_producer
             .produce_check_transaction_status_job(
                 TransactionStatusCheck::new(
                     transaction.id.clone(),
@@ -454,20 +499,81 @@ where
                     NetworkType::Stellar,
                 ),
                 Some(calculate_scheduled_timestamp(
-                    STELLAR_STATUS_CHECK_INITIAL_DELAY_SECONDS,
+                    ServerConfig::get_stellar_status_check_initial_delay_seconds(),
                 )),
+            )
+            .await
+        {
+            // Status queue failed - mark transaction as failed to prevent orphaned tx
+            error!(
+                relayer_id = %self.relayer.id,
+                transaction_id = %transaction.id,
+                error = %e,
+                "Status check queue push failed - marking transaction as failed"
+            );
+            if let Err(update_err) = self
+                .transaction_repository
+                .partial_update(
+                    transaction.id.clone(),
+                    TransactionUpdateRequest {
+                        status: Some(TransactionStatus::Failed),
+                        status_reason: Some("Queue unavailable".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                warn!(
+                    relayer_id = %self.relayer.id,
+                    transaction_id = %transaction.id,
+                    error = %update_err,
+                    "Failed to mark transaction as failed after queue push failure"
+                );
+            }
+            return Err(e.into());
+        }
+
+        // Now safe to push transaction request.
+        // Even if this fails, status check will monitor and detect the stuck transaction.
+        self.job_producer
+            .produce_transaction_request_job(
+                TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
+                None,
             )
             .await?;
 
         Ok(transaction)
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn get_balance(&self) -> Result<BalanceResponse, RelayerError> {
         let account_entry = self
             .provider
             .get_account(&self.relayer.address)
             .await
             .map_err(|e| {
+                warn!(
+                    relayer_id = %self.relayer.id,
+                    address = %self.relayer.address,
+                    error = %e,
+                    "get_account failed in get_balance (called before transaction creation)"
+                );
+                // Track RPC failure metric
+                crate::metrics::API_RPC_FAILURES
+                    .with_label_values(&[
+                        self.relayer.id.as_str(),
+                        "stellar",
+                        "get_balance",
+                        "get_account_failed",
+                    ])
+                    .inc();
                 RelayerError::ProviderError(format!("Failed to fetch account for balance: {e}"))
             })?;
 
@@ -477,6 +583,14 @@ where
         })
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn get_status(&self) -> Result<RelayerStatus, RelayerError> {
         let relayer_model = &self.relayer;
 
@@ -485,6 +599,21 @@ where
             .get_account(&relayer_model.address)
             .await
             .map_err(|e| {
+                warn!(
+                    relayer_id = %relayer_model.id,
+                    address = %relayer_model.address,
+                    error = %e,
+                    "get_account failed in get_status (called before transaction creation)"
+                );
+                // Track RPC failure metric
+                crate::metrics::API_RPC_FAILURES
+                    .with_label_values(&[
+                        relayer_model.id.as_str(),
+                        "stellar",
+                        "get_status",
+                        "get_account_failed",
+                    ])
+                    .inc();
                 RelayerError::ProviderError(format!("Failed to get account details: {e}"))
             })?;
 
@@ -528,6 +657,14 @@ where
         })
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn delete_pending_transactions(
         &self,
     ) -> Result<DeletePendingTransactionsResponse, RelayerError> {
@@ -539,12 +676,28 @@ where
         })
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, _request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_data(&self, _request: SignDataRequest) -> Result<SignDataResponse, RelayerError> {
         Err(RelayerError::NotSupported(
             "Signing data not supported for Stellar".to_string(),
         ))
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, _request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_typed_data(
         &self,
         _request: SignTypedDataRequest,
@@ -554,6 +707,14 @@ where
         ))
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn rpc(
         &self,
         request: JsonRpcRequest<NetworkRpcRequest>,
@@ -600,12 +761,28 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn validate_min_balance(&self) -> Result<(), RelayerError> {
         Ok(())
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn initialize_relayer(&self) -> Result<(), RelayerError> {
-        debug!("initializing Stellar relayer {}", self.relayer.id);
+        debug!("initializing Stellar relayer");
 
         // Migration: Check if relayer needs fee_payment_strategy migration
         // Older relayers persisted in Redis may not have this policy set.
@@ -672,6 +849,14 @@ where
         Ok(())
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn check_health(&self) -> Result<(), Vec<HealthCheckFailure>> {
         debug!(
             "running health checks for Stellar relayer {}",
@@ -736,6 +921,14 @@ where
         }
     }
 
+    #[instrument(
+        level = "debug",
+        skip(self, request),
+        fields(
+            request_id = ?crate::observability::request_id::get_request_id(),
+            relayer_id = %self.relayer.id,
+        )
+    )]
     async fn sign_transaction(
         &self,
         request: &SignTransactionRequest,
@@ -924,9 +1117,9 @@ mod tests {
             });
         let mut counter = MockTransactionCounterServiceTrait::new();
         counter
-            .expect_set()
+            .expect_sync_floor()
             .with(eq(6u64))
-            .returning(|_| Box::pin(async { Ok(()) }));
+            .returning(|floor| Box::pin(async move { Ok(floor) }));
         let relayer_repo = MockRelayerRepository::new();
         let tx_repo = MockTransactionRepository::new();
         let job_producer = MockJobProducerTrait::new();
@@ -949,6 +1142,73 @@ mod tests {
         .await
         .unwrap();
 
+        let result = relayer.sync_sequence().await;
+        assert!(result.is_ok());
+    }
+
+    /// Verifies `sync_sequence` never rewinds the counter below sequences already
+    /// allocated by concurrent `get_and_increment` calls. On the multi-threaded runtime,
+    /// a periodic/startup health-check sync racing with in-flight transaction submissions
+    /// must only ever raise the counter to the chain floor, never blindly `set` it.
+    #[tokio::test]
+    async fn test_sync_sequence_does_not_rewind_counter() {
+        let ctx = TestCtx::default();
+        ctx.setup_network().await;
+        let relayer_model = ctx.relayer_model.clone();
+        let mut provider = MockStellarProviderTrait::new();
+        // Chain reports on-chain sequence 5, so next usable sequence is 6.
+        provider
+            .expect_get_account()
+            .with(eq(relayer_model.address.clone()))
+            .returning(|_| {
+                Box::pin(async {
+                    Ok(AccountEntry {
+                        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                        balance: 0,
+                        ext: AccountEntryExt::V0,
+                        flags: 0,
+                        home_domain: String32::default(),
+                        inflation_dest: None,
+                        seq_num: SequenceNumber(5),
+                        num_sub_entries: 0,
+                        signers: VecM::default(),
+                        thresholds: Thresholds([0, 0, 0, 0]),
+                    })
+                })
+            });
+
+        let mut counter = MockTransactionCounterServiceTrait::new();
+        // Counter is already at 15 (advanced past the chain floor of 6 by concurrent
+        // allocations). `sync_floor` must return the higher existing value, not rewind.
+        counter
+            .expect_sync_floor()
+            .with(eq(6u64))
+            .returning(|floor| Box::pin(async move { Ok(std::cmp::max(floor, 15)) }));
+
+        let relayer_repo = MockRelayerRepository::new();
+        let tx_repo = MockTransactionRepository::new();
+        let job_producer = MockJobProducerTrait::new();
+        let signer = Arc::new(MockStellarSignTrait::new());
+        let dex_service = create_mock_dex_service();
+
+        let relayer = StellarRelayer::new(
+            relayer_model.clone(),
+            signer,
+            provider,
+            StellarRelayerDependencies::new(
+                Arc::new(relayer_repo),
+                ctx.network_repository.clone(),
+                Arc::new(tx_repo),
+                Arc::new(counter),
+                Arc::new(job_producer),
+            ),
+            dex_service,
+        )
+        .await
+        .unwrap();
+
+        // sync_sequence succeeds and, because it goes through sync_floor rather than a
+        // blind set, does not clobber the counter's higher, already-allocated value.
         let result = relayer.sync_sequence().await;
         assert!(result.is_ok());
     }
@@ -1047,7 +1307,7 @@ mod tests {
                     && statuses == [TransactionStatus::Confirmed]
                     && query.page == 1
                     && query.per_page == 1
-                    && *oldest_first == false
+                    && !(*oldest_first)
             })
             .returning(move |_, _, _, _| {
                 Ok(crate::repositories::PaginatedResult {
@@ -1578,8 +1838,8 @@ mod tests {
         let tx_repo = MockTransactionRepository::new();
         let mut counter = MockTransactionCounterServiceTrait::new();
         counter
-            .expect_set()
-            .returning(|_| Box::pin(async { Ok(()) }));
+            .expect_sync_floor()
+            .returning(|floor| Box::pin(async move { Ok(floor) }));
         let signer = Arc::new(MockStellarSignTrait::new());
         let dex_service = create_mock_dex_service();
         let job_producer = MockJobProducerTrait::new();
@@ -1634,8 +1894,8 @@ mod tests {
         let tx_repo = MockTransactionRepository::new();
         let mut counter = MockTransactionCounterServiceTrait::new();
         counter
-            .expect_set()
-            .returning(|_| Box::pin(async { Ok(()) }));
+            .expect_sync_floor()
+            .returning(|floor| Box::pin(async move { Ok(floor) }));
         let signer = Arc::new(MockStellarSignTrait::new());
         let dex_service = create_mock_dex_service();
         let job_producer = MockJobProducerTrait::new();
@@ -1817,6 +2077,7 @@ mod tests {
                 transaction_xdr: Some("AAAAAgAAAACige4lTdwSB/sto4SniEdJ2kOa2X65s5bqkd40J4DjSwAAAAEAAHAkAAAADwAAAAAAAAAAAAAAAQAAAAAAAAABAAAAAKKB7iVN3BIH+y2jhKeIR0naQ5rZfrmzluqR3jQngONLAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_string()),
                 fee_bump: None,
                 max_fee: None,
+                signed_auth_entry: None,
             })
         }
 
@@ -1882,7 +2143,7 @@ mod tests {
 
             let result = relayer.process_transaction_request(tx_request).await;
             if let Err(e) = &result {
-                panic!("process_transaction_request failed: {}", e);
+                panic!("process_transaction_request failed: {e}");
             }
             assert!(result.is_ok());
         }
@@ -1918,8 +2179,9 @@ mod tests {
                         let now = Utc::now().timestamp();
                         let diff = scheduled_at - now;
                         // Allow some tolerance (within 2 seconds)
-                        diff >= (STELLAR_STATUS_CHECK_INITIAL_DELAY_SECONDS - 2)
-                            && diff <= (STELLAR_STATUS_CHECK_INITIAL_DELAY_SECONDS + 2)
+                        ((STELLAR_STATUS_CHECK_INITIAL_DELAY_SECONDS - 2)
+                            ..=(STELLAR_STATUS_CHECK_INITIAL_DELAY_SECONDS + 2))
+                            .contains(&diff)
                     } else {
                         false
                     }
@@ -1998,8 +2260,7 @@ mod tests {
             let err_msg = result.err().unwrap().to_string();
             assert!(
                 err_msg.contains("Database connection failed"),
-                "Error was: {}",
-                err_msg
+                "Error was: {err_msg}"
             );
         }
 
@@ -2018,8 +2279,15 @@ mod tests {
             let mut tx_repo = MockTransactionRepository::new();
             tx_repo.expect_create().returning(|t| Ok(t.clone()));
 
-            // Mock produce_transaction_request_job to fail
             let mut job_producer = MockJobProducerTrait::new();
+
+            // Status check is called FIRST and succeeds (safety net)
+            job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            // Transaction request fails AFTER status check succeeds
+            // This is safe because status check will monitor the stuck transaction
             job_producer
                 .expect_produce_transaction_request_job()
                 .returning(|_, _| {
@@ -2029,8 +2297,6 @@ mod tests {
                         ))
                     })
                 });
-
-            // Status check job should NOT be called if request job fails
 
             let relayer_repo = Arc::new(MockRelayerRepository::new());
             let counter = MockTransactionCounterServiceTrait::new();
@@ -2069,21 +2335,84 @@ mod tests {
 
             let mut tx_repo = MockTransactionRepository::new();
             tx_repo.expect_create().returning(|t| Ok(t.clone()));
+            // When status check fails, transaction is marked as failed
+            tx_repo
+                .expect_partial_update()
+                .returning(|_, _| Ok(TransactionRepoModel::default()));
 
             let mut job_producer = MockJobProducerTrait::new();
 
-            // Request job succeeds
-            job_producer
-                .expect_produce_transaction_request_job()
-                .returning(|_, _| Box::pin(async { Ok(()) }));
-
-            // Status check job fails
+            // Status check is called FIRST and fails
+            // This prevents orphaned transactions without monitoring
             job_producer
                 .expect_produce_check_transaction_status_job()
                 .returning(|_, _| {
                     Box::pin(async {
                         Err(crate::jobs::JobProducerError::QueueError(
                             "Failed to queue job".to_string(),
+                        ))
+                    })
+                });
+
+            // Transaction request should NOT be called when status check fails
+            // (no expectation set = test fails if called)
+
+            let relayer_repo = Arc::new(MockRelayerRepository::new());
+            let counter = MockTransactionCounterServiceTrait::new();
+
+            let relayer = StellarRelayer::new(
+                relayer_model,
+                signer,
+                provider,
+                StellarRelayerDependencies::new(
+                    relayer_repo,
+                    ctx.network_repository.clone(),
+                    Arc::new(tx_repo),
+                    Arc::new(counter),
+                    Arc::new(job_producer),
+                ),
+                dex_service,
+            )
+            .await
+            .unwrap();
+
+            let result = relayer.process_transaction_request(tx_request).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_process_transaction_request_status_check_failure_marks_tx_failed() {
+            // Verify that when status check queue fails, the transaction is marked
+            // as Failed with "Queue unavailable" reason
+            let ctx = TestCtx::default();
+            ctx.setup_network().await;
+            let relayer_model = ctx.relayer_model.clone();
+
+            let provider = MockStellarProviderTrait::new();
+            let signer = Arc::new(MockStellarSignTrait::new());
+            let dex_service = create_mock_dex_service();
+
+            let tx_request = create_test_transaction_request();
+
+            let mut tx_repo = MockTransactionRepository::new();
+            tx_repo.expect_create().returning(|t| Ok(t.clone()));
+
+            // Verify partial_update is called with correct status and reason
+            tx_repo
+                .expect_partial_update()
+                .withf(|_tx_id, update| {
+                    update.status == Some(TransactionStatus::Failed)
+                        && update.status_reason == Some("Queue unavailable".to_string())
+                })
+                .returning(|_, _| Ok(TransactionRepoModel::default()));
+
+            let mut job_producer = MockJobProducerTrait::new();
+            job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| {
+                    Box::pin(async {
+                        Err(crate::jobs::JobProducerError::QueueError(
+                            "Redis timeout".to_string(),
                         ))
                     })
                 });
@@ -2109,6 +2438,7 @@ mod tests {
 
             let result = relayer.process_transaction_request(tx_request).await;
             assert!(result.is_err());
+            // The mock verification (withf) ensures partial_update was called correctly
         }
 
         #[tokio::test]
@@ -2900,8 +3230,8 @@ mod tests {
 
             let mut counter = MockTransactionCounterServiceTrait::new();
             counter
-                .expect_set()
-                .returning(|_| Box::pin(async { Ok(()) }));
+                .expect_sync_floor()
+                .returning(|floor| Box::pin(async move { Ok(floor) }));
 
             let relayer = StellarRelayer::new(
                 relayer_model.clone(),
@@ -3011,8 +3341,8 @@ mod tests {
 
             let mut counter = MockTransactionCounterServiceTrait::new();
             counter
-                .expect_set()
-                .returning(|_| Box::pin(async { Ok(()) }));
+                .expect_sync_floor()
+                .returning(|floor| Box::pin(async move { Ok(floor) }));
 
             let relayer = StellarRelayer::new(
                 relayer_model.clone(),

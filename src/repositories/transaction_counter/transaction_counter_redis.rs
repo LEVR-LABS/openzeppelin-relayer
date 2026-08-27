@@ -8,8 +8,8 @@
 use super::TransactionCounterTrait;
 use crate::models::RepositoryError;
 use crate::repositories::redis_base::RedisRepository;
+use crate::utils::RedisConnections;
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use std::fmt;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ const COUNTER_PREFIX: &str = "transaction_counter";
 
 #[derive(Clone)]
 pub struct RedisTransactionCounter {
-    pub client: Arc<ConnectionManager>,
+    pub connections: Arc<RedisConnections>,
     pub key_prefix: String,
 }
 
@@ -35,7 +35,7 @@ impl fmt::Debug for RedisTransactionCounter {
 
 impl RedisTransactionCounter {
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        connections: Arc<RedisConnections>,
         key_prefix: String,
     ) -> Result<Self, RepositoryError> {
         if key_prefix.is_empty() {
@@ -45,7 +45,7 @@ impl RedisTransactionCounter {
         }
 
         Ok(Self {
-            client: connection_manager,
+            connections,
             key_prefix,
         })
     }
@@ -77,7 +77,9 @@ impl TransactionCounterTrait for RedisTransactionCounter {
         let key = self.counter_key(relayer_id, address);
         debug!(relayer_id = %relayer_id, address = %address, "getting counter for relayer and address");
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "get")
+            .await?;
 
         let value: Option<u64> = conn
             .get(&key)
@@ -108,7 +110,9 @@ impl TransactionCounterTrait for RedisTransactionCounter {
         let key = self.counter_key(relayer_id, address);
         debug!(relayer_id = %relayer_id, address = %address, "getting and incrementing counter for relayer and address");
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "get_and_increment")
+            .await?;
 
         // Use Redis INCR for atomic increment
         let new_value: u64 = conn
@@ -138,7 +142,9 @@ impl TransactionCounterTrait for RedisTransactionCounter {
         let key = self.counter_key(relayer_id, address);
         debug!(relayer_id = %relayer_id, address = %address, "decrementing counter for relayer and address");
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "decrement")
+            .await?;
 
         // Check if counter exists first
         let exists: bool = conn
@@ -194,7 +200,9 @@ impl TransactionCounterTrait for RedisTransactionCounter {
         let key = self.counter_key(relayer_id, address);
         debug!(relayer_id = %relayer_id, address = %address, value = %value, "setting counter for relayer and address");
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "set")
+            .await?;
 
         let _: () = conn
             .set(&key, value)
@@ -204,25 +212,197 @@ impl TransactionCounterTrait for RedisTransactionCounter {
         debug!(value = %value, "counter set");
         Ok(())
     }
+
+    async fn sync_floor(
+        &self,
+        relayer_id: &str,
+        address: &str,
+        floor: u64,
+    ) -> Result<u64, RepositoryError> {
+        if relayer_id.is_empty() {
+            return Err(RepositoryError::InvalidData(
+                "Relayer ID cannot be empty".to_string(),
+            ));
+        }
+
+        if address.is_empty() {
+            return Err(RepositoryError::InvalidData(
+                "Address cannot be empty".to_string(),
+            ));
+        }
+
+        let key = self.counter_key(relayer_id, address);
+        debug!(relayer_id = %relayer_id, address = %address, floor = %floor, "syncing counter floor for relayer and address");
+
+        let mut conn = self
+            .get_connection(self.connections.primary(), "sync_floor")
+            .await?;
+
+        // Atomic monotonic max: raise to `floor` only if the current value is lower (or unset),
+        // never rewind below an already-allocated sequence. Returns the effective value.
+        //
+        // Comparison and return are string-based: Lua 5.1 numbers are f64, exact only to
+        // 2^53 — not enough for Stellar sequences (~2^57+). Length-then-lexicographic
+        // ordering is correct because the key only ever holds canonical non-negative
+        // decimals (written via SET from u64 / INCR).
+        const SYNC_FLOOR_LUA: &str = r#"
+            local function numlt(a, b)
+                if #a ~= #b then return #a < #b end
+                return a < b
+            end
+            local cur = redis.call('GET', KEYS[1])
+            if (not cur) or numlt(cur, ARGV[1]) then
+                redis.call('SET', KEYS[1], ARGV[1])
+                return ARGV[1]
+            end
+            return cur
+        "#;
+
+        let effective: u64 = redis::Script::new(SYNC_FLOOR_LUA)
+            .key(&key)
+            .arg(floor)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "sync_floor"))?;
+
+        debug!(effective = %effective, "counter floor synced");
+        Ok(effective)
+    }
+
+    async fn set_if_equals(
+        &self,
+        relayer_id: &str,
+        address: &str,
+        expected: u64,
+        value: u64,
+    ) -> Result<bool, RepositoryError> {
+        if relayer_id.is_empty() {
+            return Err(RepositoryError::InvalidData(
+                "Relayer ID cannot be empty".to_string(),
+            ));
+        }
+
+        if address.is_empty() {
+            return Err(RepositoryError::InvalidData(
+                "Address cannot be empty".to_string(),
+            ));
+        }
+
+        let key = self.counter_key(relayer_id, address);
+        debug!(relayer_id = %relayer_id, address = %address, expected = %expected, value = %value, "setting counter if current value matches expected");
+
+        let mut conn = self
+            .get_connection(self.connections.primary(), "set_if_equals")
+            .await?;
+
+        // Atomic compare-and-set: only lower the counter to `value` if the current value is
+        // exactly `expected` and `value` is genuinely lower, guarding against clobbering a
+        // counter that has moved on since it was last observed.
+        //
+        // Comparisons are string-based: Lua 5.1 numbers are f64, exact only to 2^53 —
+        // adjacent Stellar sequences (~2^57+) would collide as doubles and let a stale
+        // CAS apply. Equality is exact on canonical decimals; ordering is
+        // length-then-lexicographic (valid for canonical non-negative decimals).
+        const SET_IF_EQUALS_LUA: &str = r#"
+            local function numlt(a, b)
+                if #a ~= #b then return #a < #b end
+                return a < b
+            end
+            local cur = redis.call('GET', KEYS[1])
+            if cur and (cur == ARGV[1]) and numlt(ARGV[2], ARGV[1]) then
+                redis.call('SET', KEYS[1], ARGV[2])
+                return 1
+            end
+            return 0
+        "#;
+
+        let applied: bool = redis::Script::new(SET_IF_EQUALS_LUA)
+            .key(&key)
+            .arg(expected)
+            .arg(value)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "set_if_equals"))?;
+
+        debug!(expected = %expected, value = %value, applied = %applied, "counter set_if_equals evaluated");
+        Ok(applied)
+    }
+
+    async fn drop_all_entries(&self) -> Result<(), RepositoryError> {
+        let mut conn = self
+            .get_connection(self.connections.primary(), "drop_all_entries")
+            .await?;
+
+        let pattern = format!("{}:{}:*", self.key_prefix, COUNTER_PREFIX);
+        debug!(pattern = %pattern, "dropping all transaction counter entries");
+
+        // Phase 1: Collect all matching keys without mutating the keyspace.
+        // Deleting during SCAN can cause hash table rehashing, which may skip keys.
+        let mut cursor: u64 = 0;
+        let mut all_keys: Vec<String> = Vec::new();
+
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .cursor_arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "drop_all_entries_scan"))?;
+
+            all_keys.extend(keys);
+
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        // Phase 2: Batch delete all collected keys.
+        if !all_keys.is_empty() {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for key in &all_keys {
+                pipe.del(key);
+            }
+            pipe.exec_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "drop_all_entries_delete"))?;
+        }
+
+        debug!(total_deleted = %all_keys.len(), "dropped all transaction counter entries");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redis::aio::ConnectionManager;
     use std::sync::Arc;
     use tokio;
     use uuid::Uuid;
 
     async fn setup_test_repo() -> RedisTransactionCounter {
+        setup_test_repo_with_prefix("test_counter").await
+    }
+
+    async fn setup_test_repo_with_prefix(prefix: &str) -> RedisTransactionCounter {
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let client = redis::Client::open(redis_url).expect("Failed to create Redis client");
-        let connection_manager = ConnectionManager::new(client)
-            .await
-            .expect("Failed to create Redis connection manager");
+        let cfg = deadpool_redis::Config::from_url(&redis_url);
+        let pool = Arc::new(
+            cfg.builder()
+                .expect("Failed to create pool builder")
+                .max_size(16)
+                .runtime(deadpool_redis::Runtime::Tokio1)
+                .build()
+                .expect("Failed to build Redis pool"),
+        );
+        let connections = Arc::new(RedisConnections::new_single_pool(pool));
 
-        RedisTransactionCounter::new(Arc::new(connection_manager), "test_counter".to_string())
+        RedisTransactionCounter::new(connections, prefix.to_string())
             .expect("Failed to create Redis transaction counter")
     }
 
@@ -245,6 +425,169 @@ mod tests {
         repo.set(&relayer_id, &address, 100).await.unwrap();
         let result = repo.get(&relayer_id, &address).await.unwrap();
         assert_eq!(result, Some(100));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_sync_floor_no_rewind() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        // Counter starts at S = 5 then concurrent INCRs advance it to S+10 = 15.
+        repo.set(&relayer_id, &address, 5).await.unwrap();
+        for _ in 0..10 {
+            repo.get_and_increment(&relayer_id, &address).await.unwrap();
+        }
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(15));
+
+        // Stale chain floor S+1 = 6 MUST NOT rewind the counter.
+        let effective = repo.sync_floor(&relayer_id, &address, 6).await.unwrap();
+        assert_eq!(effective, 15);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(15));
+
+        // A genuinely-ahead floor DOES advance the counter.
+        let effective = repo.sync_floor(&relayer_id, &address, 20).await.unwrap();
+        assert_eq!(effective, 20);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(20));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_sync_floor_seeds_when_unset() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        let effective = repo.sync_floor(&relayer_id, &address, 7).await.unwrap();
+        assert_eq!(effective, 7);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_set_if_equals_applies_when_expected_matches_and_value_is_lower() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        repo.set(&relayer_id, &address, 15).await.unwrap();
+
+        let applied = repo
+            .set_if_equals(&relayer_id, &address, 15, 5)
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_set_if_equals_returns_false_when_current_does_not_match_expected() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        repo.set(&relayer_id, &address, 20).await.unwrap();
+
+        let applied = repo
+            .set_if_equals(&relayer_id, &address, 15, 5)
+            .await
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(20));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_set_if_equals_returns_false_on_missing_key() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        let applied = repo
+            .set_if_equals(&relayer_id, &address, 15, 5)
+            .await
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_set_if_equals_returns_false_when_value_not_lower() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        repo.set(&relayer_id, &address, 15).await.unwrap();
+
+        let applied = repo
+            .set_if_equals(&relayer_id, &address, 15, 15)
+            .await
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(15));
+    }
+
+    /// Values above 2^53 are indistinguishable as Lua doubles — adjacent Stellar-scale
+    /// sequences must still compare exactly (string comparison, not `tonumber`).
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_set_if_equals_exact_above_f64_precision() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        // 2^57 and 2^57 + 1 round to the same f64.
+        let big = 1u64 << 57;
+        repo.set(&relayer_id, &address, big).await.unwrap();
+
+        // Stale expected (off by one) must NOT match.
+        let applied = repo
+            .set_if_equals(&relayer_id, &address, big + 1, big - 10)
+            .await
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(repo.get(&relayer_id, &address).await.unwrap(), Some(big));
+
+        // Exact expected must match, and `value` one below must count as lower.
+        let applied = repo
+            .set_if_equals(&relayer_id, &address, big, big - 1)
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            repo.get(&relayer_id, &address).await.unwrap(),
+            Some(big - 1)
+        );
+    }
+
+    /// `sync_floor` must distinguish adjacent values above 2^53 and return them intact.
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_sync_floor_exact_above_f64_precision() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        let big = 1u64 << 57;
+        repo.set(&relayer_id, &address, big).await.unwrap();
+
+        // One above must raise (equal-as-f64, greater-as-integer).
+        let effective = repo
+            .sync_floor(&relayer_id, &address, big + 1)
+            .await
+            .unwrap();
+        assert_eq!(effective, big + 1);
+        assert_eq!(
+            repo.get(&relayer_id, &address).await.unwrap(),
+            Some(big + 1)
+        );
+
+        // One below must not lower, and the returned value must be exact.
+        let effective = repo.sync_floor(&relayer_id, &address, big).await.unwrap();
+        assert_eq!(effective, big + 1);
     }
 
     #[tokio::test]
@@ -358,6 +701,35 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires active Redis instance"]
+    async fn test_drop_all_entries() {
+        let prefix = format!("test_drop_{}", uuid::Uuid::new_v4());
+        let repo = setup_test_repo_with_prefix(&prefix).await;
+        let relayer_1 = uuid::Uuid::new_v4().to_string();
+        let relayer_2 = uuid::Uuid::new_v4().to_string();
+        let address_1 = uuid::Uuid::new_v4().to_string();
+        let address_2 = uuid::Uuid::new_v4().to_string();
+
+        // Set up multiple counters
+        repo.set(&relayer_1, &address_1, 100).await.unwrap();
+        repo.set(&relayer_1, &address_2, 200).await.unwrap();
+        repo.set(&relayer_2, &address_1, 300).await.unwrap();
+
+        // Verify they exist
+        assert_eq!(repo.get(&relayer_1, &address_1).await.unwrap(), Some(100));
+        assert_eq!(repo.get(&relayer_1, &address_2).await.unwrap(), Some(200));
+        assert_eq!(repo.get(&relayer_2, &address_1).await.unwrap(), Some(300));
+
+        // Drop all
+        repo.drop_all_entries().await.unwrap();
+
+        // Verify all are gone
+        assert_eq!(repo.get(&relayer_1, &address_1).await.unwrap(), None);
+        assert_eq!(repo.get(&relayer_1, &address_2).await.unwrap(), None);
+        assert_eq!(repo.get(&relayer_2, &address_1).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
     async fn test_concurrent_get_and_increment() {
         let repo = setup_test_repo().await;
         let relayer_id = uuid::Uuid::new_v4().to_string();
@@ -394,5 +766,53 @@ mod tests {
         // Verify final value is 110
         let final_value = repo.get(&relayer_id, &address).await.unwrap();
         assert_eq!(final_value, Some(110));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_concurrent_get_and_increment_races_set_if_equals() {
+        let repo = setup_test_repo().await;
+        let relayer_id = uuid::Uuid::new_v4().to_string();
+        let address = uuid::Uuid::new_v4().to_string();
+
+        repo.set(&relayer_id, &address, 100).await.unwrap();
+
+        // Race several increments against a single set_if_equals rollback attempt.
+        let mut handles: Vec<tokio::task::JoinHandle<Option<u64>>> = Vec::new();
+        for _ in 0..10 {
+            let repo = repo.clone();
+            let relayer_id = relayer_id.clone();
+            let address = address.clone();
+            handles.push(tokio::spawn(async move {
+                repo.get_and_increment(&relayer_id, &address).await.ok()
+            }));
+        }
+        {
+            let repo = repo.clone();
+            let relayer_id = relayer_id.clone();
+            let address = address.clone();
+            handles.push(tokio::spawn(async move {
+                repo.set_if_equals(&relayer_id, &address, 100, 50)
+                    .await
+                    .ok()
+                    .map(|applied| applied as u64)
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // The CAS can only apply if it wins the race to run before any increment observes the
+        // counter (the only moment `cur == expected` holds, since increments only move the
+        // counter upward from 100). So either: the CAS ran first, rolled the counter back to
+        // 50, and all 10 increments then landed on top of that (final = 60); or an increment
+        // ran first, the CAS then saw a value != 100 and was refused, and all 10 increments
+        // completed untouched (final = 110). No increment is ever lost either way.
+        let final_value = repo.get(&relayer_id, &address).await.unwrap().unwrap();
+        assert!(
+            final_value == 60 || final_value == 110,
+            "unexpected final value: {final_value}"
+        );
     }
 }

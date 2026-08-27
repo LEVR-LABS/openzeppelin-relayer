@@ -32,6 +32,7 @@ pub struct ConfigFileRelayerEvmPolicy {
     pub private_transactions: Option<bool>,
     pub min_balance: Option<u128>,
     pub gas_limit_estimation: Option<bool>,
+    pub include_revert_data: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
@@ -195,6 +196,7 @@ pub struct ConfigFileRelayerStellarPolicy {
     pub min_balance: Option<u64>,
     pub concurrent_transactions: Option<bool>,
     /// Determines if the relayer pays the transaction fee or the user. Optional.
+    /// When set to "user" with STELLAR_FEE_FORWARDER_ADDRESS env var, enables soroban gas abstraction as well.
     pub fee_payment_strategy: Option<ConfigFileStellarFeePaymentStrategy>,
     /// Default slippage percentage for token conversions. Optional.
     pub slippage_percentage: Option<f32>,
@@ -399,6 +401,7 @@ fn convert_config_policies_to_domain(
                 whitelist_receivers: evm_policy.whitelist_receivers,
                 eip1559_pricing: evm_policy.eip1559_pricing,
                 private_transactions: evm_policy.private_transactions,
+                include_revert_data: evm_policy.include_revert_data,
             }))
         }
         ConfigFileRelayerNetworkPolicy::Solana(solana_policy) => {
@@ -667,6 +670,21 @@ mod tests {
     }
 
     #[test]
+    fn test_evm_policy_include_revert_data_serde_roundtrip() {
+        let omitted: ConfigFileRelayerEvmPolicy =
+            serde_json::from_str(r#"{ "gas_limit_estimation": true }"#).unwrap();
+        assert_eq!(omitted.include_revert_data, None);
+
+        let explicit: ConfigFileRelayerEvmPolicy =
+            serde_json::from_str(r#"{ "include_revert_data": false }"#).unwrap();
+        assert_eq!(explicit.include_revert_data, Some(false));
+
+        let reparsed: ConfigFileRelayerEvmPolicy =
+            serde_json::from_str(&serde_json::to_string(&explicit).unwrap()).unwrap();
+        assert_eq!(reparsed.include_revert_data, Some(false));
+    }
+
+    #[test]
     fn test_relayer_file_config_deserialization_solana() {
         let json_input = r#"{
             "id": "test-solana-relayer",
@@ -883,6 +901,7 @@ mod tests {
     #[test]
     fn test_convert_config_policies_to_domain_evm() {
         let config_policy = ConfigFileRelayerNetworkPolicy::Evm(ConfigFileRelayerEvmPolicy {
+            include_revert_data: None,
             gas_price_cap: Some(50000000000),
             whitelist_receivers: Some(vec!["0x123".to_string(), "0x456".to_string()]),
             eip1559_pricing: Some(true),
@@ -1012,6 +1031,7 @@ mod tests {
             network_type: ConfigFileNetworkType::Evm,
             policies: Some(ConfigFileRelayerNetworkPolicy::Evm(
                 ConfigFileRelayerEvmPolicy {
+                    include_revert_data: None,
                     gas_price_cap: Some(75000000000),
                     whitelist_receivers: None,
                     eip1559_pricing: Some(true),
@@ -1265,10 +1285,7 @@ mod tests {
                 // Also acceptable - network doesn't exist in our mock config
             }
             Err(other) => {
-                panic!(
-                    "Expected DuplicateId or InvalidReference error, got: {:?}",
-                    other
-                );
+                panic!("Expected DuplicateId or InvalidReference error, got: {other:?}");
             }
             Ok(_) => {
                 panic!("Expected validation to fail but it succeeded");
@@ -1307,6 +1324,7 @@ mod tests {
     fn test_config_file_policy_serialization() {
         // Test that individual policy structs can be serialized/deserialized
         let evm_policy = ConfigFileRelayerEvmPolicy {
+            include_revert_data: None,
             gas_price_cap: Some(80000000000),
             whitelist_receivers: Some(vec!["0xabc".to_string()]),
             eip1559_pricing: Some(false),

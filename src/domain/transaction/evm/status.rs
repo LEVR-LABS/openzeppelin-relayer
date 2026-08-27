@@ -3,20 +3,27 @@
 //! or replace transactions with NOOPs, and updating transaction status in the repository.
 
 use alloy::network::ReceiptResponse;
+use alloy::primitives::{Address, TxKind};
+use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use chrono::{DateTime, Duration, Utc};
+use dashmap::{mapref::entry::Entry, DashMap};
 use eyre::Result;
+use serde_json::json;
+use std::sync::OnceLock;
+use std::time::{Duration as StdDuration, Instant};
 use tracing::{debug, error, info, warn};
 
+use super::super::common::is_active_nonce_status;
 use super::EvmRelayerTransaction;
 use super::{
-    ensure_status, get_age_since_status_change, has_enough_confirmations, is_noop,
-    is_too_early_to_resubmit, is_transaction_valid, make_noop, too_many_attempts,
-    too_many_noop_attempts,
+    ensure_status, evm_transaction::TX_NONCE_RECONCILE_TRIGGER, get_age_since_status_change,
+    has_enough_confirmations, is_noop, is_too_early_to_resubmit, is_transaction_valid, make_noop,
+    too_many_attempts, too_many_noop_attempts,
 };
 use crate::constants::{
     get_evm_min_age_for_hash_recovery, get_evm_pending_recovery_trigger_timeout,
     get_evm_prepare_timeout, get_evm_resend_timeout, ARBITRUM_TIME_TO_RESUBMIT,
-    EVM_MIN_HASHES_FOR_RECOVERY,
+    DEFAULT_EVM_INCLUDE_REVERT_DATA, EVM_MIN_HASHES_FOR_RECOVERY, MAX_GAP_SCAN_RANGE,
 };
 use crate::domain::transaction::common::{
     get_age_of_sent_at, is_final_state, is_pending_transaction,
@@ -26,15 +33,139 @@ use crate::models::{EvmNetwork, NetworkRepoModel, NetworkType};
 use crate::repositories::{NetworkRepository, RelayerRepository};
 use crate::{
     domain::transaction::evm::price_calculator::PriceCalculatorTrait,
-    jobs::JobProducerTrait,
+    jobs::{JobProducerTrait, StatusCheckContext},
     models::{
-        NetworkTransactionData, RelayerRepoModel, TransactionError, TransactionRepoModel,
-        TransactionStatus, TransactionUpdateRequest,
+        EvmTransactionData, NetworkTransactionData, RelayerRepoModel, TransactionError,
+        TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{Repository, TransactionCounterTrait, TransactionRepository},
     services::{provider::EvmProviderTrait, signer::Signer},
     utils::{get_resubmit_timeout_for_speed, get_resubmit_timeout_with_backoff},
 };
+
+/// The reason recorded on a failed EVM transaction when the on-chain revert payload cannot be
+/// recovered (or recovery is disabled). Kept byte-for-byte for consumers that match on it.
+const REVERT_REASON_GENERIC: &str = "Transaction reverted on-chain (receipt status: failed)";
+
+/// Upper bound (in characters) on the revert-data hex embedded in `status_reason`. Revert payloads
+/// are normally tiny, but they are RPC/contract-controlled, so we cap the recovered hex before it
+/// is persisted to avoid an oversized DB write or notification payload.
+const MAX_REVERT_DATA_HEX_LEN: usize = 4096;
+
+/// Caps an overlong revert-data hex string to [`MAX_REVERT_DATA_HEX_LEN`], appending a marker so
+/// consumers can tell the payload was clipped. The hex is ASCII, so slicing on a byte index is safe.
+fn truncate_revert_hex(hex: &str) -> String {
+    if hex.len() <= MAX_REVERT_DATA_HEX_LEN {
+        return hex.to_string();
+    }
+    format!("{}...(truncated)", &hex[..MAX_REVERT_DATA_HEX_LEN])
+}
+
+/// Reconstructs an `eth_call` request from persisted transaction data to reproduce the call as a
+/// state read. The fee fields (gas price / EIP-1559 caps) are carried through because contracts
+/// can branch on `tx.gasprice`, which would otherwise change the revert path versus the mined tx.
+fn build_revert_call_request(
+    evm_data: &EvmTransactionData,
+) -> Result<TransactionRequest, TransactionError> {
+    let from = evm_data.from.parse::<Address>().map_err(|e| {
+        TransactionError::UnexpectedError(format!("Invalid from address for revert recovery: {e}"))
+    })?;
+    let to = match evm_data.to.as_ref() {
+        Some(addr) => TxKind::Call(addr.parse::<Address>().map_err(|e| {
+            TransactionError::UnexpectedError(format!(
+                "Invalid to address for revert recovery: {e}"
+            ))
+        })?),
+        None => TxKind::Create,
+    };
+    let input = evm_data.data_to_bytes().map_err(|e| {
+        TransactionError::UnexpectedError(format!("Invalid input data for revert recovery: {e}"))
+    })?;
+
+    Ok(TransactionRequest {
+        from: Some(from),
+        to: Some(to),
+        value: Some(evm_data.value),
+        input: TransactionInput::from(input),
+        gas: evm_data.gas_limit,
+        gas_price: evm_data.gas_price,
+        max_fee_per_gas: evm_data.max_fee_per_gas,
+        max_priority_fee_per_gas: evm_data.max_priority_fee_per_gas,
+        ..Default::default()
+    })
+}
+
+/// Extracts the revert payload from a `callTracer` trace result. The top-level `output` field
+/// carries the revert bytes; an empty/`"0x"` value means no payload. The output is
+/// RPC-controlled, so it is validated as `0x`-prefixed hex before being accepted — this rejects
+/// malformed/non-ASCII payloads that would otherwise be recorded verbatim and could panic the
+/// byte-index slicing in [`truncate_revert_hex`].
+fn extract_trace_output(trace: &serde_json::Value) -> Option<String> {
+    trace
+        .get("output")
+        .and_then(|v| v.as_str())
+        .filter(|s| is_revert_hex(s))
+        .map(|s| s.to_string())
+}
+
+/// Returns `true` when `s` is `0x` followed by at least one ASCII hex digit and nothing else.
+fn is_revert_hex(s: &str) -> bool {
+    match s.strip_prefix("0x") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// Per-key TTL gate: `should_fire` returns true at most once per `ttl` per key.
+struct TtlDebounce {
+    entries: DashMap<String, Instant>,
+    ttl: StdDuration,
+}
+
+impl TtlDebounce {
+    fn new(ttl: StdDuration) -> Self {
+        Self {
+            entries: DashMap::new(),
+            ttl,
+        }
+    }
+
+    fn should_fire(&self, key: &str) -> bool {
+        // Entry holds the shard lock across check-and-set, so concurrent
+        // callers cannot both fire within the same TTL window.
+        match self.entries.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().elapsed() < self.ttl {
+                    false
+                } else {
+                    entry.insert(Instant::now());
+                    true
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
+                true
+            }
+        }
+    }
+
+    /// Releases the window for `key` so the next caller can fire immediately.
+    /// Used when the action gated by `should_fire` failed and should be retried.
+    fn clear(&self, key: &str) {
+        self.entries.remove(key);
+    }
+}
+
+/// Per-relayer debounce for nonce-health job *production* in `detect_nonce_gap_ahead`.
+///
+/// The distributed lock taken when the health job runs already dedupes concurrent
+/// *execution*, but with many transactions stuck on the same gapped relayer, every
+/// status-check cycle for every one of them would otherwise enqueue its own job.
+/// This bounds enqueue volume to at most one per relayer per TTL window.
+static NONCE_HEALTH_DEBOUNCE: OnceLock<TtlDebounce> = OnceLock::new();
+
+/// TTL for the `NONCE_HEALTH_DEBOUNCE` window.
+const NONCE_HEALTH_DEBOUNCE_TTL: StdDuration = StdDuration::from_secs(30);
 
 impl<P, RR, NR, TR, J, S, TCR, PC> EvmRelayerTransaction<P, RR, NR, TR, J, S, TCR, PC>
 where
@@ -106,12 +237,47 @@ where
                 last_block_number,
                 network.required_confirmations,
             ) {
-                debug!(tx_hash = %tx_hash, "transaction mined but not confirmed");
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    tx_hash = %tx_hash,
+                    "transaction mined but not confirmed"
+                );
                 return Ok(TransactionStatus::Mined);
+            }
+            // For a user-cancelled transaction, attribute the terminal status by what
+            // ACTUALLY mined. Cancellation replaces the tx with a self-send NOOP
+            // (to == from). If that NOOP is what confirmed, the transaction was truly
+            // cancelled. If the original mined instead (the cancellation lost the nonce
+            // race), it executed for real and must be reported Confirmed, not Canceled.
+            // We key off the mined receipt rather than the locally-stored network_data,
+            // which may still describe the NOOP even while the original hash is what
+            // confirmed (e.g. before the replacement has been broadcast).
+            if tx.is_canceled == Some(true) {
+                if receipt.to == Some(receipt.from) {
+                    debug!(
+                        tx_id = %tx.id,
+                        relayer_id = %tx.relayer_id,
+                        tx_hash = %tx_hash,
+                        "cancellation NOOP confirmed on-chain; marking transaction as Canceled"
+                    );
+                    return Ok(TransactionStatus::Canceled);
+                }
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    tx_hash = %tx_hash,
+                    "cancelled transaction's original mined before the NOOP could replace it; reporting Confirmed"
+                );
             }
             Ok(TransactionStatus::Confirmed)
         } else {
-            debug!(tx_hash = %tx_hash, "transaction not yet mined");
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                tx_hash = %tx_hash,
+                "transaction not yet mined"
+            );
 
             // FALLBACK: Try to find transaction by checking all historical hashes
             // Only do this for transactions that have multiple resubmission attempts
@@ -168,7 +334,12 @@ where
         };
 
         if age > Duration::milliseconds(timeout_with_backoff) {
-            info!("Transaction has been pending for too long, resubmitting");
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                age_ms = %age.num_milliseconds(),
+                "transaction has been pending for too long, resubmitting"
+            );
             return Ok(true);
         }
         Ok(false)
@@ -188,7 +359,7 @@ where
         tx: &TransactionRepoModel,
     ) -> Result<(bool, Option<String>), TransactionError> {
         if too_many_noop_attempts(tx) {
-            info!("Transaction has too many NOOP attempts already");
+            debug!("Transaction has too many NOOP attempts already");
             return Ok((false, None));
         }
 
@@ -215,13 +386,23 @@ where
         if network.is_rollup() && too_many_attempts(tx) {
             let reason =
                 "Rollup transaction has too many attempts. Replacing with NOOP.".to_string();
-            info!("{}", reason);
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                reason = %reason,
+                "replacing transaction with NOOP"
+            );
             return Ok((true, Some(reason)));
         }
 
         if !is_transaction_valid(&tx.created_at, &tx.valid_until) {
             let reason = "Transaction is expired. Replacing with NOOP.".to_string();
-            info!("{}", reason);
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                reason = %reason,
+                "replacing transaction with NOOP"
+            );
             return Ok((true, Some(reason)));
         }
 
@@ -238,7 +419,12 @@ where
                     "Transaction in Pending state for over {} minutes. Replacing with NOOP.",
                     get_evm_prepare_timeout().num_minutes()
                 );
-                info!("{}", reason);
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    reason = %reason,
+                    "replacing transaction with NOOP"
+                );
                 return Ok((true, Some(reason)));
             }
         }
@@ -270,9 +456,12 @@ where
         &self,
         tx: TransactionRepoModel,
         new_status: TransactionStatus,
+        status_reason: Option<String>,
     ) -> Result<TransactionRepoModel, TransactionError> {
         if tx.status != new_status {
-            return self.update_transaction_status(tx, new_status).await;
+            return self
+                .update_transaction_status(tx, new_status, status_reason)
+                .await;
         }
         Ok(tx)
     }
@@ -318,17 +507,144 @@ where
     }
 
     /// Handles transactions in the Submitted state.
+    ///
+    /// Before resubmitting, checks whether the transaction's nonce is ahead of
+    /// the on-chain nonce. If so, the tx can never mine because there's a gap
+    /// below it — schedules a nonce health job to fill the gap instead of
+    /// resubmitting (which would be futile).
     async fn handle_submitted_state(
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
         if self.should_resubmit(&tx).await? {
+            // Before resubmitting, check if there's a nonce gap blocking this tx.
+            // Only worth the RPC call when we're already going to resubmit (tx is stale).
+            if let Some(nonce_gap_detected) = self.detect_nonce_gap_ahead(&tx).await {
+                if nonce_gap_detected {
+                    // Tx can't mine — nonce gap below it. Trigger health job, skip resubmit.
+                    return self
+                        .update_transaction_status_if_needed(tx, TransactionStatus::Submitted, None)
+                        .await;
+                }
+            }
+
             let resubmitted_tx = self.handle_resubmission(tx).await?;
             return Ok(resubmitted_tx);
         }
 
-        self.update_transaction_status_if_needed(tx, TransactionStatus::Submitted)
+        self.update_transaction_status_if_needed(tx, TransactionStatus::Submitted, None)
             .await
+    }
+
+    /// Checks whether the tx is blocked by a nonce gap below it.
+    ///
+    /// 1. Fetches on-chain nonce (single RPC call).
+    /// 2. If `tx_nonce <= on_chain_nonce` — no gap, tx should be mineable.
+    /// 3. Otherwise scans `on_chain_nonce..tx_nonce` using the Redis nonce index
+    ///    to check if every slot has an active (Pending/Sent/Submitted/Mined) tx.
+    /// 4. If any slot is empty or has a terminal-status tx — that's a real gap.
+    ///    Schedules a nonce health job and returns `Some(true)`.
+    ///
+    /// Returns:
+    /// - `Some(true)` — gap confirmed, health job scheduled
+    /// - `Some(false)` — no gap (all slots filled or tx is next)
+    /// - `None` — couldn't determine (missing nonce, RPC/Redis error)
+    async fn detect_nonce_gap_ahead(&self, tx: &TransactionRepoModel) -> Option<bool> {
+        let evm_data = match tx.network_data.get_evm_transaction_data() {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+        let tx_nonce = match evm_data.nonce {
+            Some(n) => n,
+            None => return None,
+        };
+
+        let on_chain_nonce = match self
+            .provider()
+            .get_transaction_count(&self.relayer().address)
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                debug!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "nonce gap check: failed to get on-chain nonce, skipping"
+                );
+                return None;
+            }
+        };
+
+        // tx is the next expected nonce or already behind — no gap possible.
+        if tx_nonce <= on_chain_nonce {
+            return Some(false);
+        }
+
+        // Cap the scan to avoid an unbounded MGET if tx_nonce is very far ahead.
+        // If the gap is larger, we scan what we can — the health job's
+        // detect_nonce_gaps will use the nonce hint to extend its own scan.
+        let scan_to = std::cmp::min(tx_nonce, on_chain_nonce + MAX_GAP_SCAN_RANGE);
+
+        let occupancy = match self
+            .transaction_repository()
+            .get_nonce_occupancy(&tx.relayer_id, on_chain_nonce, scan_to)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                debug!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "nonce gap check: occupancy lookup failed, skipping"
+                );
+                return None;
+            }
+        };
+
+        let gap_nonces: Vec<u64> = occupancy
+            .into_iter()
+            .filter(|(_, status)| !status.as_ref().is_some_and(is_active_nonce_status))
+            .map(|(nonce, _)| nonce)
+            .collect();
+
+        if gap_nonces.is_empty() {
+            // All slots between on-chain and tx_nonce are actively filled — no gap.
+            return Some(false);
+        }
+
+        warn!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            tx_nonce = tx_nonce,
+            on_chain_nonce = on_chain_nonce,
+            gap_count = gap_nonces.len(),
+            gaps = ?gap_nonces,
+            "nonce gaps confirmed below tx, scheduling nonce health to fill"
+        );
+
+        // Debounce job *production* per relayer — detection/return value is unaffected.
+        let debounce =
+            NONCE_HEALTH_DEBOUNCE.get_or_init(|| TtlDebounce::new(NONCE_HEALTH_DEBOUNCE_TTL));
+        if debounce.should_fire(&tx.relayer_id) {
+            if let Err(e) = self.schedule_relayer_nonce_health_job(tx).await {
+                warn!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "failed to schedule nonce health job for nonce gap"
+                );
+                // A failed enqueue must not hold the window: no job was produced, so
+                // let the next detection on this relayer retry immediately.
+                debounce.clear(&tx.relayer_id);
+            }
+        } else {
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                "nonce health job production debounced for relayer"
+            );
+        }
+
+        Some(true)
     }
 
     /// Processes transaction resubmission logic
@@ -336,7 +652,12 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!("scheduling resubmit job for transaction");
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            status = ?tx.status,
+            "scheduling resubmit job for transaction"
+        );
 
         // Check if transaction gas limit exceeds block gas limit before resubmitting
         let (should_noop, reason) = self.should_noop(&tx).await?;
@@ -356,7 +677,12 @@ where
         tx: &TransactionRepoModel,
         reason: Option<String>,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!("preparing transaction NOOP before resubmission");
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            status = ?tx.status,
+            "preparing transaction NOOP before resubmission"
+        );
         let update = self.prepare_noop_update_request(tx, false, reason).await?;
         let updated_tx = self
             .transaction_repository()
@@ -367,9 +693,10 @@ where
         if let Err(e) = res {
             error!(
                 tx_id = %updated_tx.id,
+                relayer_id = %updated_tx.relayer_id,
                 status = ?updated_tx.status,
-                "sending transaction update notification failed for NOOP transaction: {:?}",
-                e
+                error = %e,
+                "sending transaction update notification failed for NOOP transaction"
             );
         }
         Ok(updated_tx)
@@ -386,6 +713,7 @@ where
             // instead of NOOP. This matches prepare_transaction behavior.
             debug!(
                 tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
                 reason = %reason.as_ref().unwrap_or(&"unknown".to_string()),
                 "marking pending transaction as Failed (nonce not assigned, no NOOP needed)"
             );
@@ -403,9 +731,10 @@ where
             if let Err(e) = res {
                 error!(
                     tx_id = %updated_tx.id,
+                    relayer_id = %updated_tx.relayer_id,
                     status = ?updated_tx.status,
-                    "sending transaction update notification failed: {:?}",
-                    e
+                    error = %e,
+                    "sending transaction update notification failed for Pending state NOOP"
                 );
             }
             return Ok(updated_tx);
@@ -416,6 +745,7 @@ where
         if age > get_evm_pending_recovery_trigger_timeout() {
             warn!(
                 tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
                 age_seconds = age.num_seconds(),
                 "transaction stuck in Pending, queuing prepare job"
             );
@@ -432,7 +762,7 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        self.update_transaction_status_if_needed(tx, TransactionStatus::Mined)
+        self.update_transaction_status_if_needed(tx, TransactionStatus::Mined, None)
             .await
     }
 
@@ -441,8 +771,288 @@ where
         &self,
         tx: TransactionRepoModel,
         status: TransactionStatus,
+        status_reason: Option<String>,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        self.update_transaction_status_if_needed(tx, status).await
+        self.update_transaction_status_if_needed(tx, status, status_reason)
+            .await
+    }
+
+    /// Marks a transaction as Failed with a given reason.
+    async fn mark_as_failed(
+        &self,
+        tx: TransactionRepoModel,
+        reason: String,
+    ) -> Result<TransactionRepoModel, TransactionError> {
+        warn!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            reason = %reason,
+            "force-failing transaction due to circuit breaker"
+        );
+
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Failed),
+            status_reason: Some(reason),
+            ..Default::default()
+        };
+
+        let updated_tx = self
+            .transaction_repository()
+            .partial_update(tx.id.clone(), update)
+            .await?;
+
+        // Send notification (best effort)
+        if let Err(e) = self.send_transaction_update_notification(&updated_tx).await {
+            error!(
+                tx_id = %updated_tx.id,
+                relayer_id = %updated_tx.relayer_id,
+                error = %e,
+                "failed to send notification for force-failed transaction"
+            );
+        }
+
+        Ok(updated_tx)
+    }
+
+    /// Reconciles a single transaction's nonce state against on-chain reality.
+    ///
+    /// This is the fast-path reconciliation triggered by nonce errors during submission.
+    /// It checks:
+    /// 1. Receipt for current tx hash — if found, defers to normal flow
+    /// 2. Historical hash recovery — if a different hash was mined, updates the tx
+    /// 3. On-chain nonce comparison — if the nonce was consumed externally, marks Failed
+    ///
+    /// Returns `Some(tx)` if recovery handled the transaction (caller should return early),
+    /// or `None` to continue with normal status flow.
+    async fn reconcile_tx_nonce_state(
+        &self,
+        tx: &TransactionRepoModel,
+    ) -> Result<Option<TransactionRepoModel>, TransactionError> {
+        let evm_data = tx.network_data.get_evm_transaction_data()?;
+
+        // Track whether any RPC call failed transiently. If so, we must NOT
+        // make the irreversible "consumed externally" determination in step 3,
+        // because the tx could be mined under a hash we failed to check.
+        let mut had_rpc_errors = false;
+
+        // 1. Check receipt for current tx hash — if found, normal flow handles it
+        if let Some(ref hash) = evm_data.hash {
+            match self.provider().get_transaction_receipt(hash).await {
+                Ok(Some(_)) => {
+                    debug!(
+                        tx_id = %tx.id,
+                        hash = %hash,
+                        "nonce recovery: receipt found for current hash, deferring to normal flow"
+                    );
+                    return Ok(None);
+                }
+                Ok(None) => {
+                    // No receipt for current hash — continue recovery
+                }
+                Err(e) => {
+                    warn!(
+                        tx_id = %tx.id,
+                        hash = %hash,
+                        error = %e,
+                        "nonce recovery: error checking receipt for current hash"
+                    );
+                    had_rpc_errors = true;
+                }
+            }
+        }
+
+        // 2. Try historical hash recovery (reuse existing method)
+        if tx.hashes.len() > 1 {
+            match self.try_recover_with_historical_hashes(tx, &evm_data).await {
+                Ok(Some(recovered_tx)) => {
+                    debug!(
+                        tx_id = %tx.id,
+                        "nonce recovery: recovered transaction via historical hash"
+                    );
+                    return Ok(Some(recovered_tx));
+                }
+                Ok(None) => {
+                    // No historical hash found — continue
+                }
+                Err(e) => {
+                    warn!(
+                        tx_id = %tx.id,
+                        error = %e,
+                        "nonce recovery: error during historical hash recovery"
+                    );
+                    had_rpc_errors = true;
+                }
+            }
+        }
+
+        // 3. Compare on-chain nonce to determine if nonce was consumed externally.
+        //    Only safe to make this determination if all hash checks succeeded.
+        //    If any RPC call failed, the tx might be mined under a hash we couldn't check.
+        if had_rpc_errors {
+            warn!(
+                tx_id = %tx.id,
+                "nonce recovery: skipping nonce comparison due to RPC errors during hash checks, deferring to normal flow"
+            );
+            return Ok(None);
+        }
+
+        let tx_nonce = match evm_data.nonce {
+            Some(n) => n,
+            None => {
+                // No nonce assigned — can't compare, defer to normal flow
+                return Ok(None);
+            }
+        };
+
+        let on_chain_nonce = self
+            .provider()
+            .get_transaction_count(&self.relayer().address)
+            .await
+            .map_err(|e| {
+                TransactionError::UnexpectedError(format!(
+                    "Failed to get on-chain nonce for recovery: {e}"
+                ))
+            })?;
+
+        if on_chain_nonce > tx_nonce {
+            // Nonce was consumed but no known hash found — consumed externally
+            let reason = format!(
+                "Nonce {tx_nonce} consumed externally (on-chain nonce: {on_chain_nonce}). \
+                 No matching transaction hash found on-chain."
+            );
+            warn!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                tx_nonce = tx_nonce,
+                on_chain_nonce = on_chain_nonce,
+                "nonce recovery: nonce consumed externally, marking as Failed"
+            );
+
+            let updated_tx = self
+                .update_transaction_status(tx.clone(), TransactionStatus::Failed, Some(reason))
+                .await?;
+
+            // External nonce consumption may have left the internal transaction counter
+            // behind the on-chain nonce, or created gaps. Schedule a nonce health job
+            // to sync the counter and fill any gaps with NOOPs. Best-effort — failure
+            // here doesn't block the recovery; the periodic health check will catch it.
+            if let Err(e) = self.schedule_relayer_nonce_health_job(tx).await {
+                warn!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "nonce recovery: failed to schedule nonce health after external consumption"
+                );
+            }
+
+            return Ok(Some(updated_tx));
+        }
+
+        // on_chain_nonce <= tx_nonce: nonce not yet consumed, defer to normal status flow
+        debug!(
+            tx_id = %tx.id,
+            tx_nonce = tx_nonce,
+            on_chain_nonce = on_chain_nonce,
+            "nonce recovery: on-chain nonce not past tx nonce, deferring to normal flow"
+        );
+        Ok(None)
+    }
+
+    /// Handles circuit breaker safely based on transaction status.
+    ///
+    /// This method implements the safe circuit breaker logic:
+    /// - **Pending/Sent**: Safe to mark as Failed (never broadcast to network)
+    /// - **Submitted**: Must trigger NOOP to clear nonce slot (regardless of expiry)
+    ///
+    /// For Submitted transactions, we always issue a NOOP because the nonce slot is
+    /// occupied and the original transaction could still execute. Simply marking as
+    /// Failed/Expired would leave the nonce blocked and risk the relayer stopping.
+    ///
+    /// Note: NOOP transactions are filtered out before entering this function.
+    async fn handle_circuit_breaker_safely(
+        &self,
+        tx: TransactionRepoModel,
+        ctx: &StatusCheckContext,
+    ) -> Result<TransactionRepoModel, TransactionError> {
+        let reason = format!(
+            "Transaction status monitoring failed after {} consecutive errors (total: {}). \
+             Last status: {:?}.",
+            ctx.consecutive_failures, ctx.total_failures, tx.status
+        );
+
+        match tx.status {
+            TransactionStatus::Pending => {
+                // Pending: no nonce assigned yet - safe to mark as Failed
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    "circuit breaker: Pending transaction (no nonce) - safe to mark as Failed"
+                );
+                self.mark_as_failed(tx, reason).await
+            }
+            TransactionStatus::Sent => {
+                // Sent: nonce assigned but never broadcast to network.
+                // If a nonce is assigned, we must issue a NOOP to clear the nonce slot
+                // rather than just marking as Failed (which would leak the nonce).
+                let has_nonce = tx
+                    .network_data
+                    .get_evm_transaction_data()
+                    .map(|d| d.nonce.is_some())
+                    .unwrap_or(false);
+
+                if has_nonce {
+                    warn!(
+                        tx_id = %tx.id,
+                        relayer_id = %tx.relayer_id,
+                        "circuit breaker: Sent transaction with nonce assigned - triggering NOOP to clear nonce slot"
+                    );
+                    let noop_reason = Some(format!(
+                        "{reason}. Replacing with NOOP to clear nonce slot (Sent state with assigned nonce)."
+                    ));
+                    let updated_tx = self.process_noop_transaction(&tx, noop_reason).await?;
+                    // Must use resubmit (not submit) — resubmit re-signs with new gas pricing,
+                    // producing fresh `raw` bytes for the NOOP. submit_transaction would
+                    // broadcast the stale `raw` bytes which still contain the original tx.
+                    self.send_transaction_resubmit_job(&updated_tx).await?;
+                    Ok(updated_tx)
+                } else {
+                    // Defensive: Sent without nonce shouldn't normally happen
+                    debug!(
+                        tx_id = %tx.id,
+                        relayer_id = %tx.relayer_id,
+                        "circuit breaker: Sent transaction without nonce - safe to mark as Failed"
+                    );
+                    self.mark_as_failed(tx, reason).await
+                }
+            }
+            TransactionStatus::Submitted => {
+                // Submitted transactions occupy a nonce slot and could still execute.
+                // Regardless of expiry status, we MUST issue a NOOP to:
+                // 1. Clear the nonce slot so subsequent transactions can proceed
+                // 2. Prevent the original transaction from executing later
+                // Note: NOOP transactions are filtered out before entering this function.
+                warn!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    "circuit breaker: Submitted transaction - triggering NOOP to safely clear nonce"
+                );
+                let noop_reason = Some(format!(
+                    "{reason}. Replacing with NOOP to clear nonce slot."
+                ));
+                let updated_tx = self.process_noop_transaction(&tx, noop_reason).await?;
+                self.send_transaction_resubmit_job(&updated_tx).await?;
+                Ok(updated_tx)
+            }
+            _ => {
+                // Final states shouldn't reach here, but handle gracefully
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    status = ?tx.status,
+                    "circuit breaker: unexpected status, returning transaction unchanged"
+                );
+                Ok(tx)
+            }
+        }
     }
 
     /// Inherent status-handling method.
@@ -452,13 +1062,91 @@ where
     pub async fn handle_status_impl(
         &self,
         tx: TransactionRepoModel,
+        context: Option<StatusCheckContext>,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!("checking transaction status {}", tx.id);
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            status = ?tx.status,
+            "checking transaction status"
+        );
 
         // 1. Early return if final state
         if is_final_state(&tx.status) {
-            debug!(status = ?tx.status, "transaction already in final state");
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                status = ?tx.status,
+                "transaction already in final state"
+            );
             return Ok(tx);
+        }
+
+        // 1.1. Check if circuit breaker should force finalization
+        // Skip circuit breaker for NOOP transactions - they're already safe (just clearing nonce)
+        // and should be handled by normal status logic which will eventually resolve them.
+        if let Some(ref ctx) = context {
+            let is_noop_tx = tx
+                .network_data
+                .get_evm_transaction_data()
+                .map(|data| is_noop(&data))
+                .unwrap_or(false);
+
+            if ctx.should_force_finalize() && !is_noop_tx {
+                warn!(
+                    tx_id = %tx.id,
+                    consecutive_failures = ctx.consecutive_failures,
+                    total_failures = ctx.total_failures,
+                    max_consecutive = ctx.max_consecutive_failures,
+                    status = ?tx.status,
+                    "circuit breaker triggered - handling safely based on transaction state"
+                );
+                return self.handle_circuit_breaker_safely(tx, ctx).await;
+            }
+
+            if ctx.should_force_finalize() && is_noop_tx {
+                debug!(
+                    tx_id = %tx.id,
+                    consecutive_failures = ctx.consecutive_failures,
+                    relayer_id = %tx.relayer_id,
+                    "circuit breaker would trigger but transaction is NOOP - continuing with normal status logic"
+                );
+            }
+        }
+
+        // 1.2. Check for nonce recovery hint in job metadata (one-shot signal from submission errors).
+        // This performs nonce reconciliation before normal status flow.
+        // The hint is in job_metadata, not the transaction — subsequent retries won't have it.
+        if let Some(ref ctx) = context {
+            if let Some(ref metadata) = ctx.job_metadata {
+                if let Some(hint) = metadata.get(TX_NONCE_RECONCILE_TRIGGER) {
+                    debug!(
+                        tx_id = %tx.id,
+                        hint = %hint,
+                        "nonce recovery hint detected - performing nonce reconciliation"
+                    );
+                    match self.reconcile_tx_nonce_state(&tx).await {
+                        Ok(Some(recovered_tx)) => {
+                            return Ok(recovered_tx);
+                        }
+                        Ok(None) => {
+                            // Recovery didn't resolve it — fall through to normal flow
+                            debug!(
+                                tx_id = %tx.id,
+                                "nonce recovery did not resolve transaction, continuing normal flow"
+                            );
+                        }
+                        Err(e) => {
+                            // Recovery failed — log and continue with normal flow
+                            warn!(
+                                tx_id = %tx.id,
+                                error = %e,
+                                "nonce recovery failed, falling through to normal status flow"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // 2. Check transaction status first
@@ -471,6 +1159,7 @@ where
             tx_id = %tx.id,
             previous_status = ?tx.status,
             new_status = ?status,
+            relayer_id = %tx.relayer_id,
             "transaction status check completed"
         );
 
@@ -482,6 +1171,7 @@ where
                 tx_id = %tx.id,
                 old_status = ?tx.status,
                 new_status = ?status,
+                relayer_id = %tx.relayer_id,
                 "status changed during check, reloading transaction from DB to ensure fresh data"
             );
             self.transaction_repository()
@@ -497,7 +1187,9 @@ where
         // For other states (Mined/Confirmed/Failed/etc), process immediately regardless of age.
         if is_too_early_to_resubmit(&tx)? && is_pending_transaction(&status) {
             // Update status if it changed, then return
-            return self.update_transaction_status_if_needed(tx, status).await;
+            return self
+                .update_transaction_status_if_needed(tx, status, None)
+                .await;
         }
 
         // 4. Handle based on status (including complex operations like resubmission)
@@ -506,10 +1198,160 @@ where
             TransactionStatus::Sent => self.handle_sent_state(tx).await,
             TransactionStatus::Submitted => self.handle_submitted_state(tx).await,
             TransactionStatus::Mined => self.handle_mined_state(tx).await,
+            TransactionStatus::Failed => {
+                // On the transition into Failed, attempt best-effort recovery of the on-chain
+                // revert payload; on re-polls of an already-Failed tx, leave the reason untouched.
+                let status_reason = if tx.status != TransactionStatus::Failed {
+                    Some(self.build_failed_status_reason(&tx).await)
+                } else {
+                    None
+                };
+                self.handle_final_state(tx, status, status_reason).await
+            }
             TransactionStatus::Confirmed
-            | TransactionStatus::Failed
             | TransactionStatus::Expired
-            | TransactionStatus::Canceled => self.handle_final_state(tx, status).await,
+            | TransactionStatus::Canceled => self.handle_final_state(tx, status, None).await,
+        }
+    }
+
+    /// Builds the `status_reason` recorded when a transaction transitions into Failed from a
+    /// failed on-chain receipt. When revert-data recovery is enabled (default) and a payload is
+    /// recovered, returns the enriched reason; otherwise returns the generic string.
+    async fn build_failed_status_reason(&self, tx: &TransactionRepoModel) -> String {
+        if !self
+            .relayer()
+            .policies
+            .get_evm_policy()
+            .include_revert_data
+            .unwrap_or(DEFAULT_EVM_INCLUDE_REVERT_DATA)
+        {
+            debug!(
+                tx_id = %tx.id,
+                "revert-data recovery disabled by policy; using generic reason"
+            );
+            return REVERT_REASON_GENERIC.to_string();
+        }
+
+        match self.recover_revert_data(tx).await {
+            Some(hex) => {
+                let hex = truncate_revert_hex(&hex);
+                format!("Transaction reverted on-chain (revert_data: {hex})")
+            }
+            None => REVERT_REASON_GENERIC.to_string(),
+        }
+    }
+
+    /// Best-effort recovery of the on-chain revert payload for a transaction entering Failed.
+    ///
+    /// Prefers `debug_traceTransaction` with `callTracer`; falls back to an `eth_call` re-executed
+    /// at the transaction's execution block. Every error is contained and mapped to `None`, so a
+    /// recovery failure can never propagate out of the status flow. Returns the `0x`-prefixed
+    /// revert hex when recovered.
+    async fn recover_revert_data(&self, tx: &TransactionRepoModel) -> Option<String> {
+        let evm_data = tx.network_data.get_evm_transaction_data().ok()?;
+        let hash = evm_data.hash.as_ref()?;
+
+        // Preferred: debug_traceTransaction. An Err means tracing is unavailable on this RPC,
+        // so fall through to eth_call.
+        match self
+            .provider()
+            .raw_request_dyn_best_effort(
+                "debug_traceTransaction",
+                json!([hash, {"tracer": "callTracer"}]),
+            )
+            .await
+        {
+            Ok(trace) => {
+                if let Some(hex) = extract_trace_output(&trace) {
+                    info!(
+                        tx_id = %tx.id,
+                        method = "trace",
+                        "recovered on-chain revert data"
+                    );
+                    return Some(hex);
+                }
+                debug!(
+                    tx_id = %tx.id,
+                    "trace returned no revert output; trying eth_call fallback"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "debug_traceTransaction unavailable; trying eth_call fallback"
+                );
+            }
+        }
+
+        // Fallback: re-fetch the receipt to learn the execution block, then re-run the
+        // transaction as an eth_call at that block.
+        let block_number = match self.provider().get_transaction_receipt(hash).await {
+            Ok(Some(receipt)) => match receipt.block_number {
+                Some(bn) => bn,
+                None => {
+                    debug!(
+                        tx_id = %tx.id,
+                        "receipt missing block number; skipping eth_call recovery"
+                    );
+                    return None;
+                }
+            },
+            Ok(None) => {
+                debug!(
+                    tx_id = %tx.id,
+                    "no receipt found; skipping eth_call recovery"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "failed to re-fetch receipt for revert recovery"
+                );
+                return None;
+            }
+        };
+
+        let request = match build_revert_call_request(&evm_data) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "failed to reconstruct eth_call request for revert recovery"
+                );
+                return None;
+            }
+        };
+
+        match self
+            .provider()
+            .get_call_revert_data(&request, block_number)
+            .await
+        {
+            Ok(Some(bytes)) if !bytes.is_empty() => {
+                let hex = format!("0x{}", hex::encode(&bytes));
+                info!(
+                    tx_id = %tx.id,
+                    method = "eth_call",
+                    "recovered on-chain revert data"
+                );
+                Some(hex)
+            }
+            Ok(_) => {
+                debug!(tx_id = %tx.id, "no revert data recovered");
+                None
+            }
+            Err(e) => {
+                warn!(
+                    tx_id = %tx.id,
+                    error = %e,
+                    "eth_call revert recovery failed"
+                );
+                None
+            }
         }
     }
 
@@ -518,12 +1360,20 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!(tx_id = %tx.id, "handling Sent state");
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            "handling Sent state"
+        );
 
         // Check if transaction should be replaced with NOOP (expired, too many attempts on rollup, etc.)
         let (should_noop, reason) = self.should_noop(&tx).await?;
         if should_noop {
-            debug!("preparing NOOP for sent transaction {}", tx.id);
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                "preparing NOOP for sent transaction"
+            );
             let update = self.prepare_noop_update_request(&tx, false, reason).await?;
             let updated_tx = self
                 .transaction_repository()
@@ -535,9 +1385,10 @@ where
             if let Err(e) = res {
                 error!(
                     tx_id = %updated_tx.id,
+                    relayer_id = %updated_tx.relayer_id,
                     status = ?updated_tx.status,
-                    "sending transaction update notification failed for Sent state NOOP: {:?}",
-                    e
+                    error = %e,
+                    "sending transaction update notification failed for Sent state NOOP"
                 );
             }
             return Ok(updated_tx);
@@ -548,8 +1399,17 @@ where
         let age_since_sent = get_age_since_status_change(&tx)?;
 
         if age_since_sent > get_evm_resend_timeout() {
+            // A nonce gap below this tx makes any resubmit futile; the detector schedules
+            // the nonce-health job itself. Only worth the RPC once the tx is already stale.
+            if let Some(true) = self.detect_nonce_gap_ahead(&tx).await {
+                return self
+                    .update_transaction_status_if_needed(tx, TransactionStatus::Sent, None)
+                    .await;
+            }
+
             warn!(
                 tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
                 age_seconds = age_since_sent.num_seconds(),
                 "transaction stuck in Sent, queuing resubmit job with repricing"
             );
@@ -558,7 +1418,7 @@ where
             self.send_transaction_resubmit_job(&tx).await?;
         }
 
-        self.update_transaction_status_if_needed(tx, TransactionStatus::Sent)
+        self.update_transaction_status_if_needed(tx, TransactionStatus::Sent, None)
             .await
     }
 
@@ -614,6 +1474,7 @@ where
     ) -> Result<Option<TransactionRepoModel>, TransactionError> {
         warn!(
             tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
             current_hash = ?evm_data.hash,
             total_hashes = %tx.hashes.len(),
             "attempting hash recovery - checking historical hashes"
@@ -628,6 +1489,7 @@ where
 
             debug!(
                 tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
                 hash = %historical_hash,
                 index = %idx,
                 "checking historical hash"
@@ -642,6 +1504,7 @@ where
                 Ok(Some(receipt)) => {
                     warn!(
                         tx_id = %tx.id,
+                        relayer_id = %tx.relayer_id,
                         mined_hash = %historical_hash,
                         wrong_hash = ?evm_data.hash,
                         block_number = ?receipt.block_number,
@@ -669,6 +1532,7 @@ where
                     // Network error, log but continue checking other hashes
                     warn!(
                         tx_id = %tx.id,
+                        relayer_id = %tx.relayer_id,
                         hash = %historical_hash,
                         error = %e,
                         "error checking historical hash, continuing to next"
@@ -681,6 +1545,7 @@ where
         // None of the historical hashes found on-chain
         debug!(
             tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
             "hash recovery completed - no historical hashes found on-chain"
         );
         Ok(None)
@@ -715,8 +1580,9 @@ where
         if let Err(e) = self.send_transaction_update_notification(&updated_tx).await {
             error!(
                 tx_id = %updated_tx.id,
+                relayer_id = %updated_tx.relayer_id,
                 error = %e,
-                "failed to send notification after hash recovery"
+                "failed to send notification for hash recovery"
             );
         }
 
@@ -887,6 +1753,7 @@ mod tests {
             hashes: Vec::new(),
             noop_count: None,
             is_canceled: Some(false),
+            metadata: None,
         }
     }
 
@@ -975,6 +1842,23 @@ mod tests {
         }
     }
 
+    /// The fixed `from` address used by [`make_mock_receipt`].
+    fn mock_receipt_from() -> Address {
+        Address::from([0x11; 20])
+    }
+
+    /// Like [`make_mock_receipt`] but sets the receipt's `to`, so cancellation
+    /// attribution (a NOOP is a self-send: `to == from`) can be exercised.
+    fn make_mock_receipt_with_to(
+        status: bool,
+        block_number: Option<u64>,
+        to: Option<Address>,
+    ) -> TransactionReceipt {
+        let mut receipt = make_mock_receipt(status, block_number);
+        receipt.inner.to = to;
+        receipt
+    }
+
     // Tests for `check_transaction_status`
     mod check_transaction_status_tests {
         use super::*;
@@ -1059,6 +1943,125 @@ mod tests {
                 .return_once(|| Box::pin(async { Ok(113) }));
 
             // Mock network repository to return a test network model
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            let status = evm_transaction.check_transaction_status(&tx).await.unwrap();
+            assert_eq!(status, TransactionStatus::Confirmed);
+        }
+
+        /// When a user-cancelled tx confirms and the mined tx is the NOOP (a self-send,
+        /// receipt.to == receipt.from), it must terminate as Canceled.
+        #[tokio::test]
+        async fn test_cancellation_noop_confirmed_becomes_canceled() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.is_canceled = Some(true);
+
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.hash = Some("0xNoopHash".to_string());
+            }
+
+            // Mined receipt for a NOOP: to == from.
+            let noop_to = Some(mock_receipt_from());
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(move |_| {
+                    Box::pin(async move {
+                        Ok(Some(make_mock_receipt_with_to(true, Some(100), noop_to)))
+                    })
+                });
+            mocks
+                .provider
+                .expect_get_block_number()
+                .return_once(|| Box::pin(async { Ok(113) }));
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            let status = evm_transaction.check_transaction_status(&tx).await.unwrap();
+            assert_eq!(status, TransactionStatus::Canceled);
+        }
+
+        /// If a user-cancelled tx confirms but the ORIGINAL transaction is what mined
+        /// (cancellation lost the nonce race: receipt.to != receipt.from), it actually
+        /// executed and must be reported Confirmed, not Canceled.
+        #[tokio::test]
+        async fn test_cancellation_original_mined_stays_confirmed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.is_canceled = Some(true);
+
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.hash = Some("0xOriginalHash".to_string());
+            }
+
+            // Mined receipt for the ORIGINAL transfer: to is a different address than from.
+            let original_to = Some(Address::from([0x22; 20]));
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(move |_| {
+                    Box::pin(async move {
+                        Ok(Some(make_mock_receipt_with_to(
+                            true,
+                            Some(100),
+                            original_to,
+                        )))
+                    })
+                });
+            mocks
+                .provider
+                .expect_get_block_number()
+                .return_once(|| Box::pin(async { Ok(113) }));
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            let status = evm_transaction.check_transaction_status(&tx).await.unwrap();
+            assert_eq!(status, TransactionStatus::Confirmed);
+        }
+
+        /// A confirmed self-send that is NOT a user cancellation (is_canceled=false) — e.g.
+        /// a nonce-clearing NOOP from timeout handling — must still confirm normally.
+        #[tokio::test]
+        async fn test_non_cancellation_noop_confirmed_stays_confirmed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            // is_canceled stays Some(false) from the helper.
+
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.hash = Some("0xNoopHash".to_string());
+            }
+
+            // Even with a self-send receipt (to == from), a non-cancelled tx stays Confirmed.
+            let noop_to = Some(mock_receipt_from());
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(move |_| {
+                    Box::pin(async move {
+                        Ok(Some(make_mock_receipt_with_to(true, Some(100), noop_to)))
+                    })
+                });
+            mocks
+                .provider
+                .expect_get_block_number()
+                .return_once(|| Box::pin(async { Ok(113) }));
             mocks
                 .network_repo
                 .expect_get_by_chain_id()
@@ -1457,7 +2460,7 @@ mod tests {
             // When new status is the same as current, update_transaction_status_if_needed
             // should simply return the original transaction.
             let updated_tx = evm_transaction
-                .update_transaction_status_if_needed(tx.clone(), TransactionStatus::Submitted)
+                .update_transaction_status_if_needed(tx.clone(), TransactionStatus::Submitted, None)
                 .await
                 .unwrap();
             assert_eq!(updated_tx.status, TransactionStatus::Submitted);
@@ -1488,11 +2491,48 @@ mod tests {
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
             let updated_tx = evm_transaction
-                .update_transaction_status_if_needed(tx.clone(), TransactionStatus::Mined)
+                .update_transaction_status_if_needed(tx.clone(), TransactionStatus::Mined, None)
                 .await
                 .unwrap();
 
             assert_eq!(updated_tx.status, TransactionStatus::Mined);
+        }
+
+        #[tokio::test]
+        async fn test_updates_with_status_reason() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let tx = make_test_transaction(TransactionStatus::Submitted);
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| {
+                    update.status == Some(TransactionStatus::Failed)
+                        && update.status_reason == Some("Transaction reverted on-chain".to_string())
+                })
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let updated_tx = evm_transaction
+                .update_transaction_status_if_needed(
+                    tx.clone(),
+                    TransactionStatus::Failed,
+                    Some("Transaction reverted on-chain".to_string()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(updated_tx.status, TransactionStatus::Failed);
+            assert_eq!(
+                updated_tx.status_reason.as_deref(),
+                Some("Transaction reverted on-chain")
+            );
         }
     }
 
@@ -1579,6 +2619,296 @@ mod tests {
 
             assert_eq!(result.status, TransactionStatus::Sent);
         }
+
+        /// An aged `Sent` tx with a confirmed nonce gap below it skips the resubmit
+        /// and schedules a nonce-health job instead (tx stays `Sent`).
+        #[tokio::test]
+        async fn issue818_t5_sent_state_nonce_gap_ahead_skips_resubmit() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc as StdArc;
+
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            // Aged Sent tx (60s > 25s resend timeout) with nonce 300. Unique relayer id
+            // so the nonce-health debounce doesn't interact with other tests.
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.relayer_id = "issue818-t5-relayer".to_string();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(60)).to_rfc3339());
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(300),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            // should_noop: network lookup + block gas limit (does not noop).
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+            // Chain nonce is far behind tx nonce (100 vs 300).
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(100) }));
+
+            // Scan is capped to on_chain_nonce + MAX_GAP_SCAN_RANGE (100 + 100 = 200).
+            // All slots empty -> confirmed gap.
+            mocks
+                .tx_repo
+                .expect_get_nonce_occupancy()
+                .withf(|relayer_id, from, to| {
+                    relayer_id == "issue818-t5-relayer" && *from == 100 && *to == 200
+                })
+                .returning(|_, from, to| Ok((from..to).map(|n| (n, None)).collect()));
+
+            // Nonce health job should be produced (unique relayer id, so not debounced).
+            let health_calls = StdArc::new(AtomicUsize::new(0));
+            let health_calls_clone = health_calls.clone();
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .withf(|job, _| {
+                    job.metadata.as_ref().map_or(false, |m| {
+                        m.get("health_check_action") == Some(&"nonce_health".to_string())
+                    })
+                })
+                .returning(move |_, _| {
+                    health_calls_clone.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                });
+
+            // Should NOT call produce_submit_transaction_job (resubmit skipped) —
+            // mockall will panic if an unexpected call is made.
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_sent_state(tx.clone()).await.unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Sent);
+            assert_eq!(
+                health_calls.load(Ordering::SeqCst),
+                1,
+                "nonce health job should be produced when the Sent-state gap check confirms a gap"
+            );
+        }
+
+        /// When `detect_nonce_gap_ahead` can't determine an answer (RPC error),
+        /// the Sent-state resubmit fails open and proceeds.
+        #[tokio::test]
+        async fn issue818_sent_state_gap_check_rpc_failure_proceeds_to_resubmit() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.relayer_id = "issue818-rpc-failure-relayer".to_string();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(60)).to_rfc3339());
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(300),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+            // RPC fails for the on-chain nonce lookup — gap check is skipped (None).
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| {
+                    Box::pin(async {
+                        Err(crate::services::provider::ProviderError::Other(
+                            "rpc timeout".to_string(),
+                        ))
+                    })
+                });
+
+            // Resubmission should still proceed (fail-open).
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_sent_state(tx.clone()).await.unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Sent);
+        }
+
+        /// With no nonce gap below the tx, the Sent-state resubmit proceeds normally.
+        #[tokio::test]
+        async fn issue818_sent_state_no_gap_proceeds_to_resubmit() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.relayer_id = "issue818-no-gap-relayer".to_string();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(60)).to_rfc3339());
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(270),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+            // tx_nonce=270, on_chain=269 -> single slot to check.
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(269) }));
+
+            // Nonce 269 has an active Submitted tx -> no gap.
+            mocks
+                .tx_repo
+                .expect_get_nonce_occupancy()
+                .returning(|_, from, to| {
+                    Ok((from..to)
+                        .map(|n| (n, Some(TransactionStatus::Submitted)))
+                        .collect())
+                });
+
+            // Should proceed to resubmit (no health job expected).
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_sent_state(tx.clone()).await.unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Sent);
+        }
+
+        /// A failed enqueue must not hold the debounce window: after `clear`, the
+        /// next caller fires immediately instead of waiting out the TTL.
+        #[test]
+        fn ttl_debounce_clear_releases_window() {
+            use crate::domain::transaction::evm::status::TtlDebounce;
+
+            let debounce = TtlDebounce::new(std::time::Duration::from_secs(3600));
+            assert!(debounce.should_fire("relayer-1"));
+            assert!(!debounce.should_fire("relayer-1"));
+
+            debounce.clear("relayer-1");
+            assert!(debounce.should_fire("relayer-1"));
+
+            // Clearing one key must not affect another relayer's window.
+            assert!(debounce.should_fire("relayer-2"));
+            debounce.clear("relayer-1");
+            assert!(!debounce.should_fire("relayer-2"));
+        }
+
+        /// A second gap detection for the same relayer within the debounce TTL skips
+        /// resubmission both times but enqueues only one nonce-health job.
+        #[tokio::test]
+        async fn issue818_nonce_health_debounce_produces_once_within_ttl() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc as StdArc;
+
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.relayer_id = "issue818-debounce-relayer".to_string();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(60)).to_rfc3339());
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(300),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(100) }));
+
+            mocks
+                .tx_repo
+                .expect_get_nonce_occupancy()
+                .returning(|_, from, to| Ok((from..to).map(|n| (n, None)).collect()));
+
+            let health_calls = StdArc::new(AtomicUsize::new(0));
+            let health_calls_clone = health_calls.clone();
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .returning(move |_, _| {
+                    health_calls_clone.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            // First detection for this relayer: produces the health job.
+            let result1 = evm_transaction.handle_sent_state(tx.clone()).await.unwrap();
+            assert_eq!(result1.status, TransactionStatus::Sent);
+
+            // Second detection immediately after, same relayer: debounced, no
+            // second job produced. Resubmit is still skipped in both cases —
+            // debounce only affects job *production*, not gap detection.
+            let result2 = evm_transaction.handle_sent_state(tx.clone()).await.unwrap();
+            assert_eq!(result2.status, TransactionStatus::Sent);
+
+            assert_eq!(
+                health_calls.load(Ordering::SeqCst),
+                1,
+                "nonce health job should be produced only once within the debounce TTL"
+            );
+        }
     }
 
     // Tests for `prepare_noop_update_request`
@@ -1657,6 +2987,12 @@ mod tests {
                 })
             });
 
+            // On-chain nonce <= tx nonce (no gap), so resubmission proceeds normally
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+
             // Expect the resubmit job to be produced
             mocks
                 .job_producer
@@ -1673,6 +3009,179 @@ mod tests {
             let updated_tx = evm_transaction.handle_submitted_state(tx).await.unwrap();
 
             // We remain in "Submitted" after scheduling the resubmit
+            assert_eq!(updated_tx.status, TransactionStatus::Submitted);
+        }
+
+        /// When tx_nonce > on_chain_nonce and nonce slots are empty, the tx is
+        /// blocked by a gap. Should schedule nonce health job and skip resubmission.
+        #[tokio::test]
+        async fn test_nonce_gap_detected_schedules_health_skips_resubmit() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(600)).to_rfc3339());
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(274),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            // Mock network repository for should_resubmit
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            // On-chain nonce is 269, tx nonce is 274
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(269) }));
+
+            // Batch nonce scan: nonces 269-273 are all empty → confirmed gap
+            mocks
+                .tx_repo
+                .expect_get_nonce_occupancy()
+                .withf(|relayer_id, from, to| {
+                    relayer_id == "test-relayer-id" && *from == 269 && *to == 274
+                })
+                .returning(|_, from, to| Ok((from..to).map(|n| (n, None)).collect()));
+
+            // Should schedule nonce health job
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .withf(|job, _| {
+                    job.metadata.as_ref().map_or(false, |m| {
+                        m.get("health_check_action") == Some(&"nonce_health".to_string())
+                    })
+                })
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            // Should NOT call produce_submit_transaction_job (resubmit skipped)
+            // mockall will panic if unexpected calls are made
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let updated_tx = evm_transaction.handle_submitted_state(tx).await.unwrap();
+
+            assert_eq!(updated_tx.status, TransactionStatus::Submitted);
+        }
+
+        /// When get_transaction_count fails, the gap check should be skipped
+        /// and resubmission should proceed normally.
+        #[tokio::test]
+        async fn test_nonce_gap_check_rpc_failure_proceeds_to_resubmit() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(600)).to_rfc3339());
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+            // RPC fails for nonce check — should be gracefully skipped
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| {
+                    Box::pin(async {
+                        Err(crate::services::provider::ProviderError::Other(
+                            "rpc timeout".to_string(),
+                        ))
+                    })
+                });
+
+            // Resubmission should still proceed
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let updated_tx = evm_transaction.handle_submitted_state(tx).await.unwrap();
+
+            assert_eq!(updated_tx.status, TransactionStatus::Submitted);
+        }
+
+        /// When all nonce slots between on-chain and tx_nonce are filled by active
+        /// transactions, no gap exists — resubmission proceeds normally.
+        #[tokio::test]
+        async fn test_no_gap_when_slots_filled_proceeds_to_resubmit() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(600)).to_rfc3339());
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(270),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+            // tx_nonce=270, on_chain=269 → 1 slot to check
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(269) }));
+
+            // Nonce 269 has an active Submitted tx → no gap
+            mocks
+                .tx_repo
+                .expect_get_nonce_occupancy()
+                .returning(|_, from, to| {
+                    Ok((from..to)
+                        .map(|n| (n, Some(TransactionStatus::Submitted)))
+                        .collect())
+                });
+
+            // Should proceed to resubmit (no health job expected)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let updated_tx = evm_transaction.handle_submitted_state(tx).await.unwrap();
+
             assert_eq!(updated_tx.status, TransactionStatus::Submitted);
         }
     }
@@ -1840,7 +3349,7 @@ mod tests {
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
             let result = evm_transaction
-                .handle_final_state(tx.clone(), TransactionStatus::Confirmed)
+                .handle_final_state(tx.clone(), TransactionStatus::Confirmed, None)
                 .await
                 .unwrap();
             assert_eq!(result.status, TransactionStatus::Confirmed);
@@ -1852,22 +3361,25 @@ mod tests {
             let relayer = create_test_relayer();
             let tx = make_test_transaction(TransactionStatus::Submitted);
 
-            // Expect partial_update to update status to Failed.
+            // Expect partial_update to update status to Failed with status_reason.
             mocks
                 .tx_repo
                 .expect_partial_update()
                 .returning(|_, update| {
                     let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
                     updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
                     Ok(updated_tx)
                 });
 
+            let reason = "Transaction reverted on-chain (receipt status: failed)".to_string();
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
             let result = evm_transaction
-                .handle_final_state(tx.clone(), TransactionStatus::Failed)
+                .handle_final_state(tx.clone(), TransactionStatus::Failed, Some(reason.clone()))
                 .await
                 .unwrap();
             assert_eq!(result.status, TransactionStatus::Failed);
+            assert_eq!(result.status_reason.as_deref(), Some(reason.as_str()));
         }
 
         #[tokio::test]
@@ -1888,7 +3400,7 @@ mod tests {
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
             let result = evm_transaction
-                .handle_final_state(tx.clone(), TransactionStatus::Expired)
+                .handle_final_state(tx.clone(), TransactionStatus::Expired, None)
                 .await
                 .unwrap();
             assert_eq!(result.status, TransactionStatus::Expired);
@@ -1935,7 +3447,7 @@ mod tests {
                 });
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
-            let result = evm_transaction.handle_status_impl(tx).await.unwrap();
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
             assert_eq!(result.status, TransactionStatus::Submitted);
         }
 
@@ -1986,7 +3498,7 @@ mod tests {
                 });
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
-            let result = evm_transaction.handle_status_impl(tx).await.unwrap();
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
             assert_eq!(result.status, TransactionStatus::Mined);
         }
 
@@ -2009,7 +3521,7 @@ mod tests {
                 });
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
-            let result = evm_transaction.handle_status_impl(tx).await.unwrap();
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
             assert_eq!(result.status, TransactionStatus::Confirmed);
         }
 
@@ -2030,8 +3542,77 @@ mod tests {
                 });
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
-            let result = evm_transaction.handle_status_impl(tx).await.unwrap();
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
             assert_eq!(result.status, TransactionStatus::Failed);
+        }
+
+        /// Verifies that a Submitted transaction with a failed on-chain receipt
+        /// transitions to Failed status with a descriptive status_reason.
+        #[tokio::test]
+        async fn test_impl_submitted_to_failed_sets_status_reason() {
+            let mut mocks = default_test_mocks();
+            let mut relayer = create_test_relayer();
+            // Opt in to revert-data recovery so the transition-to-Failed path exercises it.
+            relayer.policies = RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+                include_revert_data: Some(true),
+                ..Default::default()
+            });
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.hash = Some("0xFakeHash".to_string());
+            }
+
+            // Simulate a receipt with status=false (reverted on-chain).
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(Some(make_mock_receipt(false, Some(100)))) }));
+
+            // Revert-data recovery runs on the transition to Failed. The trace path returns no
+            // usable output here, and the placeholder tx data can't be reconstructed into an
+            // eth_call, so recovery yields the legacy generic reason.
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .returning(|_, _| Box::pin(async { Ok(serde_json::json!({})) }));
+
+            // Mock get_by_id for the DB reload after status change.
+            let tx_clone = tx.clone();
+            mocks.tx_repo.expect_get_by_id().returning(move |_| {
+                let mut reloaded = tx_clone.clone();
+                reloaded.status = TransactionStatus::Submitted;
+                Ok(reloaded)
+            });
+
+            // Expect partial_update with status=Failed and a status_reason.
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| {
+                    update.status == Some(TransactionStatus::Failed)
+                        && update.status_reason.is_some()
+                })
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(result.status_reason.is_some());
+            assert!(
+                result
+                    .status_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("reverted on-chain"),
+                "Expected on-chain revert reason, got: {:?}",
+                result.status_reason
+            );
         }
 
         #[tokio::test]
@@ -2051,8 +3632,674 @@ mod tests {
                 });
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
-            let result = evm_transaction.handle_status_impl(tx).await.unwrap();
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
             assert_eq!(result.status, TransactionStatus::Expired);
+        }
+    }
+
+    // Tests for on-chain revert-data recovery on the transition into Failed.
+    mod revert_data_recovery_tests {
+        use super::super::{extract_trace_output, truncate_revert_hex, MAX_REVERT_DATA_HEX_LEN};
+        use super::*;
+        use crate::services::provider::ProviderError;
+        use alloy::primitives::Bytes;
+
+        const LEGACY_REASON: &str = "Transaction reverted on-chain (receipt status: failed)";
+
+        // Trace output is RPC-controlled: only well-formed `0x`-prefixed hex is accepted. This
+        // rejects malformed/non-ASCII payloads that would otherwise be recorded verbatim and
+        // could panic the byte-index slicing in `truncate_revert_hex`.
+        #[test]
+        fn test_extract_trace_output_accepts_only_hex() {
+            let hex = |out: &str| extract_trace_output(&serde_json::json!({ "output": out }));
+            assert_eq!(hex("0xdeadbeef"), Some("0xdeadbeef".to_string()));
+            assert_eq!(hex("0x"), None); // no payload
+            assert_eq!(hex("0xZZZZ"), None); // non-hex digits
+            assert_eq!(hex("0x日本語"), None); // non-ASCII
+            assert_eq!(hex("deadbeef"), None); // missing 0x prefix
+            assert_eq!(extract_trace_output(&serde_json::json!({})), None); // missing field
+        }
+
+        // A very long (but valid-hex) payload truncates on a byte boundary without panicking.
+        #[test]
+        fn test_truncate_revert_hex_bounds_long_payload() {
+            let long = format!("0x{}", "ab".repeat(MAX_REVERT_DATA_HEX_LEN));
+            let truncated = truncate_revert_hex(&long);
+            assert!(truncated.ends_with("...(truncated)"));
+            assert!(truncated.starts_with("0xabab"));
+        }
+
+        /// A Submitted tx (aged past the resubmit grace) with valid EVM fields and a hash,
+        /// poised to transition to Failed from a failed receipt.
+        fn failing_submitted_tx() -> TransactionRepoModel {
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.from = "0x0000000000000000000000000000000000000001".to_string();
+                evm_data.to = Some("0x0000000000000000000000000000000000000002".to_string());
+                evm_data.data = Some("0xabcdef".to_string());
+                evm_data.hash = Some("0xFakeHash".to_string());
+            }
+            tx
+        }
+
+        /// Receipt with status=false (reverted) at block 100. Reused for the status check and
+        /// the recovery re-fetch.
+        fn expect_failed_receipt(mocks: &mut TestMocks) {
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(Some(make_mock_receipt(false, Some(100)))) }));
+        }
+
+        /// DB reload after the status change, plus a partial_update that captures the
+        /// status_reason onto the returned transaction so assertions can inspect it.
+        fn expect_reload_and_capture(mocks: &mut TestMocks) {
+            mocks.tx_repo.expect_get_by_id().returning(|_| {
+                let mut reloaded = failing_submitted_tx();
+                reloaded.status = TransactionStatus::Submitted;
+                Ok(reloaded)
+            });
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+        }
+
+        // eth_call surfaces revert data -> enriched status_reason.
+        #[tokio::test]
+        async fn test_eth_call_revert_data_enriches_status_reason() {
+            let mut mocks = default_test_mocks();
+            let relayer = relayer_with_revert_policy(Some(true));
+            let tx = failing_submitted_tx();
+
+            expect_failed_receipt(&mut mocks);
+            // Trace path yields no output -> fall back to eth_call.
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .returning(|_, _| Box::pin(async { Ok(serde_json::json!({})) }));
+            mocks
+                .provider
+                .expect_get_call_revert_data()
+                .returning(|_, _| {
+                    Box::pin(async { Ok(Some(Bytes::from(hex::decode("5592f1b2").unwrap()))) })
+                });
+            expect_reload_and_capture(&mut mocks);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            let reason = result.status_reason.unwrap();
+            assert!(
+                reason.contains("revert_data: 0x5592f1b2"),
+                "expected enriched revert_data, got: {reason}"
+            );
+        }
+
+        // No revert data recovered -> generic reason, byte-for-byte.
+        #[tokio::test]
+        async fn test_no_revert_data_uses_legacy_reason() {
+            let mut mocks = default_test_mocks();
+            let relayer = relayer_with_revert_policy(Some(true));
+            let tx = failing_submitted_tx();
+
+            expect_failed_receipt(&mut mocks);
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .returning(|_, _| Box::pin(async { Ok(serde_json::json!({})) }));
+            mocks
+                .provider
+                .expect_get_call_revert_data()
+                .returning(|_, _| Box::pin(async { Ok(None) }));
+            expect_reload_and_capture(&mut mocks);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert_eq!(result.status_reason.unwrap(), LEGACY_REASON);
+        }
+
+        // Tx already Failed -> no recovery RPC, reason not rewritten.
+        #[tokio::test]
+        async fn test_already_failed_skips_recovery() {
+            // No provider expectations set: any recovery RPC (trace/eth_call/receipt) would panic.
+            let mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let tx = make_test_transaction(TransactionStatus::Failed);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(
+                result.status_reason.is_none(),
+                "status_reason should not be rewritten on re-poll, got: {:?}",
+                result.status_reason
+            );
+        }
+
+        // Trace output is used and eth_call is NOT invoked.
+        #[tokio::test]
+        async fn test_trace_output_used_without_eth_call() {
+            let mut mocks = default_test_mocks();
+            let relayer = relayer_with_revert_policy(Some(true));
+            let tx = failing_submitted_tx();
+
+            expect_failed_receipt(&mut mocks);
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .returning(|_, _| {
+                    Box::pin(async { Ok(serde_json::json!({"output": "0xdeadbeef"})) })
+                });
+            // eth_call fallback must never run when the trace path produced a payload.
+            mocks.provider.expect_get_call_revert_data().never();
+            expect_reload_and_capture(&mut mocks);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(result
+                .status_reason
+                .unwrap()
+                .contains("revert_data: 0xdeadbeef"));
+        }
+
+        // Trace unavailable -> eth_call fallback produces the payload.
+        #[tokio::test]
+        async fn test_trace_unavailable_falls_back_to_eth_call() {
+            let mut mocks = default_test_mocks();
+            let relayer = relayer_with_revert_policy(Some(true));
+            let tx = failing_submitted_tx();
+
+            expect_failed_receipt(&mut mocks);
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .returning(|_, _| {
+                    Box::pin(async {
+                        Err(ProviderError::Other("method not supported".to_string()))
+                    })
+                });
+            mocks
+                .provider
+                .expect_get_call_revert_data()
+                // The reconstructed call must carry the persisted fee context (legacy gas_price
+                // here) so contracts that branch on tx.gasprice revert as they did on-chain.
+                .withf(|req, _block| req.gas_price == Some(20000000000))
+                .returning(|_, _| {
+                    Box::pin(async { Ok(Some(Bytes::from(hex::decode("08c379a0").unwrap()))) })
+                });
+            expect_reload_and_capture(&mut mocks);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(result
+                .status_reason
+                .unwrap()
+                .contains("revert_data: 0x08c379a0"));
+        }
+
+        // Both trace and eth_call fail/empty -> generic reason, status still Failed, no error.
+        #[tokio::test]
+        async fn test_both_paths_fail_uses_legacy_reason() {
+            let mut mocks = default_test_mocks();
+            let relayer = relayer_with_revert_policy(Some(true));
+            let tx = failing_submitted_tx();
+
+            expect_failed_receipt(&mut mocks);
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .returning(|_, _| {
+                    Box::pin(async { Err(ProviderError::Other("trace down".to_string())) })
+                });
+            mocks
+                .provider
+                .expect_get_call_revert_data()
+                .returning(|_, _| {
+                    Box::pin(async { Err(ProviderError::Other("eth_call down".to_string())) })
+                });
+            expect_reload_and_capture(&mut mocks);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert_eq!(result.status_reason.unwrap(), LEGACY_REASON);
+        }
+
+        /// Builds a relayer whose EVM policy sets `include_revert_data` to the given value.
+        fn relayer_with_revert_policy(include: Option<bool>) -> RelayerRepoModel {
+            let mut relayer = create_test_relayer();
+            relayer.policies = RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+                include_revert_data: include,
+                ..Default::default()
+            });
+            relayer
+        }
+
+        // None (the default) and Some(false) -> zero recovery RPCs, generic reason.
+        #[tokio::test]
+        async fn test_recovery_disabled_issues_no_recovery_rpcs() {
+            for include in [None, Some(false)] {
+                let mut mocks = default_test_mocks();
+                let relayer = relayer_with_revert_policy(include);
+                let tx = failing_submitted_tx();
+
+                // Only the status-check receipt fetch is allowed; recovery must issue none of these.
+                expect_failed_receipt(&mut mocks);
+                mocks.provider.expect_raw_request_dyn_best_effort().never();
+                mocks.provider.expect_get_call_revert_data().never();
+                expect_reload_and_capture(&mut mocks);
+
+                let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+                let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+                assert_eq!(result.status, TransactionStatus::Failed);
+                assert_eq!(
+                    result.status_reason.unwrap(),
+                    LEGACY_REASON,
+                    "recovery must not run for include_revert_data = {include:?}"
+                );
+            }
+        }
+
+        // Only an explicit opt-in (Some(true)) attempts recovery; None is off by default.
+        #[tokio::test]
+        async fn test_recovery_attempted_when_enabled() {
+            let mut mocks = default_test_mocks();
+            let relayer = relayer_with_revert_policy(Some(true));
+            let tx = failing_submitted_tx();
+
+            expect_failed_receipt(&mut mocks);
+            // Asserting the trace RPC is issued exactly once proves recovery was attempted.
+            mocks
+                .provider
+                .expect_raw_request_dyn_best_effort()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(serde_json::json!({"output": "0xfeed"})) }));
+            expect_reload_and_capture(&mut mocks);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(
+                result
+                    .status_reason
+                    .unwrap()
+                    .contains("revert_data: 0xfeed"),
+                "recovery should run for include_revert_data = Some(true)"
+            );
+        }
+    }
+
+    // Tests for circuit breaker functionality
+    mod circuit_breaker_tests {
+        use super::*;
+        use crate::jobs::StatusCheckContext;
+
+        /// Helper to create a context that should trigger the circuit breaker
+        fn create_triggered_context() -> StatusCheckContext {
+            StatusCheckContext::new(
+                30, // consecutive_failures: exceeds EVM threshold of 25
+                50, // total_failures
+                60, // total_retries
+                25, // max_consecutive_failures (EVM default)
+                75, // max_total_failures (EVM default)
+                NetworkType::Evm,
+            )
+        }
+
+        /// Helper to create a context that should NOT trigger the circuit breaker
+        fn create_safe_context() -> StatusCheckContext {
+            StatusCheckContext::new(
+                5,  // consecutive_failures: below threshold
+                10, // total_failures
+                15, // total_retries
+                25, // max_consecutive_failures
+                75, // max_total_failures
+                NetworkType::Evm,
+            )
+        }
+
+        /// Helper to create a context that triggers via total failures (safety net)
+        fn create_total_triggered_context() -> StatusCheckContext {
+            StatusCheckContext::new(
+                5,   // consecutive_failures: below threshold
+                80,  // total_failures: exceeds EVM threshold of 75
+                100, // total_retries
+                25,  // max_consecutive_failures
+                75,  // max_total_failures
+                NetworkType::Evm,
+            )
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_pending_marks_as_failed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let tx = make_test_transaction(TransactionStatus::Pending);
+
+            // Expect partial_update to be called with Failed status
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Pending);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            // Mock notification (best effort, may or may not be called)
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let ctx = create_triggered_context();
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(result.status_reason.is_some());
+            assert!(result.status_reason.unwrap().contains("consecutive errors"));
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_sent_marks_as_failed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let tx = make_test_transaction(TransactionStatus::Sent);
+
+            // Expect partial_update to be called with Failed status
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Sent);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            // Mock notification
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let ctx = create_triggered_context();
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Failed);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_submitted_triggers_noop() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(120)).to_rfc3339());
+
+            // Mock network repository for NOOP processing
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            // Expect partial_update to be called with NOOP indicator
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    updated_tx.noop_count = update.noop_count;
+                    Ok(updated_tx)
+                });
+
+            // Mock resubmit job (NOOP triggers resubmit)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let ctx = create_triggered_context();
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            // NOOP processing should succeed
+            assert!(result.noop_count.is_some());
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_noop_tx_excluded() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            // Create a NOOP transaction (to: self, value: 0, data: "0x")
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(120)).to_rfc3339());
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.to = Some(evm_data.from.clone()); // to == from (NOOP indicator)
+                evm_data.value = U256::from(0);
+                evm_data.data = Some("0x".to_string());
+                evm_data.hash = Some("0xFakeHash".to_string());
+            }
+
+            // NOOP transactions should NOT trigger circuit breaker
+            // Instead, they should go through normal status checking
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            // Mock resubmit job (may be triggered by normal status flow for stuck transactions)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let ctx = create_triggered_context();
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            // NOOP tx should continue normal processing, not be force-failed
+            assert_eq!(result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_total_failures_triggers() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let tx = make_test_transaction(TransactionStatus::Pending);
+
+            // Expect partial_update to be called with Failed status
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Pending);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            // Use context that triggers via total failures (safety net)
+            let ctx = create_total_triggered_context();
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(result.status_reason.is_some());
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_below_threshold_continues_normally() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(120)).to_rfc3339());
+
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.hash = Some("0xFakeHash".to_string());
+            }
+
+            // Below threshold, should continue with normal status checking
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let ctx = create_safe_context();
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            // Should continue normal processing, not trigger circuit breaker
+            assert_eq!(result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_no_context_continues_normally() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(120)).to_rfc3339());
+
+            if let NetworkTransactionData::Evm(ref mut evm_data) = tx.network_data {
+                evm_data.hash = Some("0xFakeHash".to_string());
+            }
+
+            // No context means no circuit breaker, should continue normally
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = make_test_transaction(TransactionStatus::Submitted);
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            // Pass None for context
+            let result = evm_transaction.handle_status_impl(tx, None).await.unwrap();
+
+            // Should continue normal processing
+            assert_eq!(result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_final_state_early_return() {
+            let mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            // Transaction is already in final state
+            let tx = make_test_transaction(TransactionStatus::Confirmed);
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let ctx = create_triggered_context();
+
+            // Even with triggered context, final states should return early
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(ctx))
+                .await
+                .unwrap();
+
+            assert_eq!(result.status, TransactionStatus::Confirmed);
         }
     }
 
@@ -2427,6 +4674,374 @@ mod tests {
                 TransactionStatus::Confirmed,
                 "Should return final state without querying blockchain"
             );
+        }
+    }
+
+    mod nonce_recovery_tests {
+        use super::*;
+        use crate::domain::transaction::evm::evm_transaction::TX_NONCE_RECONCILE_TRIGGER;
+        use crate::jobs::StatusCheckContext;
+
+        /// Test reconcile_tx_nonce_state with on_chain_nonce > tx_nonce → marks Failed
+        #[tokio::test]
+        async fn test_nonce_recovery_nonce_consumed_externally() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.sent_at = Some(Utc::now().to_rfc3339());
+
+            // No receipt for current hash
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+
+            // On-chain nonce is 10, tx nonce is 5 → consumed externally
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+
+            // Should update to Failed status
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| {
+                    update.status == Some(TransactionStatus::Failed)
+                        && update
+                            .status_reason
+                            .as_ref()
+                            .map(|r| r.contains("consumed externally"))
+                            .unwrap_or(false)
+                })
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    updated_tx.status = update.status.unwrap();
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            // Should schedule nonce health job after detecting external consumption
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .withf(|job, scheduled_on| {
+                    job.relayer_id == "test-relayer-id"
+                        && job.metadata.as_ref().map_or(false, |m| {
+                            m.get("health_check_action") == Some(&"nonce_health".to_string())
+                        })
+                        && scheduled_on.is_none()
+                })
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.is_ok());
+            let recovered = result.unwrap();
+            assert!(recovered.is_some(), "Expected Some(tx) for consumed nonce");
+            assert_eq!(recovered.unwrap().status, TransactionStatus::Failed);
+        }
+
+        /// Test reconcile_tx_nonce_state with on_chain_nonce <= tx_nonce → returns None
+        #[tokio::test]
+        async fn test_nonce_recovery_nonce_not_consumed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            // No receipt for current hash
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+
+            // On-chain nonce is 5, same as tx nonce → not consumed yet
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(5) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.is_ok());
+            assert!(
+                result.unwrap().is_none(),
+                "Expected None when nonce not consumed"
+            );
+        }
+
+        /// Test reconcile_tx_nonce_state with receipt found → returns None (defer to normal flow)
+        #[tokio::test]
+        async fn test_nonce_recovery_receipt_found() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            // Receipt exists for current hash — defer to normal flow
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| {
+                    let receipt = make_mock_receipt(true, Some(100));
+                    Box::pin(async move { Ok(Some(receipt)) })
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.is_ok());
+            assert!(
+                result.unwrap().is_none(),
+                "Expected None when receipt found — defer to normal flow"
+            );
+        }
+
+        /// Test reconcile_tx_nonce_state with RPC errors during receipt check → returns None
+        /// Must NOT proceed to force-fail via nonce comparison when hash checks were incomplete
+        #[tokio::test]
+        async fn test_nonce_recovery_rpc_error_prevents_force_fail() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+
+            // Receipt check FAILS with RPC error
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| {
+                    Box::pin(async {
+                        Err(crate::services::provider::ProviderError::Other(
+                            "RPC timeout".to_string(),
+                        ))
+                    })
+                });
+
+            // get_transaction_count should NOT be called — we bail before reaching it
+            // (no expectation set = will panic if called)
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.is_ok());
+            assert!(
+                result.unwrap().is_none(),
+                "Expected None when RPC errors occurred — must not force-fail on incomplete data"
+            );
+        }
+
+        /// Test handle_status_impl with nonce_error_hint metadata triggers recovery
+        #[tokio::test]
+        async fn test_handle_status_impl_nonce_recovery_hint() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.sent_at = Some(Utc::now().to_rfc3339());
+
+            // No receipt for current hash
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+
+            // On-chain nonce > tx nonce → consumed externally
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+
+            // Should update to Failed
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    if let Some(status) = update.status {
+                        updated_tx.status = status;
+                    }
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            // Should schedule nonce health job after detecting external consumption
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            // Build context with nonce_error_hint metadata
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                TX_NONCE_RECONCILE_TRIGGER.to_string(),
+                "NonceTooLow".to_string(),
+            );
+            let context = StatusCheckContext::default().with_job_metadata(Some(metadata));
+
+            let result = evm_transaction.handle_status_impl(tx, Some(context)).await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().status, TransactionStatus::Failed);
+        }
+    }
+
+    mod circuit_breaker_sent_state_tests {
+        use super::*;
+        use crate::jobs::StatusCheckContext;
+
+        /// Test circuit breaker on Sent tx with nonce → issues NOOP + submit job
+        #[tokio::test]
+        async fn test_circuit_breaker_sent_with_nonce_issues_noop() {
+            let mut mocks = default_test_mocks_with_network();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.sent_at = Some(Utc::now().to_rfc3339());
+
+            // process_noop_transaction calls prepare_noop_update_request → partial_update
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    if let Some(status) = update.status {
+                        updated_tx.status = status;
+                    }
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            // Should produce a submit job (for the NOOP)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            // Circuit breaker context that should trigger
+            let ctx = StatusCheckContext::new(100, 200, 250, 15, 45, NetworkType::Evm);
+
+            let result = evm_transaction
+                .handle_circuit_breaker_safely(tx, &ctx)
+                .await;
+            assert!(result.is_ok());
+        }
+
+        /// Test circuit breaker on Sent tx without nonce → marks Failed
+        #[tokio::test]
+        async fn test_circuit_breaker_sent_without_nonce_marks_failed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            // No nonce assigned
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: None,
+                hash: None,
+                raw: None,
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.sent_at = Some(Utc::now().to_rfc3339());
+
+            // Should mark as Failed
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    updated_tx.status = update.status.unwrap();
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            let ctx = StatusCheckContext::new(100, 200, 250, 15, 45, NetworkType::Evm);
+
+            let result = evm_transaction
+                .handle_circuit_breaker_safely(tx, &ctx)
+                .await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().status, TransactionStatus::Failed);
+        }
+
+        /// Test circuit breaker on Pending tx → marks Failed (unchanged behavior)
+        #[tokio::test]
+        async fn test_circuit_breaker_pending_marks_failed() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let tx = make_test_transaction(TransactionStatus::Pending);
+
+            // Should mark as Failed
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    updated_tx.status = update.status.unwrap();
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+
+            let ctx = StatusCheckContext::new(100, 200, 250, 15, 45, NetworkType::Evm);
+
+            let result = evm_transaction
+                .handle_circuit_breaker_safely(tx, &ctx)
+                .await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().status, TransactionStatus::Failed);
         }
     }
 }

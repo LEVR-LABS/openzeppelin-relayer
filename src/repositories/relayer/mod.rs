@@ -31,9 +31,10 @@ use crate::{
         DisabledReason, PaginationQuery, RelayerNetworkPolicy, RelayerRepoModel, RepositoryError,
     },
     repositories::{PaginatedResult, Repository},
+    utils::RedisConnections,
 };
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
+use deadpool_redis::Pool;
 use std::sync::Arc;
 
 #[async_trait]
@@ -67,6 +68,19 @@ pub trait RelayerRepository: Repository<RelayerRepoModel, String> + Send + Sync 
     /// Returns true if this repository uses persistent storage (e.g., Redis).
     /// Returns false for in-memory storage.
     fn is_persistent_storage(&self) -> bool;
+
+    /// Returns connection info for distributed operations.
+    ///
+    /// This method provides access to the underlying connection and key prefix
+    /// when using persistent storage. This is useful for distributed locking and
+    /// other coordination operations that need direct storage access.
+    ///
+    /// # Returns
+    /// * `Some((pool, prefix))` - If using persistent storage (e.g., Redis)
+    /// * `None` - If using in-memory storage (default)
+    fn connection_info(&self) -> Option<(Arc<Pool>, String)> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +110,7 @@ mockall::mock! {
         async fn disable_relayer(&self, relayer_id: String, reason: DisabledReason) -> Result<RelayerRepoModel, RepositoryError>;
         async fn update_policy(&self, id: String, policy: RelayerNetworkPolicy) -> Result<RelayerRepoModel, RepositoryError>;
         fn is_persistent_storage(&self) -> bool;
+        fn connection_info(&self) -> Option<(Arc<Pool>, String)>;
     }
 }
 
@@ -112,13 +127,31 @@ impl RelayerRepositoryStorage {
     }
 
     pub fn new_redis(
-        connection_manager: Arc<ConnectionManager>,
+        connections: Arc<RedisConnections>,
         key_prefix: String,
     ) -> Result<Self, RepositoryError> {
         Ok(Self::Redis(RedisRelayerRepository::new(
-            connection_manager,
+            connections,
             key_prefix,
         )?))
+    }
+
+    /// Returns connection info for distributed operations.
+    ///
+    /// This method provides access to the underlying Redis connection and key prefix
+    /// when using Redis-backed storage. This is useful for distributed locking and
+    /// other coordination operations that need direct Redis access.
+    ///
+    /// # Returns
+    /// * `Some((pool, prefix))` - If using persistent storage (e.g., Redis)
+    /// * `None` - If using in-memory storage
+    pub fn connection_info(&self) -> Option<(Arc<Pool>, String)> {
+        match self {
+            RelayerRepositoryStorage::InMemory(_) => None,
+            RelayerRepositoryStorage::Redis(repo) => {
+                Some((repo.connections.primary().clone(), repo.key_prefix.clone()))
+            }
+        }
     }
 }
 
@@ -285,6 +318,15 @@ impl RelayerRepository for RelayerRepositoryStorage {
             RelayerRepositoryStorage::Redis(_) => true,
         }
     }
+
+    fn connection_info(&self) -> Option<(Arc<Pool>, String)> {
+        match self {
+            RelayerRepositoryStorage::InMemory(_) => None,
+            RelayerRepositoryStorage::Redis(repo) => {
+                Some((repo.connections.primary().clone(), repo.key_prefix.clone()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +342,7 @@ mod tests {
             paused: false,
             network_type: NetworkType::Evm,
             policies: RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+                include_revert_data: None,
                 min_balance: Some(0),
                 gas_limit_estimation: Some(true),
                 gas_price_cap: None,
@@ -400,6 +443,7 @@ mod tests {
 
         // Test update_policy
         let new_policy = RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+            include_revert_data: None,
             min_balance: Some(1000000000000000000),
             gas_limit_estimation: Some(true),
             gas_price_cap: Some(50_000_000_000),
@@ -498,5 +542,39 @@ mod tests {
 
         repo.drop_all_entries().await.unwrap();
         assert!(!repo.has_entries().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_connection_info_returns_none_for_in_memory() {
+        let storage = RelayerRepositoryStorage::new_in_memory();
+
+        // In-memory storage should return None for connection_info
+        assert!(storage.connection_info().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_is_persistent_storage_returns_false_for_in_memory() {
+        let storage = RelayerRepositoryStorage::new_in_memory();
+
+        // In-memory storage should return false for is_persistent_storage
+        assert!(!storage.is_persistent_storage());
+    }
+
+    #[tokio::test]
+    async fn test_trait_connection_info_returns_none_for_in_memory() {
+        let storage = RelayerRepositoryStorage::new_in_memory();
+
+        // Test the RelayerRepository trait's connection_info method
+        let trait_ref: &dyn RelayerRepository = &storage;
+        assert!(trait_ref.connection_info().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_struct_connection_info_returns_none_for_in_memory() {
+        let storage = RelayerRepositoryStorage::new_in_memory();
+
+        // Test the struct's own connection_info method
+        let result: Option<(Arc<Pool>, String)> = storage.connection_info();
+        assert!(result.is_none());
     }
 }

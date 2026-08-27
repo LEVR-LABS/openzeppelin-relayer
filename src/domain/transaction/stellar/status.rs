@@ -3,25 +3,36 @@
 //! ensuring proper transaction state management and lane cleanup.
 
 use chrono::{DateTime, Utc};
-use soroban_rs::xdr::{Error, Hash, Limits, WriteXdr};
+use soroban_rs::xdr::{
+    ContractEventBody, DiagnosticEvent, Error, Hash, InnerTransactionResultResult,
+    InvokeHostFunctionResult, Limits, OperationResult, OperationResultTr, ScVal,
+    TransactionEnvelope, TransactionResultResult, WriteXdr,
+};
 use tracing::{debug, info, warn};
 
 use super::{is_final_state, StellarRelayerTransaction};
-use crate::constants::{get_stellar_max_stuck_transaction_lifetime, get_stellar_resend_timeout};
+use crate::constants::{
+    get_stellar_max_stuck_transaction_lifetime, STELLAR_RESUBMIT_BASE_INTERVAL_SECONDS,
+    STELLAR_RESUBMIT_GROWTH_FACTOR, STELLAR_RESUBMIT_MAX_INTERVAL_SECONDS,
+};
 use crate::domain::transaction::stellar::prepare::common::send_submit_transaction_job;
-use crate::domain::transaction::stellar::utils::extract_return_value_from_meta;
-use crate::domain::transaction::stellar::utils::extract_time_bounds;
+use crate::domain::transaction::stellar::utils::{
+    compute_resubmit_backoff_interval, extract_return_value_from_meta, extract_time_bounds,
+};
 use crate::domain::transaction::util::{get_age_since_created, get_age_since_sent_or_created};
 use crate::domain::xdr_utils::parse_transaction_xdr;
 use crate::{
     constants::STELLAR_PENDING_RECOVERY_TRIGGER_SECONDS,
-    jobs::{JobProducerTrait, TransactionRequest},
+    jobs::{JobProducerTrait, StatusCheckContext, TransactionRequest},
     models::{
         NetworkTransactionData, RelayerRepoModel, TransactionError, TransactionRepoModel,
         TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{Repository, TransactionCounterTrait, TransactionRepository},
-    services::{provider::StellarProviderTrait, signer::Signer},
+    services::{
+        provider::StellarProviderTrait,
+        signer::{Signer, StellarSignTrait},
+    },
 };
 
 impl<R, T, J, S, P, C, D> StellarRelayerTransaction<R, T, J, S, P, C, D>
@@ -29,23 +40,61 @@ where
     R: Repository<RelayerRepoModel, String> + Send + Sync,
     T: TransactionRepository + Send + Sync,
     J: JobProducerTrait + Send + Sync,
-    S: Signer + Send + Sync,
+    S: Signer + StellarSignTrait + Send + Sync,
     P: StellarProviderTrait + Send + Sync,
     C: TransactionCounterTrait + Send + Sync,
     D: crate::services::stellar_dex::StellarDexServiceTrait + Send + Sync + 'static,
 {
     /// Main status handling method with robust error handling.
     /// This method checks transaction status and handles lane cleanup for finalized transactions.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx` - The transaction to check status for
+    /// * `context` - Optional circuit breaker context with failure tracking information
     pub async fn handle_transaction_status_impl(
         &self,
         tx: TransactionRepoModel,
+        context: Option<StatusCheckContext>,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!(tx_id = %tx.id, status = ?tx.status, "handling transaction status");
+        debug!(
+            tx_id = %tx.id,
+            relayer_id = %tx.relayer_id,
+            status = ?tx.status,
+            "handling transaction status"
+        );
 
         // Early exit for final states - no need to check
         if is_final_state(&tx.status) {
-            info!(tx_id = %tx.id, status = ?tx.status, "transaction in final state, skipping status check");
+            debug!(
+                tx_id = %tx.id,
+                relayer_id = %tx.relayer_id,
+                status = ?tx.status,
+                "transaction in final state, skipping status check"
+            );
             return Ok(tx);
+        }
+
+        // Check if circuit breaker should force finalization
+        if let Some(ref ctx) = context {
+            if ctx.should_force_finalize() {
+                let reason = format!(
+                    "Transaction status monitoring failed after {} consecutive errors (total: {}). \
+                     Last status: {:?}. Unable to determine final on-chain state.",
+                    ctx.consecutive_failures, ctx.total_failures, tx.status
+                );
+                warn!(
+                    tx_id = %tx.id,
+                    consecutive_failures = ctx.consecutive_failures,
+                    total_failures = ctx.total_failures,
+                    max_consecutive = ctx.max_consecutive_failures,
+                    "circuit breaker triggered, forcing transaction to failed state"
+                );
+                // Note: Expiry checks are already performed in the normal flow for Pending/Sent
+                // states (before any RPC calls). If we've hit consecutive failures, it's a strong
+                // signal that status monitoring is fundamentally broken for this transaction.
+                return self.mark_as_failed(tx, reason).await;
+            }
         }
 
         match self.status_core(tx.clone()).await {
@@ -63,6 +112,23 @@ where
                     error = ?error,
                     "status check encountered error"
                 );
+
+                // CAS conflict means another writer already mutated this tx.
+                // Reload the latest state and return Ok so the status handler
+                // sees a non-final status and schedules the next poll cycle via
+                // HandlerError::Retry — no work is lost, just deferred.
+                if error.is_concurrent_update_conflict() {
+                    info!(
+                        tx_id = %tx.id,
+                        relayer_id = %tx.relayer_id,
+                        "concurrent transaction update detected during status handling, reloading latest state"
+                    );
+                    return self
+                        .transaction_repository()
+                        .get_by_id(tx.id.clone())
+                        .await
+                        .map_err(TransactionError::from);
+                }
 
                 // Handle different error types appropriately
                 match error {
@@ -94,52 +160,15 @@ where
     }
 
     /// Core status checking logic - pure business logic without error handling concerns.
+    /// Dispatches to the appropriate handler based on internal transaction status.
     async fn status_core(
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        // Early exits for unsubmitted transactions - they don't have on-chain hashes yet
-        // The submit handler will schedule status checks after submission
-        if tx.status == TransactionStatus::Pending {
-            return self.handle_pending_state(tx).await;
-        }
-
-        if tx.status == TransactionStatus::Sent {
-            return self.handle_sent_state(tx).await;
-        }
-
-        let stellar_hash = match self.parse_and_validate_hash(&tx) {
-            Ok(hash) => hash,
-            Err(e) => {
-                // Transaction should be in Submitted or later state
-                // If hash is missing, this is a database inconsistency that won't fix itself
-                warn!(
-                    tx_id = %tx.id,
-                    status = ?tx.status,
-                    error = ?e,
-                    "failed to parse and validate hash for submitted transaction"
-                );
-                return self
-                    .mark_as_failed(tx, format!("Failed to parse and validate hash: {e}"))
-                    .await;
-            }
-        };
-
-        let provider_response = match self.provider().get_transaction(&stellar_hash).await {
-            Ok(response) => response,
-            Err(e) => {
-                warn!(error = ?e, "provider get_transaction failed");
-                return Err(TransactionError::from(e));
-            }
-        };
-
-        match provider_response.status.as_str().to_uppercase().as_str() {
-            "SUCCESS" => self.handle_stellar_success(tx, provider_response).await,
-            "FAILED" => self.handle_stellar_failed(tx, provider_response).await,
-            _ => {
-                self.handle_stellar_pending(tx, provider_response.status)
-                    .await
-            }
+        match tx.status {
+            TransactionStatus::Pending => self.handle_pending_state(tx).await,
+            TransactionStatus::Sent => self.handle_sent_state(tx).await,
+            _ => self.handle_submitted_state(tx).await,
         }
     }
 
@@ -214,7 +243,7 @@ where
 
         // Try to enqueue next transaction
         if let Err(e) = self.enqueue_next_pending_transaction(&tx.id).await {
-            warn!(error = %e, "failed to enqueue next pending transaction after expiration");
+            warn!(tx_id = %tx.id, relayer_id = %tx.relayer_id, error = %e, "failed to enqueue next pending transaction after expiration");
         }
 
         Ok(expired_tx)
@@ -311,22 +340,63 @@ where
         tx: TransactionRepoModel,
         provider_response: soroban_rs::stellar_rpc_client::GetTransactionResponse,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        let base_reason = "Transaction failed on-chain. Provider status: FAILED.".to_string();
-        let detailed_reason = if let Some(ref tx_result_xdr) = provider_response.result {
-            format!(
-                "{} Specific XDR reason: {}.",
-                base_reason,
-                tx_result_xdr.result.name()
-            )
-        } else {
-            format!("{base_reason} No detailed XDR result available.")
-        };
+        let result_code = provider_response
+            .result
+            .as_ref()
+            .map(|r| r.result.name())
+            .unwrap_or("unknown");
 
-        warn!(reason = %detailed_reason, "stellar transaction failed");
+        // Extract inner failure fields for fee-bump and op-level detail
+        let (inner_result_code, op_result_code, inner_tx_hash, inner_fee_charged) =
+            match provider_response.result.as_ref().map(|r| &r.result) {
+                Some(TransactionResultResult::TxFeeBumpInnerFailed(pair)) => {
+                    let inner = &pair.result.result;
+                    let op = match inner {
+                        InnerTransactionResultResult::TxFailed(ops) => {
+                            first_failing_op(ops.as_slice())
+                        }
+                        _ => None,
+                    };
+                    (
+                        Some(inner.name()),
+                        op,
+                        Some(hex::encode(pair.transaction_hash.0)),
+                        pair.result.fee_charged,
+                    )
+                }
+                Some(TransactionResultResult::TxFailed(ops)) => {
+                    (None, first_failing_op(ops.as_slice()), None, 0)
+                }
+                _ => (None, None, None, 0),
+            };
+
+        let fee_charged = provider_response.result.as_ref().map(|r| r.fee_charged);
+        let fee_bid = provider_response.envelope.as_ref().map(extract_fee_bid);
+        let contract_error = extract_contract_error(&provider_response.events.diagnostic_events);
+
+        warn!(
+            tx_id = %tx.id,
+            result_code,
+            inner_result_code = inner_result_code.unwrap_or("n/a"),
+            op_result_code = op_result_code.unwrap_or("n/a"),
+            inner_tx_hash = inner_tx_hash.as_deref().unwrap_or("n/a"),
+            inner_fee_charged,
+            fee_charged = ?fee_charged,
+            fee_bid = ?fee_bid,
+            contract_error = contract_error.as_deref().unwrap_or("n/a"),
+            "stellar transaction failed"
+        );
+
+        let status_reason = format_failure_reason(
+            result_code,
+            inner_result_code,
+            op_result_code,
+            contract_error.as_deref(),
+        );
 
         let update_request = TransactionUpdateRequest {
             status: Some(TransactionStatus::Failed),
-            status_reason: Some(detailed_reason),
+            status_reason: Some(status_reason),
             ..Default::default()
         };
 
@@ -387,12 +457,27 @@ where
             return result;
         }
 
-        // Re-enqueue submit job if transaction exceeded resend timeout
-        let age = get_age_since_sent_or_created(&tx)?;
-        if age > get_stellar_resend_timeout() {
-            info!(tx_id = %tx.id, age_seconds = age.num_seconds(),
-                "re-enqueueing submit job for stuck Sent transaction");
-            send_submit_transaction_job(self.job_producer(), &tx, None).await?;
+        // Resubmit with backoff based on total transaction age.
+        // Uses the same backoff logic as the Submitted state handler:
+        // 10s → 15s → 22s → 33s → 50s → 75s → 113s → 120s (capped).
+        let total_age = get_age_since_created(&tx)?;
+        if let Some(backoff_interval) = compute_resubmit_backoff_interval(
+            total_age,
+            STELLAR_RESUBMIT_BASE_INTERVAL_SECONDS,
+            STELLAR_RESUBMIT_MAX_INTERVAL_SECONDS,
+            STELLAR_RESUBMIT_GROWTH_FACTOR,
+        ) {
+            let age_since_last_submit = get_age_since_sent_or_created(&tx)?;
+            if age_since_last_submit > backoff_interval {
+                info!(
+                    tx_id = %tx.id,
+                    total_age_seconds = total_age.num_seconds(),
+                    since_last_submit_seconds = age_since_last_submit.num_seconds(),
+                    backoff_interval_seconds = backoff_interval.num_seconds(),
+                    "re-enqueueing submit job for stuck Sent transaction"
+                );
+                send_submit_transaction_job(self.job_producer(), &tx, None).await?;
+            }
         }
 
         Ok(tx)
@@ -468,29 +553,240 @@ where
         }
     }
 
-    /// Handles the logic when a Stellar transaction is still pending or in an unknown state.
-    pub async fn handle_stellar_pending(
+    /// Handles status checking for Submitted transactions (and any other state with a hash).
+    /// Parses the hash, queries the provider, and dispatches to success/failed/pending handlers.
+    /// For non-final on-chain status, checks expiration/max-lifetime and resubmits if needed.
+    async fn handle_submitted_state(
         &self,
         tx: TransactionRepoModel,
-        original_status_str: String,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!(status = %original_status_str, "stellar transaction status is still pending, will retry check later");
+        let stellar_hash = match self.parse_and_validate_hash(&tx) {
+            Ok(hash) => hash,
+            Err(e) => {
+                // If hash is missing, this is a database inconsistency that won't fix itself
+                warn!(
+                    tx_id = %tx.id,
+                    status = ?tx.status,
+                    error = ?e,
+                    "failed to parse and validate hash for submitted transaction"
+                );
+                return self
+                    .mark_as_failed(tx, format!("Failed to parse and validate hash: {e}"))
+                    .await;
+            }
+        };
 
-        // Check for expiration and max lifetime for Submitted transactions
-        if tx.status == TransactionStatus::Submitted {
-            if let Some(result) = self
-                .check_expiration_and_max_lifetime(
-                    tx.clone(),
-                    "Transaction stuck in Submitted status for too long".to_string(),
-                )
-                .await
-            {
-                return result;
+        let provider_response = match self.provider().get_transaction(&stellar_hash).await {
+            Ok(response) => response,
+            Err(e) => {
+                warn!(error = ?e, "provider get_transaction failed");
+                return Err(TransactionError::from(e));
+            }
+        };
+
+        match provider_response.status.as_str().to_uppercase().as_str() {
+            "SUCCESS" => self.handle_stellar_success(tx, provider_response).await,
+            "FAILED" => self.handle_stellar_failed(tx, provider_response).await,
+            _ => {
+                debug!(
+                    tx_id = %tx.id,
+                    relayer_id = %tx.relayer_id,
+                    status = %provider_response.status,
+                    "submitted transaction not yet final on-chain, will retry check later"
+                );
+
+                // Check for expiration and max lifetime
+                if let Some(result) = self
+                    .check_expiration_and_max_lifetime(
+                        tx.clone(),
+                        "Transaction stuck in Submitted status for too long".to_string(),
+                    )
+                    .await
+                {
+                    return result;
+                }
+
+                // Resubmit with backoff based on total transaction age.
+                // The backoff interval grows: 10s → 15s → 22s → 33s → 50s → 75s → 113s → 120s (capped).
+                let total_age = get_age_since_created(&tx)?;
+                if let Some(backoff_interval) = compute_resubmit_backoff_interval(
+                    total_age,
+                    STELLAR_RESUBMIT_BASE_INTERVAL_SECONDS,
+                    STELLAR_RESUBMIT_MAX_INTERVAL_SECONDS,
+                    STELLAR_RESUBMIT_GROWTH_FACTOR,
+                ) {
+                    let age_since_last_submit = get_age_since_sent_or_created(&tx)?;
+                    if age_since_last_submit > backoff_interval {
+                        info!(
+                            tx_id = %tx.id,
+                            relayer_id = %tx.relayer_id,
+                            total_age_seconds = total_age.num_seconds(),
+                            since_last_submit_seconds = age_since_last_submit.num_seconds(),
+                            backoff_interval_seconds = backoff_interval.num_seconds(),
+                            "resubmitting Submitted transaction to ensure mempool inclusion"
+                        );
+                        send_submit_transaction_job(self.job_producer(), &tx, None).await?;
+                    }
+                }
+
+                Ok(tx)
             }
         }
-
-        Ok(tx)
     }
+}
+
+/// Extracts the fee bid from a transaction envelope.
+///
+/// For fee-bump transactions, returns the outer bump fee (the max the submitter was
+/// willing to pay). For regular V1 transactions, returns the `fee` field.
+fn extract_fee_bid(envelope: &TransactionEnvelope) -> i64 {
+    match envelope {
+        TransactionEnvelope::TxFeeBump(fb) => fb.tx.fee,
+        TransactionEnvelope::Tx(v1) => v1.tx.fee as i64,
+        TransactionEnvelope::TxV0(v0) => v0.tx.fee as i64,
+    }
+}
+
+/// Returns the `.name()` of the first failing operation in the results.
+///
+/// Scans left-to-right since earlier operations may show success while a later
+/// one carries the actual failure code. Returns `None` if no failure is found.
+fn first_failing_op(ops: &[OperationResult]) -> Option<&'static str> {
+    let op = ops.iter().find(|op| match op {
+        OperationResult::OpInner(tr) => match tr {
+            OperationResultTr::InvokeHostFunction(r) => {
+                !matches!(r, InvokeHostFunctionResult::Success(_))
+            }
+            OperationResultTr::ExtendFootprintTtl(r) => r.name() != "Success",
+            OperationResultTr::RestoreFootprint(r) => r.name() != "Success",
+            _ => false,
+        },
+        _ => true,
+    })?;
+    match op {
+        OperationResult::OpInner(tr) => match tr {
+            OperationResultTr::InvokeHostFunction(r) => Some(r.name()),
+            OperationResultTr::ExtendFootprintTtl(r) => Some(r.name()),
+            OperationResultTr::RestoreFootprint(r) => Some(r.name()),
+            _ => Some(tr.name()),
+        },
+        _ => Some(op.name()),
+    }
+}
+
+/// Builds the layered `status_reason` written for a failed Stellar
+/// transaction. Each component is omitted when its source data is unavailable.
+fn format_failure_reason(
+    outer: &str,
+    inner: Option<&str>,
+    op: Option<&str>,
+    contract_error: Option<&str>,
+) -> String {
+    let mut s = format!("Transaction failed on-chain. reason={outer}");
+    if let Some(inner) = inner {
+        s.push_str(" inner=");
+        s.push_str(inner);
+    }
+    if let Some(op) = op {
+        s.push_str(" op=");
+        s.push_str(op);
+    }
+    if let Some(ce) = contract_error {
+        s.push_str(" contract_error=");
+        s.push_str(ce);
+    }
+    s
+}
+
+/// Returns a contract-level error from Soroban diagnostic events, rendered as
+/// `"<TypeName>(<code>)"` with an optional ` message="<text>"` when the same
+/// event carries a sibling `ScVal::String` or `ScVal::Symbol`. Returns `None`
+/// when no `ScVal::Error` is present.
+fn extract_contract_error(events: &[DiagnosticEvent]) -> Option<String> {
+    for evt in events {
+        let ContractEventBody::V0(body) = &evt.event.body;
+        let mut error_str: Option<String> = None;
+        let mut message: Option<String> = None;
+        for v in body.topics.iter().chain(std::iter::once(&body.data)) {
+            scan_scval(v, &mut error_str, &mut message);
+            if error_str.is_some() && message.is_some() {
+                break;
+            }
+        }
+        if let Some(err) = error_str {
+            return Some(match message {
+                Some(m) => format!("{err} message=\"{}\"", sanitize_message(&m)),
+                None => err,
+            });
+        }
+    }
+    None
+}
+
+fn scan_scval(v: &ScVal, error_str: &mut Option<String>, message: &mut Option<String>) {
+    match v {
+        ScVal::Error(e) => {
+            if error_str.is_none() {
+                let payload = match e {
+                    soroban_rs::xdr::ScError::Contract(n) => n.to_string(),
+                    soroban_rs::xdr::ScError::WasmVm(c)
+                    | soroban_rs::xdr::ScError::Context(c)
+                    | soroban_rs::xdr::ScError::Storage(c)
+                    | soroban_rs::xdr::ScError::Object(c)
+                    | soroban_rs::xdr::ScError::Crypto(c)
+                    | soroban_rs::xdr::ScError::Events(c)
+                    | soroban_rs::xdr::ScError::Budget(c)
+                    | soroban_rs::xdr::ScError::Value(c)
+                    | soroban_rs::xdr::ScError::Auth(c) => c.name().to_string(),
+                };
+                *error_str = Some(format!("{}({payload})", e.name()));
+            }
+        }
+        ScVal::String(s) => {
+            if message.is_none() {
+                let bytes: &[u8] = s.as_ref();
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    if !text.is_empty() {
+                        *message = Some(text.to_string());
+                    }
+                }
+            }
+        }
+        ScVal::Symbol(sym) => {
+            if message.is_none() {
+                let bytes: &[u8] = sym.as_ref();
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    // Skip the conventional "error" topic marker.
+                    if !text.is_empty() && text != "error" {
+                        *message = Some(text.to_string());
+                    }
+                }
+            }
+        }
+        ScVal::Vec(Some(items)) => {
+            for inner in items.iter() {
+                scan_scval(inner, error_str, message);
+                if error_str.is_some() && message.is_some() {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_message(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -632,7 +928,7 @@ mod tests {
                         && statuses == [TransactionStatus::Pending]
                         && query.page == 1
                         && query.per_page == 1
-                        && *oldest_first == true
+                        && *oldest_first
                 })
                 .times(1)
                 .returning(move |_, _, _, _| {
@@ -666,7 +962,7 @@ mod tests {
             initial_tx_for_handling.status = TransactionStatus::Submitted;
 
             let result = handler
-                .handle_transaction_status_impl(initial_tx_for_handling)
+                .handle_transaction_status_impl(initial_tx_for_handling, None)
                 .await;
 
             assert!(result.is_ok());
@@ -714,10 +1010,19 @@ mod tests {
                 .expect_produce_send_notification_job()
                 .never();
 
+            // Submitted tx older than resubmit timeout triggers resubmission
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
             let original_tx_clone = tx_to_handle.clone();
 
-            let result = handler.handle_transaction_status_impl(tx_to_handle).await;
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
 
             assert!(result.is_ok());
             let returned_tx = result.unwrap();
@@ -788,7 +1093,7 @@ mod tests {
                         && statuses == [TransactionStatus::Pending]
                         && query.page == 1
                         && query.per_page == 1
-                        && *oldest_first == true
+                        && *oldest_first
                 })
                 .times(1)
                 .returning(move |_, _, _, _| {
@@ -825,7 +1130,7 @@ mod tests {
             initial_tx_for_handling.status = TransactionStatus::Submitted;
 
             let result = handler
-                .handle_transaction_status_impl(initial_tx_for_handling)
+                .handle_transaction_status_impl(initial_tx_for_handling, None)
                 .await;
 
             assert!(result.is_ok());
@@ -835,7 +1140,7 @@ mod tests {
             assert!(handled_tx.status_reason.is_some());
             assert_eq!(
                 handled_tx.status_reason.unwrap(),
-                "Transaction failed on-chain. Provider status: FAILED. No detailed XDR result available."
+                "Transaction failed on-chain. reason=unknown"
             );
         }
 
@@ -884,7 +1189,9 @@ mod tests {
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
 
-            let result = handler.handle_transaction_status_impl(tx_to_handle).await;
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
 
             // Provider errors are now propagated as errors (retriable)
             assert!(result.is_err());
@@ -933,7 +1240,7 @@ mod tests {
                         && statuses == [TransactionStatus::Pending]
                         && query.page == 1
                         && query.per_page == 1
-                        && *oldest_first == true
+                        && *oldest_first
                 })
                 .times(1)
                 .returning(move |_, _, _, _| {
@@ -946,7 +1253,9 @@ mod tests {
                 }); // No pending transactions
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx_to_handle).await;
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
 
             // Should succeed but mark transaction as Failed
             assert!(result.is_ok(), "Expected Ok result");
@@ -1030,7 +1339,9 @@ mod tests {
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
             let initial_tx = tx_to_handle.clone();
 
-            let result = handler.handle_transaction_status_impl(initial_tx).await;
+            let result = handler
+                .handle_transaction_status_impl(initial_tx, None)
+                .await;
 
             assert!(result.is_ok());
             let handled_tx = result.unwrap();
@@ -1110,7 +1421,9 @@ mod tests {
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
             let initial_tx = tx_to_handle.clone();
 
-            let result = handler.handle_transaction_status_impl(initial_tx).await;
+            let result = handler
+                .handle_transaction_status_impl(initial_tx, None)
+                .await;
 
             assert!(result.is_ok());
             let handled_tx = result.unwrap();
@@ -1155,7 +1468,9 @@ mod tests {
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
 
-            let result = handler.handle_transaction_status_impl(tx_to_handle).await;
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
 
             // Provider errors are now propagated as errors (retriable)
             assert!(result.is_err());
@@ -1205,7 +1520,7 @@ mod tests {
                     id == "tx-with-result"
                         && update.status == Some(TransactionStatus::Confirmed)
                         && update.confirmed_at.is_some()
-                        && update.network_data.as_ref().map_or(false, |and| {
+                        && update.network_data.as_ref().is_some_and(|and| {
                             if let NetworkTransactionData::Stellar(stellar_data) = and {
                                 // Verify transaction_result_xdr is present
                                 stellar_data.transaction_result_xdr.is_some()
@@ -1247,7 +1562,9 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx_to_handle).await;
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
 
             assert!(result.is_ok());
             let handled_tx = result.unwrap();
@@ -1337,7 +1654,9 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx_to_handle).await;
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
 
             assert!(result.is_ok());
             let handled_tx = result.unwrap();
@@ -1378,7 +1697,9 @@ mod tests {
                 .never();
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx.clone()).await;
+            let result = handler
+                .handle_transaction_status_impl(tx.clone(), None)
+                .await;
 
             assert!(result.is_ok());
             let returned_tx = result.unwrap();
@@ -1413,7 +1734,9 @@ mod tests {
                 .returning(|_, _| Box::pin(async { Ok(()) }));
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx.clone()).await;
+            let result = handler
+                .handle_transaction_status_impl(tx.clone(), None)
+                .await;
 
             assert!(result.is_ok());
             let returned_tx = result.unwrap();
@@ -1470,7 +1793,7 @@ mod tests {
             mocks
                 .tx_repo
                 .expect_find_by_status_paginated()
-                .returning(|_, _, _, _| {
+                .returning(move |_, _, _, _| {
                     Ok(PaginatedResult {
                         items: vec![],
                         total: 0,
@@ -1480,7 +1803,7 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let expired_tx = result.unwrap();
@@ -1551,16 +1874,91 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let failed_tx = result.unwrap();
             assert_eq!(failed_tx.status, TransactionStatus::Failed);
+            // assert_eq!(failed_tx.status_reason.as_ref().unwrap(), "Transaction stuck in Sent status for too long");
             assert!(failed_tx
                 .status_reason
                 .as_ref()
                 .unwrap()
                 .contains("stuck in Sent status for too long"));
+        }
+        #[tokio::test]
+        async fn handle_status_concurrent_update_conflict_reloads_latest_state() {
+            // When status_core returns ConcurrentUpdateConflict, the handler
+            // should reload the latest state via get_by_id and return Ok.
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-cas-conflict".to_string();
+            tx.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+            let tx_hash_bytes = [11u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+            tx.status = TransactionStatus::Submitted;
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            // Provider returns SUCCESS — triggers a partial_update for confirmation
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("SUCCESS")) })
+                });
+
+            // partial_update fails with ConcurrentUpdateConflict
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(1)
+                .returning(|_id, _update| {
+                    Err(RepositoryError::ConcurrentUpdateConflict(
+                        "CAS mismatch".to_string(),
+                    ))
+                });
+
+            // After conflict, handler reloads via get_by_id
+            let reloaded_tx = {
+                let mut t = create_test_transaction(&relayer.id);
+                t.id = "tx-cas-conflict".to_string();
+                // Simulate another writer already confirmed it
+                t.status = TransactionStatus::Confirmed;
+                t
+            };
+            let reloaded_clone = reloaded_tx.clone();
+            mocks
+                .tx_repo
+                .expect_get_by_id()
+                .with(eq("tx-cas-conflict".to_string()))
+                .times(1)
+                .returning(move |_| Ok(reloaded_clone.clone()));
+
+            // No notifications or job enqueuing should happen on CAS path
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .never();
+            mocks
+                .job_producer
+                .expect_produce_transaction_request_job()
+                .never();
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok(), "CAS conflict should return Ok after reload");
+            let returned_tx = result.unwrap();
+            assert_eq!(returned_tx.id, "tx-cas-conflict");
+            // The reloaded tx reflects what the other writer persisted
+            assert_eq!(returned_tx.status, TransactionStatus::Confirmed);
         }
     }
 
@@ -1607,7 +2005,7 @@ mod tests {
             mocks
                 .tx_repo
                 .expect_find_by_status_paginated()
-                .returning(|_, _, _, _| {
+                .returning(move |_, _, _, _| {
                     Ok(PaginatedResult {
                         items: vec![],
                         total: 0,
@@ -1617,7 +2015,7 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let failed_tx = result.unwrap();
@@ -1650,7 +2048,7 @@ mod tests {
                 .returning(|_, _| Box::pin(async { Ok(()) }));
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let tx_result = result.unwrap();
@@ -1677,7 +2075,7 @@ mod tests {
                 .never();
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let tx_result = result.unwrap();
@@ -1686,7 +2084,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_sent_without_hash_handles_stuck_recovery() {
-            use crate::constants::get_stellar_resend_timeout;
+            use crate::constants::STELLAR_RESUBMIT_BASE_INTERVAL_SECONDS;
 
             let relayer = create_test_relayer();
             let mut mocks = default_test_mocks();
@@ -1694,9 +2092,11 @@ mod tests {
             let mut tx = create_test_transaction(&relayer.id);
             tx.id = "tx-sent-no-hash".to_string();
             tx.status = TransactionStatus::Sent;
-            // Created more than resend timeout ago (31 seconds > 30 seconds)
-            tx.created_at =
-                (Utc::now() - get_stellar_resend_timeout() - Duration::seconds(1)).to_rfc3339();
+            // Created more than base resubmit interval ago (16 seconds > 15 seconds)
+            tx.created_at = (Utc::now()
+                - Duration::seconds(STELLAR_RESUBMIT_BASE_INTERVAL_SECONDS)
+                - Duration::seconds(1))
+            .to_rfc3339();
             if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
                 stellar_data.hash = None; // No hash
             }
@@ -1709,7 +2109,7 @@ mod tests {
                 .returning(|_, _| Box::pin(async { Ok(()) }));
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let tx_result = result.unwrap();
@@ -1754,7 +2154,7 @@ mod tests {
             mocks
                 .tx_repo
                 .expect_find_by_status_paginated()
-                .returning(|_, _, _, _| {
+                .returning(move |_, _, _, _| {
                     Ok(PaginatedResult {
                         items: vec![],
                         total: 0,
@@ -1764,7 +2164,7 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let failed_tx = result.unwrap();
@@ -1831,7 +2231,7 @@ mod tests {
             mocks
                 .tx_repo
                 .expect_find_by_status_paginated()
-                .returning(|_, _, _, _| {
+                .returning(move |_, _, _, _| {
                     Ok(PaginatedResult {
                         items: vec![],
                         total: 0,
@@ -1841,7 +2241,7 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let failed_tx = result.unwrap();
@@ -1907,7 +2307,7 @@ mod tests {
             mocks
                 .tx_repo
                 .expect_find_by_status_paginated()
-                .returning(|_, _, _, _| {
+                .returning(move |_, _, _, _| {
                     Ok(PaginatedResult {
                         items: vec![],
                         total: 0,
@@ -1917,7 +2317,307 @@ mod tests {
                 });
 
             let handler = make_stellar_tx_handler(relayer.clone(), mocks);
-            let result = handler.handle_transaction_status_impl(tx).await;
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok());
+            let expired_tx = result.unwrap();
+            assert_eq!(expired_tx.status, TransactionStatus::Expired);
+            assert!(expired_tx
+                .status_reason
+                .as_ref()
+                .unwrap()
+                .contains("expired"));
+        }
+
+        #[tokio::test]
+        async fn test_handle_submitted_state_resubmits_after_timeout() {
+            // Transaction created 16s ago, sent_at also 16s ago → exceeds base interval (15s)
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-submitted-resubmit".to_string();
+            tx.status = TransactionStatus::Submitted;
+            let sixteen_seconds_ago = (Utc::now() - Duration::seconds(16)).to_rfc3339();
+            tx.created_at = sixteen_seconds_ago.clone();
+            tx.sent_at = Some(sixteen_seconds_ago);
+            // Set a hash so it can query provider
+            let tx_hash_bytes = [8u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            // Mock provider to return PENDING status (not SUCCESS or FAILED)
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash.clone()))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("PENDING")) })
+                });
+
+            // Should resubmit the transaction
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok());
+            let tx_result = result.unwrap();
+            assert_eq!(tx_result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_handle_submitted_state_backoff_increases_interval() {
+            // Transaction created 30s ago but sent_at only 15s ago.
+            // At total_age=30s, backoff interval = 30s (base*2^1, since 30/15=2, log2(2)=1).
+            // age_since_last_submit=15s < 30s → should NOT resubmit yet.
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-submitted-backoff".to_string();
+            tx.status = TransactionStatus::Submitted;
+            tx.created_at = (Utc::now() - Duration::seconds(30)).to_rfc3339();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(15)).to_rfc3339());
+            let tx_hash_bytes = [11u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash.clone()))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("PENDING")) })
+                });
+
+            // Should NOT resubmit (15s < 30s backoff interval)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok());
+            let tx_result = result.unwrap();
+            assert_eq!(tx_result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_handle_submitted_state_backoff_resubmits_when_interval_exceeded() {
+            // Transaction created 25s ago, sent_at 25s ago.
+            // At total_age=25s with base=10, factor=1.5: interval = 22s (third tier).
+            // age_since_last_submit=25s > 22s → should resubmit.
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-submitted-backoff-resubmit".to_string();
+            tx.status = TransactionStatus::Submitted;
+            tx.created_at = (Utc::now() - Duration::seconds(25)).to_rfc3339();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(25)).to_rfc3339());
+            let tx_hash_bytes = [12u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash.clone()))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("PENDING")) })
+                });
+
+            // Should resubmit (25s > 22s backoff interval)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok());
+            let tx_result = result.unwrap();
+            assert_eq!(tx_result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_handle_submitted_state_recent_sent_at_prevents_resubmit() {
+            // Transaction created 60s ago (old), but sent_at only 5s ago (recent resubmission).
+            // At total_age=60s with base=10, factor=1.5: interval = 50s (fifth tier).
+            // age_since_last_submit=5s < 50s → should NOT resubmit.
+            // This verifies that sent_at being updated on resubmission correctly resets the clock.
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-submitted-recent-sent".to_string();
+            tx.status = TransactionStatus::Submitted;
+            tx.created_at = (Utc::now() - Duration::seconds(60)).to_rfc3339();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(5)).to_rfc3339());
+            let tx_hash_bytes = [13u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash.clone()))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("PENDING")) })
+                });
+
+            // Should NOT resubmit (sent_at is recent despite old created_at)
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok());
+            let tx_result = result.unwrap();
+            assert_eq!(tx_result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_handle_submitted_state_no_resubmit_before_timeout() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-submitted-young".to_string();
+            tx.status = TransactionStatus::Submitted;
+            // Created just now - below resubmit timeout
+            tx.created_at = Utc::now().to_rfc3339();
+            // Set a hash so it can query provider
+            let tx_hash_bytes = [9u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            // Mock provider to return PENDING status (not SUCCESS or FAILED)
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash.clone()))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("PENDING")) })
+                });
+
+            // Should NOT resubmit
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
+
+            assert!(result.is_ok());
+            let tx_result = result.unwrap();
+            assert_eq!(tx_result.status, TransactionStatus::Submitted);
+        }
+
+        #[tokio::test]
+        async fn test_handle_submitted_state_expired_before_resubmit() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx = create_test_transaction(&relayer.id);
+            tx.id = "tx-submitted-expired-no-resubmit".to_string();
+            tx.status = TransactionStatus::Submitted;
+            tx.created_at = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+            // Set valid_until to a past time (expired)
+            tx.valid_until = Some((Utc::now() - Duration::minutes(5)).to_rfc3339());
+            // Set a hash so it can query provider
+            let tx_hash_bytes = [10u8; 32];
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx.network_data {
+                stellar_data.hash = Some(hex::encode(tx_hash_bytes));
+            }
+
+            let expected_stellar_hash = soroban_rs::xdr::Hash(tx_hash_bytes);
+
+            // Mock provider to return PENDING status
+            mocks
+                .provider
+                .expect_get_transaction()
+                .with(eq(expected_stellar_hash.clone()))
+                .times(1)
+                .returning(move |_| {
+                    Box::pin(async { Ok(dummy_get_transaction_response("PENDING")) })
+                });
+
+            // Should mark as Expired, NOT resubmit
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_id, update| update.status == Some(TransactionStatus::Expired))
+                .times(1)
+                .returning(|id, update| {
+                    let mut updated = create_test_transaction("test");
+                    updated.id = id;
+                    updated.status = update.status.unwrap();
+                    updated.status_reason = update.status_reason.clone();
+                    Ok(updated)
+                });
+
+            // Should NOT resubmit
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            // Notification for expiration
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            // Try to enqueue next pending
+            mocks
+                .tx_repo
+                .expect_find_by_status_paginated()
+                .returning(move |_, _, _, _| {
+                    Ok(PaginatedResult {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        per_page: 1,
+                    })
+                });
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let result = handler.handle_transaction_status_impl(tx, None).await;
 
             assert!(result.is_ok());
             let expired_tx = result.unwrap();
@@ -1938,8 +2638,7 @@ mod tests {
                 MockRelayerRepository, MockTransactionCounterTrait, MockTransactionRepository,
             },
             services::{
-                provider::MockStellarProviderTrait, signer::MockSigner,
-                stellar_dex::MockStellarDexServiceTrait,
+                provider::MockStellarProviderTrait, stellar_dex::MockStellarDexServiceTrait,
             },
         };
         use chrono::{Duration, Utc};
@@ -1949,7 +2648,7 @@ mod tests {
             MockRelayerRepository,
             MockTransactionRepository,
             MockJobProducerTrait,
-            MockSigner,
+            MockStellarCombinedSigner,
             MockStellarProviderTrait,
             MockTransactionCounterTrait,
             MockStellarDexServiceTrait,
@@ -1991,6 +2690,617 @@ mod tests {
         fn test_invalid_format_not_expired() {
             // Invalid format should be treated as not expired (conservative)
             assert!(!TestHandler::is_valid_until_string_expired("not-a-date"));
+        }
+    }
+
+    // Tests for circuit breaker functionality
+    mod circuit_breaker_tests {
+        use super::*;
+        use crate::jobs::StatusCheckContext;
+        use crate::models::NetworkType;
+
+        /// Helper to create a context that should trigger the circuit breaker
+        fn create_triggered_context() -> StatusCheckContext {
+            StatusCheckContext::new(
+                110, // consecutive_failures: exceeds Stellar threshold of 100
+                150, // total_failures
+                160, // total_retries
+                100, // max_consecutive_failures (Stellar default)
+                300, // max_total_failures (Stellar default)
+                NetworkType::Stellar,
+            )
+        }
+
+        /// Helper to create a context that should NOT trigger the circuit breaker
+        fn create_safe_context() -> StatusCheckContext {
+            StatusCheckContext::new(
+                10,  // consecutive_failures: below threshold
+                20,  // total_failures
+                25,  // total_retries
+                100, // max_consecutive_failures
+                300, // max_total_failures
+                NetworkType::Stellar,
+            )
+        }
+
+        /// Helper to create a context that triggers via total failures (safety net)
+        fn create_total_triggered_context() -> StatusCheckContext {
+            StatusCheckContext::new(
+                20,  // consecutive_failures: below threshold
+                310, // total_failures: exceeds Stellar threshold of 300
+                350, // total_retries
+                100, // max_consecutive_failures
+                300, // max_total_failures
+                NetworkType::Stellar,
+            )
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_submitted_marks_as_failed() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx_to_handle = create_test_transaction(&relayer.id);
+            tx_to_handle.status = TransactionStatus::Submitted;
+            tx_to_handle.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+
+            // Expect partial_update to be called with Failed status
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .times(1)
+                .returning(|_, update| {
+                    let mut updated_tx = create_test_transaction("test-relayer");
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            // Mock notification
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            // Try to enqueue next pending (called after lane cleanup)
+            mocks
+                .tx_repo
+                .expect_find_by_status_paginated()
+                .returning(|_, _, _, _| {
+                    Ok(PaginatedResult {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        per_page: 1,
+                    })
+                });
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let ctx = create_triggered_context();
+
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, Some(ctx))
+                .await;
+
+            assert!(result.is_ok());
+            let tx = result.unwrap();
+            assert_eq!(tx.status, TransactionStatus::Failed);
+            assert!(tx.status_reason.is_some());
+            assert!(tx.status_reason.unwrap().contains("consecutive errors"));
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_pending_marks_as_failed() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx_to_handle = create_test_transaction(&relayer.id);
+            tx_to_handle.status = TransactionStatus::Pending;
+            tx_to_handle.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+
+            // Expect partial_update to be called with Failed status
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .times(1)
+                .returning(|_, update| {
+                    let mut updated_tx = create_test_transaction("test-relayer");
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_find_by_status_paginated()
+                .returning(|_, _, _, _| {
+                    Ok(PaginatedResult {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        per_page: 1,
+                    })
+                });
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let ctx = create_triggered_context();
+
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, Some(ctx))
+                .await;
+
+            assert!(result.is_ok());
+            let tx = result.unwrap();
+            assert_eq!(tx.status, TransactionStatus::Failed);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_total_failures_triggers() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx_to_handle = create_test_transaction(&relayer.id);
+            tx_to_handle.status = TransactionStatus::Submitted;
+            tx_to_handle.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status == Some(TransactionStatus::Failed))
+                .times(1)
+                .returning(|_, update| {
+                    let mut updated_tx = create_test_transaction("test-relayer");
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    updated_tx.status_reason = update.status_reason.clone();
+                    Ok(updated_tx)
+                });
+
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_find_by_status_paginated()
+                .returning(|_, _, _, _| {
+                    Ok(PaginatedResult {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        per_page: 1,
+                    })
+                });
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            // Use context that triggers via total failures (safety net)
+            let ctx = create_total_triggered_context();
+
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, Some(ctx))
+                .await;
+
+            assert!(result.is_ok());
+            let tx = result.unwrap();
+            assert_eq!(tx.status, TransactionStatus::Failed);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_below_threshold_continues() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx_to_handle = create_test_transaction(&relayer.id);
+            tx_to_handle.status = TransactionStatus::Submitted;
+            tx_to_handle.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+            let tx_hash_bytes = [1u8; 32];
+            let tx_hash_hex = hex::encode(tx_hash_bytes);
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx_to_handle.network_data
+            {
+                stellar_data.hash = Some(tx_hash_hex.clone());
+            }
+
+            // Below threshold, should continue with normal status checking
+            mocks
+                .provider
+                .expect_get_transaction()
+                .returning(|_| Box::pin(async { Ok(dummy_get_transaction_response("SUCCESS")) }));
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = create_test_transaction("test-relayer");
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    Ok(updated_tx)
+                });
+
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_find_by_status_paginated()
+                .returning(|_, _, _, _| {
+                    Ok(PaginatedResult {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        per_page: 1,
+                    })
+                });
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let ctx = create_safe_context();
+
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, Some(ctx))
+                .await;
+
+            assert!(result.is_ok());
+            let tx = result.unwrap();
+            // Should become Confirmed (normal flow), not Failed (circuit breaker)
+            assert_eq!(tx.status, TransactionStatus::Confirmed);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_final_state_early_return() {
+            let relayer = create_test_relayer();
+            let mocks = default_test_mocks();
+
+            // Transaction is already in final state
+            let mut tx_to_handle = create_test_transaction(&relayer.id);
+            tx_to_handle.status = TransactionStatus::Confirmed;
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+            let ctx = create_triggered_context();
+
+            // Even with triggered context, final states should return early
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle.clone(), Some(ctx))
+                .await;
+
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().id, tx_to_handle.id);
+        }
+
+        #[tokio::test]
+        async fn test_circuit_breaker_no_context_continues() {
+            let relayer = create_test_relayer();
+            let mut mocks = default_test_mocks();
+
+            let mut tx_to_handle = create_test_transaction(&relayer.id);
+            tx_to_handle.status = TransactionStatus::Submitted;
+            tx_to_handle.created_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+            let tx_hash_bytes = [1u8; 32];
+            let tx_hash_hex = hex::encode(tx_hash_bytes);
+            if let NetworkTransactionData::Stellar(ref mut stellar_data) = tx_to_handle.network_data
+            {
+                stellar_data.hash = Some(tx_hash_hex.clone());
+            }
+
+            // No context means no circuit breaker
+            mocks
+                .provider
+                .expect_get_transaction()
+                .returning(|_| Box::pin(async { Ok(dummy_get_transaction_response("SUCCESS")) }));
+
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(|_, update| {
+                    let mut updated_tx = create_test_transaction("test-relayer");
+                    updated_tx.status = update.status.unwrap_or(updated_tx.status);
+                    Ok(updated_tx)
+                });
+
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            mocks
+                .tx_repo
+                .expect_find_by_status_paginated()
+                .returning(|_, _, _, _| {
+                    Ok(PaginatedResult {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        per_page: 1,
+                    })
+                });
+
+            let handler = make_stellar_tx_handler(relayer.clone(), mocks);
+
+            // Pass None for context - should continue normally
+            let result = handler
+                .handle_transaction_status_impl(tx_to_handle, None)
+                .await;
+
+            assert!(result.is_ok());
+            let tx = result.unwrap();
+            assert_eq!(tx.status, TransactionStatus::Confirmed);
+        }
+    }
+
+    mod failure_detail_helper_tests {
+        use super::*;
+        use soroban_rs::xdr::{InvokeHostFunctionResult, OperationResult, OperationResultTr, VecM};
+
+        #[test]
+        fn first_failing_op_finds_trapped() {
+            let ops: VecM<OperationResult> = vec![OperationResult::OpInner(
+                OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Trapped),
+            )]
+            .try_into()
+            .unwrap();
+            assert_eq!(first_failing_op(ops.as_slice()), Some("Trapped"));
+        }
+
+        #[test]
+        fn first_failing_op_skips_success() {
+            let ops: VecM<OperationResult> = vec![
+                OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
+                    InvokeHostFunctionResult::Success(soroban_rs::xdr::Hash([0u8; 32])),
+                )),
+                OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
+                    InvokeHostFunctionResult::ResourceLimitExceeded,
+                )),
+            ]
+            .try_into()
+            .unwrap();
+            assert_eq!(
+                first_failing_op(ops.as_slice()),
+                Some("ResourceLimitExceeded")
+            );
+        }
+
+        #[test]
+        fn first_failing_op_all_success_returns_none() {
+            let ops: VecM<OperationResult> = vec![OperationResult::OpInner(
+                OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Success(
+                    soroban_rs::xdr::Hash([0u8; 32]),
+                )),
+            )]
+            .try_into()
+            .unwrap();
+            assert_eq!(first_failing_op(ops.as_slice()), None);
+        }
+
+        #[test]
+        fn first_failing_op_empty_returns_none() {
+            assert_eq!(first_failing_op(&[]), None);
+        }
+
+        #[test]
+        fn first_failing_op_op_bad_auth() {
+            let ops: VecM<OperationResult> = vec![OperationResult::OpBadAuth].try_into().unwrap();
+            assert_eq!(first_failing_op(ops.as_slice()), Some("OpBadAuth"));
+        }
+
+        #[test]
+        fn format_failure_reason_outer_only() {
+            let s = format_failure_reason("TxBadSeq", None, None, None);
+            assert_eq!(s, "Transaction failed on-chain. reason=TxBadSeq");
+            assert!(!s.contains("inner="));
+            assert!(!s.contains("op="));
+            assert!(!s.contains("contract_error="));
+        }
+
+        #[test]
+        fn format_failure_reason_layers_inner_and_op() {
+            let s = format_failure_reason(
+                "TxFeeBumpInnerFailed",
+                Some("TxFailed"),
+                Some("Trapped"),
+                None,
+            );
+            assert!(s.contains("reason=TxFeeBumpInnerFailed"));
+            assert!(s.contains("inner=TxFailed"));
+            assert!(s.contains("op=Trapped"));
+            assert!(!s.contains("contract_error="));
+        }
+
+        #[test]
+        fn format_failure_reason_classic_op_failure() {
+            let ops: VecM<OperationResult> = vec![OperationResult::OpBadAuth].try_into().unwrap();
+            let op = first_failing_op(ops.as_slice());
+            let s = format_failure_reason("TxFailed", None, op, None);
+            assert!(s.contains("reason=TxFailed"));
+            assert!(s.contains("op=OpBadAuth"));
+            assert!(!s.contains("contract_error="));
+        }
+
+        fn make_diag_event(topics: Vec<ScVal>, data: ScVal) -> DiagnosticEvent {
+            use soroban_rs::xdr::{
+                ContractEvent, ContractEventType, ContractEventV0, ExtensionPoint,
+            };
+            DiagnosticEvent {
+                in_successful_contract_call: false,
+                event: ContractEvent {
+                    ext: ExtensionPoint::V0,
+                    contract_id: None,
+                    type_: ContractEventType::Diagnostic,
+                    body: ContractEventBody::V0(ContractEventV0 {
+                        topics: topics.try_into().unwrap(),
+                        data,
+                    }),
+                },
+            }
+        }
+
+        #[test]
+        fn extract_contract_error_finds_sc_error() {
+            use soroban_rs::xdr::ScError;
+            let evt = make_diag_event(vec![], ScVal::Error(ScError::Contract(5)));
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(5)".to_string())
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_returns_none_for_no_error() {
+            assert_eq!(extract_contract_error(&[]), None);
+            let evt = make_diag_event(
+                vec![ScVal::Symbol("transfer".try_into().unwrap())],
+                ScVal::I32(42),
+            );
+            assert_eq!(extract_contract_error(&[evt]), None);
+        }
+
+        #[test]
+        fn extract_contract_error_finds_error_with_message() {
+            use soroban_rs::xdr::ScError;
+            let evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(5)),
+                ],
+                ScVal::String(soroban_rs::xdr::ScString(
+                    "insufficient balance".try_into().unwrap(),
+                )),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(5) message=\"insufficient balance\"".to_string())
+            );
+        }
+
+        #[test]
+        fn format_failure_reason_includes_contract_error_and_message() {
+            use soroban_rs::xdr::ScError;
+            let evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(5)),
+                ],
+                ScVal::String(soroban_rs::xdr::ScString(
+                    "insufficient balance".try_into().unwrap(),
+                )),
+            );
+            let ce = extract_contract_error(&[evt]);
+            let s = format_failure_reason(
+                "TxFeeBumpInnerFailed",
+                Some("TxFailed"),
+                Some("Trapped"),
+                ce.as_deref(),
+            );
+            assert!(s.contains("reason=TxFeeBumpInnerFailed"));
+            assert!(s.contains("inner=TxFailed"));
+            assert!(s.contains("op=Trapped"));
+            assert!(s.contains("contract_error=Contract(5)"));
+            assert!(s.contains("message=\"insufficient balance\""));
+        }
+
+        #[test]
+        fn extract_contract_error_first_event_wins() {
+            use soroban_rs::xdr::ScError;
+            let no_error_evt = make_diag_event(
+                vec![ScVal::Symbol("fn_call".try_into().unwrap())],
+                ScVal::I32(7),
+            );
+            let first_error_evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(1)),
+                ],
+                ScVal::Void,
+            );
+            let second_error_evt = make_diag_event(
+                vec![
+                    ScVal::Symbol("error".try_into().unwrap()),
+                    ScVal::Error(ScError::Contract(99)),
+                ],
+                ScVal::Void,
+            );
+            assert_eq!(
+                extract_contract_error(&[no_error_evt, first_error_evt, second_error_evt]),
+                Some("Contract(1)".to_string())
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_renders_non_contract_error_types() {
+            use soroban_rs::xdr::{ScError, ScErrorCode};
+            let evt = make_diag_event(
+                vec![],
+                ScVal::Error(ScError::Budget(ScErrorCode::ExceededLimit)),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Budget(ExceededLimit)".to_string())
+            );
+
+            let evt = make_diag_event(
+                vec![],
+                ScVal::Error(ScError::WasmVm(ScErrorCode::InvalidAction)),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("WasmVm(InvalidAction)".to_string())
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_finds_error_nested_in_vec() {
+            use soroban_rs::xdr::{ScError, ScVec};
+            let nested: VecM<ScVal> = vec![
+                ScVal::Symbol("inner".try_into().unwrap()),
+                ScVal::Error(ScError::Contract(42)),
+            ]
+            .try_into()
+            .unwrap();
+            let evt = make_diag_event(
+                vec![ScVal::Symbol("error".try_into().unwrap())],
+                ScVal::Vec(Some(ScVec(nested))),
+            );
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(42) message=\"inner\"".to_string())
+            );
+        }
+
+        #[test]
+        fn sanitize_message_escapes_quotes_and_strips_control_chars() {
+            assert_eq!(sanitize_message("hello"), "hello");
+            assert_eq!(sanitize_message(""), "");
+            assert_eq!(
+                sanitize_message(r#"it has "quotes""#),
+                r#"it has \"quotes\""#
+            );
+            assert_eq!(
+                sanitize_message("multi\nline\twith\rcontrols"),
+                "multilinewithcontrols"
+            );
+        }
+
+        #[test]
+        fn extract_contract_error_decodes_real_prod_xdr() {
+            // Captured 2026-05-06 from prod-mainnet (channels-fund, inner tx
+            // 0de7de8245c9b39ffab6282ea196e0be26b0875c0bf2431ff97affed9eccba9b),
+            // event[1] of the failure's diagnosticEventsXdr stream. Topics
+            // [Symbol("error"), Error(Contract)], data Vec[String, U32(8)].
+            const PROD_EVENT_B64: &str = "AAAAAAAAAAAAAAAB1/5EvQrxHWArEJHy9KH03yEtRE0DIeoyrbPMHLurCgQAAAACAAAAAAAAAAIAAAAPAAAABWVycm9yAAAAAAAAAgAAAAAAAAAIAAAAEAAAAAEAAAACAAAADgAAABtmYWlsaW5nIHdpdGggY29udHJhY3QgZXJyb3IAAAAAAwAAAAg=";
+            let evt = <DiagnosticEvent as soroban_rs::xdr::ReadXdr>::from_xdr_base64(
+                PROD_EVENT_B64,
+                Limits::none(),
+            )
+            .expect("real prod event should parse");
+            assert_eq!(
+                extract_contract_error(&[evt]),
+                Some("Contract(8) message=\"failing with contract error\"".to_string())
+            );
         }
     }
 }

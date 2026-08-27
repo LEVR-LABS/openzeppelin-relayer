@@ -1,5 +1,14 @@
 //! Redis-backed implementation of the TransactionRepository.
 
+use crate::config::ServerConfig;
+use crate::constants::{ALL_TRANSACTION_STATUSES, FINAL_TRANSACTION_STATUSES};
+use crate::domain::transaction::common::is_final_state;
+use crate::metrics::{
+    TRANSACTIONS_BY_STATUS, TRANSACTIONS_CREATED, TRANSACTIONS_FAILED,
+    TRANSACTIONS_INSUFFICIENT_FEE_FAILED, TRANSACTIONS_INSUFFICIENT_FEE_SUCCESS,
+    TRANSACTIONS_SUBMITTED, TRANSACTIONS_SUCCESS, TRANSACTIONS_TRY_AGAIN_LATER_FAILED,
+    TRANSACTIONS_TRY_AGAIN_LATER_SUCCESS, TRANSACTION_PROCESSING_TIME,
+};
 use crate::models::{
     NetworkTransactionData, PaginationQuery, RepositoryError, TransactionRepoModel,
     TransactionStatus, TransactionUpdateRequest,
@@ -9,12 +18,14 @@ use crate::repositories::{
     BatchDeleteResult, BatchRetrievalResult, PaginatedResult, Repository, TransactionDeleteRequest,
     TransactionRepository,
 };
+use crate::utils::RedisConnections;
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
+use chrono::Utc;
+use redis::{AsyncCommands, Script};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 const RELAYER_PREFIX: &str = "relayer";
 const TX_PREFIX: &str = "tx";
@@ -24,10 +35,31 @@ const NONCE_PREFIX: &str = "nonce";
 const TX_TO_RELAYER_PREFIX: &str = "tx_to_relayer";
 const RELAYER_LIST_KEY: &str = "relayer_list";
 const TX_BY_CREATED_AT_PREFIX: &str = "tx_by_created_at";
+const STALE_INDEX_MIN_AGE_SECS: i64 = 3600;
+const STALE_INDEX_PAGE_SIZE: usize = 100;
+const MAX_STALE_INDEX_RECONCILE_ITERATIONS_PER_STATUS: u32 = 1500;
+const NON_FINAL_STATUS_INDEXES: &[TransactionStatus] = &[
+    TransactionStatus::Pending,
+    TransactionStatus::Sent,
+    TransactionStatus::Submitted,
+    TransactionStatus::Mined,
+];
+
+/// How `reconcile_status_index` repairs a stale entry for a given index.
+#[derive(Clone, Copy, PartialEq)]
+enum ReconcileMode {
+    /// Non-final index: promote finalized transactions into their final index
+    /// and leave active (still non-final) mismatches for finalization to repair.
+    Promote,
+    /// Final index: only purge entries whose body is gone. A present body is
+    /// authoritative, so it is left untouched (cross-final mismatches self-heal
+    /// at cleanup). Never re-adds an entry to another index.
+    PurgeOrphans,
+}
 
 #[derive(Clone)]
 pub struct RedisTransactionRepository {
-    pub client: Arc<ConnectionManager>,
+    pub connections: Arc<RedisConnections>,
     pub key_prefix: String,
 }
 
@@ -35,7 +67,7 @@ impl RedisRepository for RedisTransactionRepository {}
 
 impl RedisTransactionRepository {
     pub fn new(
-        connection_manager: Arc<ConnectionManager>,
+        connections: Arc<RedisConnections>,
         key_prefix: String,
     ) -> Result<Self, RepositoryError> {
         if key_prefix.is_empty() {
@@ -45,7 +77,7 @@ impl RedisTransactionRepository {
         }
 
         Ok(Self {
-            client: connection_manager,
+            connections,
             key_prefix,
         })
     }
@@ -69,8 +101,11 @@ impl RedisTransactionRepository {
     /// Generate key for relayer status index (legacy SET): relayer:{relayer_id}:status:{status}
     fn relayer_status_key(&self, relayer_id: &str, status: &TransactionStatus) -> String {
         format!(
-            "{}:{}:{}:{}:{}",
-            self.key_prefix, RELAYER_PREFIX, relayer_id, STATUS_PREFIX, status
+            "{}:{}:{}{}",
+            self.key_prefix,
+            RELAYER_PREFIX,
+            relayer_id,
+            Self::relayer_status_key_suffix(status)
         )
     }
 
@@ -78,9 +113,20 @@ impl RedisTransactionRepository {
     /// Score is created_at timestamp in milliseconds for efficient ordering.
     fn relayer_status_sorted_key(&self, relayer_id: &str, status: &TransactionStatus) -> String {
         format!(
-            "{}:{}:{}:{}:{}",
-            self.key_prefix, RELAYER_PREFIX, relayer_id, STATUS_SORTED_PREFIX, status
+            "{}:{}:{}{}",
+            self.key_prefix,
+            RELAYER_PREFIX,
+            relayer_id,
+            Self::relayer_status_sorted_key_suffix(status)
         )
+    }
+
+    fn relayer_status_key_suffix(status: &TransactionStatus) -> String {
+        format!(":{STATUS_PREFIX}:{status}")
+    }
+
+    fn relayer_status_sorted_key_suffix(status: &TransactionStatus) -> String {
+        format!(":{STATUS_SORTED_PREFIX}:{status}")
     }
 
     /// Generate key for relayer nonce index: relayer:{relayer_id}:nonce:{nonce}
@@ -99,9 +145,170 @@ impl RedisTransactionRepository {
     /// Generate key for relayer's sorted set by created_at: relayer:{relayer_id}:tx_by_created_at
     fn relayer_tx_by_created_at_key(&self, relayer_id: &str) -> String {
         format!(
-            "{}:{}:{}:{}",
-            self.key_prefix, RELAYER_PREFIX, relayer_id, TX_BY_CREATED_AT_PREFIX
+            "{}:{}:{}{}",
+            self.key_prefix,
+            RELAYER_PREFIX,
+            relayer_id,
+            Self::relayer_tx_by_created_at_key_suffix()
         )
+    }
+
+    fn relayer_tx_by_created_at_key_suffix() -> String {
+        format!(":{TX_BY_CREATED_AT_PREFIX}")
+    }
+
+    /// Returns the components needed for Lua scripts to resolve a tx key from
+    /// only the tx_id: (tx_to_relayer lookup key, key prefix, key suffix).
+    /// The Lua script does: `GET KEYS[1]` to get the relayer_id, then
+    /// constructs the tx key as `ARGV[1] .. relayer_id .. ARGV[2]`.
+    fn tx_key_parts(&self, tx_id: &str) -> (String, String, String) {
+        let lookup_key = self.tx_to_relayer_key(tx_id);
+        let key_prefix = format!("{}:{}:", self.key_prefix, RELAYER_PREFIX);
+        let key_suffix = format!(":{TX_PREFIX}:{tx_id}");
+        (lookup_key, key_prefix, key_suffix)
+    }
+
+    /// Executes an atomic Lua script with retry/backoff for transient Redis failures.
+    ///
+    /// Every script receives `KEYS[1]` = tx_to_relayer lookup key and
+    /// `ARGV[1..2]` = key prefix/suffix. `extra_args` are appended as `ARGV[3..]`.
+    /// The script must return the (possibly updated) JSON string or `false` for
+    /// not-found.
+    async fn run_atomic_script(
+        &self,
+        lua: &str,
+        tx_id: &str,
+        extra_args: &[&str],
+        op_name: &str,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        const MAX_RETRIES: u32 = 3;
+        const BASE_BACKOFF_MS: u64 = 100;
+
+        let (lookup_key, key_prefix, key_suffix) = self.tx_key_parts(tx_id);
+        let script = Script::new(lua);
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            let backoff = BASE_BACKOFF_MS * 2u64.pow(attempt);
+
+            let mut conn = match self
+                .get_connection(self.connections.primary(), op_name)
+                .await
+            {
+                Ok(conn) => conn,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES - 1 {
+                        warn!(tx_id = %tx_id, attempt, op = %op_name, "connection failed, retrying");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            let mut invocation = script.prepare_invoke();
+            invocation
+                .key(&lookup_key)
+                .arg(&key_prefix)
+                .arg(&key_suffix);
+            for arg in extra_args {
+                invocation.arg(*arg);
+            }
+
+            match invocation.invoke_async::<Option<String>>(&mut conn).await {
+                Ok(result) => {
+                    let json = result.ok_or_else(|| {
+                        RepositoryError::NotFound(format!("Transaction with ID {tx_id} not found"))
+                    })?;
+                    return self.deserialize_entity::<TransactionRepoModel>(
+                        &json,
+                        tx_id,
+                        "transaction",
+                    );
+                }
+                Err(e) => {
+                    last_error = Some(self.map_redis_error(e, op_name));
+                    if attempt < MAX_RETRIES - 1 {
+                        warn!(
+                            tx_id = %tx_id, attempt, op = %op_name,
+                            "atomic script failed, retrying"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            RepositoryError::UnexpectedError(format!("retry loop exhausted for {op_name}"))
+        }))
+    }
+
+    /// Executes a Lua script with retry/backoff, returning a Vec<String> result
+    /// (for scripts that return Lua tables / multi-bulk replies).
+    /// Returns `Ok(None)` when the script returns `false`.
+    async fn run_script_with_retry_vec(
+        &self,
+        script: &Script,
+        lookup_key: &str,
+        key_prefix: &str,
+        key_suffix: &str,
+        extra_args: &[&str],
+        op_name: &str,
+    ) -> Result<Option<Vec<String>>, RepositoryError> {
+        const MAX_RETRIES: u32 = 3;
+        const BASE_BACKOFF_MS: u64 = 100;
+
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            let backoff = BASE_BACKOFF_MS * 2u64.pow(attempt);
+
+            let mut conn = match self
+                .get_connection(self.connections.primary(), op_name)
+                .await
+            {
+                Ok(conn) => conn,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES - 1 {
+                        warn!(op = %op_name, attempt, "connection failed, retrying");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            };
+
+            let mut invocation = script.prepare_invoke();
+            invocation.key(lookup_key).arg(key_prefix).arg(key_suffix);
+            for arg in extra_args {
+                invocation.arg(*arg);
+            }
+
+            // Redis returns `false` from Lua as a Nil bulk reply, which
+            // redis-rs maps to `None` for `Option<Vec<String>>`.
+            match invocation
+                .invoke_async::<Option<Vec<String>>>(&mut conn)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_error = Some(self.map_redis_error(e, op_name));
+                    if attempt < MAX_RETRIES - 1 {
+                        warn!(op = %op_name, attempt, "script failed, retrying");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            RepositoryError::UnexpectedError(format!("retry loop exhausted for {op_name}"))
+        }))
     }
 
     /// Parse timestamp string to score for sorted set (milliseconds since epoch)
@@ -129,9 +336,209 @@ impl RedisTransactionRepository {
         self.timestamp_to_score(&tx.created_at)
     }
 
+    fn status_json_key(status: &TransactionStatus) -> Result<String, RepositoryError> {
+        let value = serde_json::to_value(status).map_err(|e| {
+            RepositoryError::InvalidData(format!("Failed to serialize transaction status: {e}"))
+        })?;
+
+        value.as_str().map(str::to_string).ok_or_else(|| {
+            RepositoryError::InvalidData("Transaction status serialized as non-string".to_string())
+        })
+    }
+
+    fn partial_update_index_metadata(
+        &self,
+        tx_id: &str,
+        update: &TransactionUpdateRequest,
+    ) -> Result<String, RepositoryError> {
+        let mut sorted_suffixes = serde_json::Map::new();
+        let mut legacy_suffixes = serde_json::Map::new();
+
+        for status in ALL_TRANSACTION_STATUSES {
+            let status_key = Self::status_json_key(status)?;
+            sorted_suffixes.insert(
+                status_key.clone(),
+                serde_json::Value::String(Self::relayer_status_sorted_key_suffix(status)),
+            );
+            legacy_suffixes.insert(
+                status_key,
+                serde_json::Value::String(Self::relayer_status_key_suffix(status)),
+            );
+        }
+
+        let nonfinal_statuses = NON_FINAL_STATUS_INDEXES
+            .iter()
+            .map(Self::status_json_key)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let confirmed_score = if update.status.as_ref() == Some(&TransactionStatus::Confirmed) {
+            update
+                .confirmed_at
+                .as_deref()
+                .map(|confirmed_at| self.timestamp_to_score(confirmed_at).to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        serde_json::to_string(&serde_json::json!({
+            "sorted": sorted_suffixes,
+            "legacy": legacy_suffixes,
+            "nonfinal": nonfinal_statuses,
+            "created_key_suffix": Self::relayer_tx_by_created_at_key_suffix(),
+            "confirmed_score": confirmed_score,
+            "tx_id": tx_id,
+        }))
+        .map_err(|e| {
+            RepositoryError::InvalidData(format!(
+                "Failed to serialize partial update index metadata: {e}"
+            ))
+        })
+    }
+
+    async fn reconcile_status_index(
+        &self,
+        relayer_id: &str,
+        index_status: &TransactionStatus,
+        cutoff_ms: i64,
+        mode: ReconcileMode,
+    ) -> Result<usize, RepositoryError> {
+        let sorted_key = self.relayer_status_sorted_key(relayer_id, index_status);
+        let legacy_key = self.relayer_status_key(relayer_id, index_status);
+        let mut offset = 0usize;
+        let mut total_repaired = 0usize;
+        let mut iterations = 0u32;
+
+        loop {
+            if iterations >= MAX_STALE_INDEX_RECONCILE_ITERATIONS_PER_STATUS {
+                warn!(
+                    relayer_id = %relayer_id,
+                    status = %index_status,
+                    iterations,
+                    total_repaired,
+                    "reached max stale status-index reconciliation iterations, stopping"
+                );
+                break;
+            }
+            iterations += 1;
+
+            let ids: Vec<String> = {
+                let mut conn = self
+                    .get_connection(
+                        self.connections.primary(),
+                        "reconcile_stale_status_indexes_scan",
+                    )
+                    .await?;
+
+                redis::cmd("ZRANGEBYSCORE")
+                    .arg(&sorted_key)
+                    .arg("-inf")
+                    .arg(cutoff_ms)
+                    .arg("LIMIT")
+                    .arg(offset)
+                    .arg(STALE_INDEX_PAGE_SIZE)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| self.map_redis_error(e, "reconcile_stale_status_indexes_scan"))?
+            };
+
+            if ids.is_empty() {
+                break;
+            }
+
+            let batch = self.get_transactions_by_ids(&ids).await?;
+            let failed_ids: HashSet<&str> = batch.failed_ids.iter().map(String::as_str).collect();
+            let transactions_by_id: HashMap<&str, &TransactionRepoModel> = batch
+                .results
+                .iter()
+                .map(|tx| (tx.id.as_str(), tx))
+                .collect();
+
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            let mut repaired_on_page = 0usize;
+
+            for tx_id in &ids {
+                if failed_ids.contains(tx_id.as_str()) {
+                    pipe.zrem(&sorted_key, tx_id);
+                    pipe.srem(&legacy_key, tx_id);
+                    repaired_on_page += 1;
+                    continue;
+                }
+
+                // Final indexes are terminal: a present body is authoritative.
+                // Body-less orphans are already removed by the arm above; a
+                // cross-final mismatch self-heals at cleanup, so never promote
+                // (zadd) here — that is the very race this sweep guards against.
+                if mode == ReconcileMode::PurgeOrphans {
+                    continue;
+                }
+
+                let Some(tx) = transactions_by_id.get(tx_id.as_str()) else {
+                    warn!(
+                        relayer_id = %relayer_id,
+                        status = %index_status,
+                        tx_id = %tx_id,
+                        "transaction body could not be reconciled from stale status index"
+                    );
+                    continue;
+                };
+
+                if FINAL_TRANSACTION_STATUSES.contains(&tx.status) && tx.status != *index_status {
+                    let final_status_key =
+                        self.relayer_status_sorted_key(&tx.relayer_id, &tx.status);
+                    let final_status_score = self.status_sorted_score(tx);
+
+                    pipe.zrem(&sorted_key, tx_id);
+                    pipe.srem(&legacy_key, tx_id);
+                    pipe.zadd(&final_status_key, tx_id, final_status_score);
+                    repaired_on_page += 1;
+                } else if tx.status != *index_status {
+                    // Non-final mismatches may be active transitions; finalization
+                    // is the durable repair point, so do not move them here.
+                    warn!(
+                        relayer_id = %relayer_id,
+                        index_status = %index_status,
+                        body_status = %tx.status,
+                        tx_id = %tx_id,
+                        "skipping non-final transaction status-index mismatch"
+                    );
+                }
+            }
+
+            if repaired_on_page > 0 {
+                let mut conn = self
+                    .get_connection(
+                        self.connections.primary(),
+                        "reconcile_stale_status_indexes_update",
+                    )
+                    .await?;
+                pipe.query_async::<()>(&mut conn).await.map_err(|e| {
+                    self.map_redis_error(e, "reconcile_stale_status_indexes_update")
+                })?;
+                total_repaired += repaired_on_page;
+            } else {
+                offset += ids.len();
+            }
+        }
+
+        Ok(total_repaired)
+    }
+
     /// Batch fetch transactions by IDs using reverse lookup
     async fn get_transactions_by_ids(
         &self,
+        ids: &[String],
+    ) -> Result<BatchRetrievalResult<TransactionRepoModel>, RepositoryError> {
+        self.get_transactions_by_ids_on(self.connections.reader(), ids)
+            .await
+    }
+
+    /// Like [`Self::get_transactions_by_ids`], but reading through the given pool.
+    /// Recovery paths pass the primary pool for read-your-writes consistency.
+    async fn get_transactions_by_ids_on(
+        &self,
+        pool: &Arc<deadpool_redis::Pool>,
         ids: &[String],
     ) -> Result<BatchRetrievalResult<TransactionRepoModel>, RepositoryError> {
         if ids.is_empty() {
@@ -142,7 +549,9 @@ impl RedisTransactionRepository {
             });
         }
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(pool, "batch_fetch_transactions")
+            .await?;
 
         let reverse_keys: Vec<String> = ids.iter().map(|id| self.tx_to_relayer_key(id)).collect();
 
@@ -186,7 +595,6 @@ impl RedisTransactionRepository {
 
         let mut transactions = Vec::new();
         let mut failed_count = 0;
-        let mut failed_ids = Vec::new();
         for (i, value) in values.into_iter().enumerate() {
             match value {
                 Some(json) => {
@@ -253,45 +661,61 @@ impl RedisTransactionRepository {
         relayer_id: &str,
         status: &TransactionStatus,
     ) -> Result<u64, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
         let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
         let legacy_key = self.relayer_status_key(relayer_id, status);
 
-        // Always check if legacy set has data that needs migration
-        // Even if ZSET is non-empty (could be from partial migration failure or rolling deployment)
-        let legacy_count: u64 = conn
-            .scard(&legacy_key)
-            .await
-            .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_scard"))?;
+        // Phase 1: Check if migration is needed
+        let legacy_ids = {
+            let mut conn = self
+                .get_connection(self.connections.primary(), "ensure_status_sorted_set_check")
+                .await?;
 
-        if legacy_count == 0 {
-            // No legacy data to migrate, return current ZSET count
-            let sorted_count: u64 = conn
-                .zcard(&sorted_key)
+            // Always check if legacy set has data that needs migration
+            let legacy_count: u64 = conn
+                .scard(&legacy_key)
                 .await
-                .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_zcard"))?;
-            return Ok(sorted_count);
-        }
+                .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_scard"))?;
 
-        // Migration needed: get all IDs from legacy set
-        debug!(
-            relayer_id = %relayer_id,
-            status = %status,
-            legacy_count = %legacy_count,
-            "migrating status set to sorted set"
-        );
+            if legacy_count == 0 {
+                // No legacy data to migrate, return current ZSET count
+                let sorted_count: u64 = conn
+                    .zcard(&sorted_key)
+                    .await
+                    .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_zcard"))?;
+                return Ok(sorted_count);
+            }
 
-        let legacy_ids: Vec<String> = conn
-            .smembers(&legacy_key)
-            .await
-            .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_smembers"))?;
+            // Migration needed: get all IDs from legacy set
+            debug!(
+                relayer_id = %relayer_id,
+                status = %status,
+                legacy_count = %legacy_count,
+                "migrating status set to sorted set"
+            );
+
+            let ids: Vec<String> = conn
+                .smembers(&legacy_key)
+                .await
+                .map_err(|e| self.map_redis_error(e, "ensure_status_sorted_set_smembers"))?;
+
+            ids
+            // Connection dropped here before nested call to avoid connection doubling
+        };
 
         if legacy_ids.is_empty() {
             return Ok(0);
         }
 
-        // Fetch transactions to get their timestamps for scoring
+        // Phase 2: Fetch transactions (uses its own connection internally)
         let transactions = self.get_transactions_by_ids(&legacy_ids).await?;
+
+        // Phase 3: Perform migration with a new connection
+        let mut conn = self
+            .get_connection(
+                self.connections.primary(),
+                "ensure_status_sorted_set_migrate",
+            )
+            .await?;
 
         if transactions.results.is_empty() {
             // All transactions were stale/deleted, clean up legacy set
@@ -331,12 +755,20 @@ impl RedisTransactionRepository {
     }
 
     /// Update indexes atomically with comprehensive error handling
+    ///
+    /// `include_status_indexes` must be false when the caller already maintained
+    /// the status sorted sets atomically (the partial_update Lua script): replaying
+    /// them here from a possibly stale snapshot can race a concurrent transition
+    /// and re-add an index entry the other writer just removed.
     async fn update_indexes(
         &self,
         tx: &TransactionRepoModel,
         old_tx: Option<&TransactionRepoModel>,
+        include_status_indexes: bool,
     ) -> Result<(), RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "update_indexes")
+            .await?;
         let mut pipe = redis::pipe();
         pipe.atomic();
 
@@ -346,16 +778,18 @@ impl RedisTransactionRepository {
         let relayer_list_key = self.relayer_list_key();
         pipe.sadd(&relayer_list_key, &tx.relayer_id);
 
-        // Compute scores for sorted sets
-        // Status sorted set: uses confirmed_at for Confirmed status, created_at for others
-        let status_score = self.status_sorted_score(tx);
         // Global tx_by_created_at: always uses created_at for consistent ordering
         let created_at_score = self.timestamp_to_score(&tx.created_at);
 
-        // Handle status index updates - write to SORTED SET (new format)
-        let new_status_sorted_key = self.relayer_status_sorted_key(&tx.relayer_id, &tx.status);
-        pipe.zadd(&new_status_sorted_key, &tx.id, status_score);
-        debug!(tx_id = %tx.id, status = %tx.status, score = %status_score, "added transaction to status sorted set");
+        if include_status_indexes {
+            // Status sorted set: uses confirmed_at for Confirmed status, created_at for others
+            let status_score = self.status_sorted_score(tx);
+
+            // Handle status index updates - write to SORTED SET (new format)
+            let new_status_sorted_key = self.relayer_status_sorted_key(&tx.relayer_id, &tx.status);
+            pipe.zadd(&new_status_sorted_key, &tx.id, status_score);
+            debug!(tx_id = %tx.id, status = %tx.status, score = %status_score, "added transaction to status sorted set");
+        }
 
         if let Some(nonce) = self.extract_nonce(&tx.network_data) {
             let nonce_key = self.relayer_nonce_key(&tx.relayer_id, nonce);
@@ -370,7 +804,7 @@ impl RedisTransactionRepository {
 
         // Remove old indexes if updating
         if let Some(old) = old_tx {
-            if old.status != tx.status {
+            if include_status_indexes && old.status != tx.status {
                 // Remove from old status sorted set (new format)
                 let old_status_sorted_key =
                     self.relayer_status_sorted_key(&old.relayer_id, &old.status);
@@ -406,7 +840,9 @@ impl RedisTransactionRepository {
 
     /// Remove all indexes with error recovery
     async fn remove_all_indexes(&self, tx: &TransactionRepoModel) -> Result<(), RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "remove_all_indexes")
+            .await?;
         let mut pipe = redis::pipe();
         pipe.atomic();
 
@@ -458,12 +894,188 @@ impl RedisTransactionRepository {
         debug!(tx_id = %tx.id, "successfully removed all indexes for transaction");
         Ok(())
     }
+
+    /// Track Prometheus metrics when a transaction status changes.
+    fn track_status_change_metrics(
+        &self,
+        _original_tx: &TransactionRepoModel,
+        updated_tx: &TransactionRepoModel,
+        old_status: &TransactionStatus,
+        new_status: &TransactionStatus,
+    ) {
+        let network_type = format!("{:?}", updated_tx.network_type).to_lowercase();
+        let relayer_id = updated_tx.relayer_id.as_str();
+
+        // Track submission (when status changes to Submitted)
+        if *old_status != TransactionStatus::Submitted
+            && *new_status == TransactionStatus::Submitted
+        {
+            TRANSACTIONS_SUBMITTED
+                .with_label_values(&[relayer_id, &network_type])
+                .inc();
+
+            if let Ok(created_time) = chrono::DateTime::parse_from_rfc3339(&updated_tx.created_at) {
+                let processing_seconds =
+                    (Utc::now() - created_time.with_timezone(&Utc)).num_seconds() as f64;
+                TRANSACTION_PROCESSING_TIME
+                    .with_label_values(&[relayer_id, &network_type, "creation_to_submission"])
+                    .observe(processing_seconds);
+            }
+        }
+
+        // Track status distribution (update gauge when status changes)
+        if old_status != new_status {
+            let old_status_str = format!("{old_status:?}").to_lowercase();
+            let old_status_gauge = TRANSACTIONS_BY_STATUS.with_label_values(&[
+                relayer_id,
+                &network_type,
+                &old_status_str,
+            ]);
+            let clamped_value = (old_status_gauge.get() - 1.0).max(0.0);
+            old_status_gauge.set(clamped_value);
+
+            let new_status_str = format!("{new_status:?}").to_lowercase();
+            TRANSACTIONS_BY_STATUS
+                .with_label_values(&[relayer_id, &network_type, &new_status_str])
+                .inc();
+        }
+
+        // Track metrics for final transaction states
+        let was_final = is_final_state(old_status);
+        let is_final = is_final_state(new_status);
+
+        if !was_final && is_final {
+            let previous_status = format!("{old_status:?}").to_lowercase();
+            let meta = updated_tx.metadata.as_ref();
+            let had_insufficient_fee = meta.is_some_and(|m| m.insufficient_fee_retries > 0);
+            let had_try_again_later = meta.is_some_and(|m| m.try_again_later_retries > 0);
+
+            match new_status {
+                TransactionStatus::Confirmed => {
+                    TRANSACTIONS_SUCCESS
+                        .with_label_values(&[relayer_id, &network_type])
+                        .inc();
+                    if had_insufficient_fee {
+                        TRANSACTIONS_INSUFFICIENT_FEE_SUCCESS
+                            .with_label_values(&[relayer_id, &network_type])
+                            .inc();
+                    }
+                    if had_try_again_later {
+                        TRANSACTIONS_TRY_AGAIN_LATER_SUCCESS
+                            .with_label_values(&[relayer_id, &network_type])
+                            .inc();
+                    }
+
+                    if let (Some(sent_at_str), Some(confirmed_at_str)) =
+                        (&updated_tx.sent_at, &updated_tx.confirmed_at)
+                    {
+                        if let (Ok(sent_time), Ok(confirmed_time)) = (
+                            chrono::DateTime::parse_from_rfc3339(sent_at_str),
+                            chrono::DateTime::parse_from_rfc3339(confirmed_at_str),
+                        ) {
+                            let processing_seconds = (confirmed_time.with_timezone(&Utc)
+                                - sent_time.with_timezone(&Utc))
+                            .num_seconds()
+                                as f64;
+                            TRANSACTION_PROCESSING_TIME
+                                .with_label_values(&[
+                                    relayer_id,
+                                    &network_type,
+                                    "submission_to_confirmation",
+                                ])
+                                .observe(processing_seconds);
+                        }
+                    }
+
+                    if let Ok(created_time) =
+                        chrono::DateTime::parse_from_rfc3339(&updated_tx.created_at)
+                    {
+                        if let Some(confirmed_at_str) = &updated_tx.confirmed_at {
+                            if let Ok(confirmed_time) =
+                                chrono::DateTime::parse_from_rfc3339(confirmed_at_str)
+                            {
+                                let processing_seconds = (confirmed_time.with_timezone(&Utc)
+                                    - created_time.with_timezone(&Utc))
+                                .num_seconds()
+                                    as f64;
+                                TRANSACTION_PROCESSING_TIME
+                                    .with_label_values(&[
+                                        relayer_id,
+                                        &network_type,
+                                        "creation_to_confirmation",
+                                    ])
+                                    .observe(processing_seconds);
+                            }
+                        }
+                    }
+                }
+                TransactionStatus::Failed => {
+                    let failure_reason = updated_tx
+                        .status_reason
+                        .as_deref()
+                        .map(|reason| {
+                            if reason.starts_with("Submission failed:") {
+                                "submission_failed"
+                            } else if reason.starts_with("Preparation failed:") {
+                                "preparation_failed"
+                            } else {
+                                "failed"
+                            }
+                        })
+                        .unwrap_or("failed");
+                    TRANSACTIONS_FAILED
+                        .with_label_values(&[
+                            relayer_id,
+                            &network_type,
+                            failure_reason,
+                            &previous_status,
+                        ])
+                        .inc();
+                }
+                TransactionStatus::Expired => {
+                    TRANSACTIONS_FAILED
+                        .with_label_values(&[
+                            relayer_id,
+                            &network_type,
+                            "expired",
+                            &previous_status,
+                        ])
+                        .inc();
+                }
+                TransactionStatus::Canceled => {
+                    TRANSACTIONS_FAILED
+                        .with_label_values(&[
+                            relayer_id,
+                            &network_type,
+                            "canceled",
+                            &previous_status,
+                        ])
+                        .inc();
+                }
+                _ => {}
+            }
+
+            // Track retry-related failure metrics for all non-success final states
+            if *new_status != TransactionStatus::Confirmed {
+                if had_insufficient_fee {
+                    TRANSACTIONS_INSUFFICIENT_FEE_FAILED
+                        .with_label_values(&[relayer_id, &network_type])
+                        .inc();
+                }
+                if had_try_again_later {
+                    TRANSACTIONS_TRY_AGAIN_LATER_FAILED
+                        .with_label_values(&[relayer_id, &network_type])
+                        .inc();
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Debug for RedisTransactionRepository {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RedisTransactionRepository")
-            .field("client", &"<ConnectionManager>")
+            .field("connections", &"<RedisConnections>")
             .field("key_prefix", &self.key_prefix)
             .finish()
     }
@@ -483,7 +1095,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
         let key = self.tx_key(&entity.relayer_id, &entity.id);
         let reverse_key = self.tx_to_relayer_key(&entity.id);
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "create")
+            .await?;
 
         debug!(tx_id = %entity.id, "creating transaction");
 
@@ -513,10 +1127,24 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             .map_err(|e| self.map_redis_error(e, "create_transaction"))?;
 
         // Update indexes separately to handle partial failures gracefully
-        if let Err(e) = self.update_indexes(&entity, None).await {
+        if let Err(e) = self.update_indexes(&entity, None, true).await {
             error!(tx_id = %entity.id, error = %e, "failed to update indexes for new transaction");
             return Err(e);
         }
+
+        // Track transaction creation metric
+        let network_type = format!("{:?}", entity.network_type).to_lowercase();
+        let relayer_id = entity.relayer_id.as_str();
+        TRANSACTIONS_CREATED
+            .with_label_values(&[relayer_id, &network_type])
+            .inc();
+
+        // Track initial status distribution (Pending)
+        let status = &entity.status;
+        let status_str = format!("{status:?}").to_lowercase();
+        TRANSACTIONS_BY_STATUS
+            .with_label_values(&[relayer_id, &network_type, &status_str])
+            .inc();
 
         debug!(tx_id = %entity.id, "successfully created transaction");
         Ok(entity)
@@ -529,7 +1157,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             ));
         }
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "get_by_id")
+            .await?;
 
         debug!(tx_id = %id, "fetching transaction");
 
@@ -573,7 +1203,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
     // Unoptimized implementation of list_paginated. Rarely used. find_by_relayer_id is preferred.
     async fn list_all(&self) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "list_all")
+            .await?;
 
         debug!("fetching all transactions sorted by created_at (newest first)");
 
@@ -586,8 +1218,8 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
         debug!(count = %relayer_ids.len(), "found relayers");
 
-        // Collect all transactions from all relayers using their sorted sets
-        let mut all_transactions = Vec::new();
+        // Collect all transaction IDs from all relayers using their sorted sets
+        let mut all_tx_ids = Vec::new();
         for relayer_id in relayer_ids {
             let relayer_sorted_key = self.relayer_tx_by_created_at_key(&relayer_id);
             let tx_ids: Vec<String> = redis::cmd("ZRANGE")
@@ -599,9 +1231,15 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
                 .await
                 .map_err(|e| self.map_redis_error(e, "list_all_relayer_sorted"))?;
 
-            let batch_result = self.get_transactions_by_ids(&tx_ids).await?;
-            all_transactions.extend(batch_result.results);
+            all_tx_ids.extend(tx_ids);
         }
+
+        // Release connection before nested call to avoid connection doubling
+        drop(conn);
+
+        // Batch fetch all transactions at once
+        let batch_result = self.get_transactions_by_ids(&all_tx_ids).await?;
+        let mut all_transactions = batch_result.results;
 
         // Sort all transactions by created_at (newest first)
         all_transactions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -621,7 +1259,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             ));
         }
 
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "list_paginated")
+            .await?;
 
         debug!(page = %query.page, per_page = %query.per_page, "fetching paginated transactions sorted by created_at (newest first)");
 
@@ -632,8 +1272,8 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "list_paginated_relayer_ids"))?;
 
-        // Collect all transactions from all relayers using their sorted sets
-        let mut all_transactions = Vec::new();
+        // Collect all transaction IDs from all relayers using their sorted sets
+        let mut all_tx_ids = Vec::new();
         for relayer_id in relayer_ids {
             let relayer_sorted_key = self.relayer_tx_by_created_at_key(&relayer_id);
             let tx_ids: Vec<String> = redis::cmd("ZRANGE")
@@ -645,9 +1285,15 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
                 .await
                 .map_err(|e| self.map_redis_error(e, "list_paginated_relayer_sorted"))?;
 
-            let batch_result = self.get_transactions_by_ids(&tx_ids).await?;
-            all_transactions.extend(batch_result.results);
+            all_tx_ids.extend(tx_ids);
         }
+
+        // Release connection before nested call to avoid connection doubling
+        drop(conn);
+
+        // Batch fetch all transactions at once
+        let batch_result = self.get_transactions_by_ids(&all_tx_ids).await?;
+        let mut all_transactions = batch_result.results;
 
         // Sort all transactions by created_at (newest first)
         all_transactions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -695,7 +1341,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
         let old_tx = self.get_by_id(id.clone()).await?;
 
         let key = self.tx_key(&entity.relayer_id, &id);
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "update")
+            .await?;
 
         let value = self.serialize_entity(&entity, |t| &t.id, "transaction")?;
 
@@ -706,7 +1354,7 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
             .map_err(|e| self.map_redis_error(e, "update_transaction"))?;
 
         // Update indexes
-        self.update_indexes(&entity, Some(&old_tx)).await?;
+        self.update_indexes(&entity, Some(&old_tx), true).await?;
 
         debug!(tx_id = %id, "successfully updated transaction");
         Ok(entity)
@@ -726,7 +1374,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
         let key = self.tx_key(&tx.relayer_id, &id);
         let reverse_key = self.tx_to_relayer_key(&id);
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "delete_by_id")
+            .await?;
 
         let mut pipe = redis::pipe();
         pipe.atomic();
@@ -748,7 +1398,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
 
     // Unoptimized implementation of count. Rarely used. find_by_relayer_id is preferred.
     async fn count(&self) -> Result<usize, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "count")
+            .await?;
 
         debug!("counting transactions");
 
@@ -774,7 +1426,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
     }
 
     async fn has_entries(&self) -> Result<bool, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "has_entries")
+            .await?;
         let relayer_list_key = self.relayer_list_key();
 
         debug!("checking if transaction entries exist");
@@ -789,7 +1443,9 @@ impl Repository<TransactionRepoModel, String> for RedisTransactionRepository {
     }
 
     async fn drop_all_entries(&self) -> Result<(), RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "drop_all_entries")
+            .await?;
         let relayer_list_key = self.relayer_list_key();
 
         debug!("dropping all transaction entries");
@@ -893,7 +1549,9 @@ impl TransactionRepository for RedisTransactionRepository {
         relayer_id: &str,
         query: PaginationQuery,
     ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "find_by_relayer_id")
+            .await?;
 
         debug!(relayer_id = %relayer_id, page = %query.page, per_page = %query.per_page, "fetching transactions for relayer sorted by created_at (newest first)");
 
@@ -943,6 +1601,9 @@ impl TransactionRepository for RedisTransactionRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "find_by_relayer_id_sorted"))?;
 
+        // Release connection before nested call to avoid connection doubling
+        drop(conn);
+
         let items = self.get_transactions_by_ids(&page_ids).await?;
 
         debug!(relayer_id = %relayer_id, count = %items.results.len(), page = %query.page, "successfully fetched transactions for relayer");
@@ -961,14 +1622,21 @@ impl TransactionRepository for RedisTransactionRepository {
         relayer_id: &str,
         statuses: &[TransactionStatus],
     ) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        // Ensure all status sorted sets are migrated first (releases connection after each)
+        for status in statuses {
+            self.ensure_status_sorted_set(relayer_id, status).await?;
+        }
 
-        // Ensure all status sorted sets are migrated and collect IDs
+        // Read through the primary: this feeds recovery paths (nonce/sequence counter
+        // rewinds) that must observe their own just-written resets and freshly persisted
+        // transactions — a lagging read replica could hide an active record and let the
+        // rewind reclaim a sequence that is still in flight.
+        let mut conn = self
+            .get_connection(self.connections.primary(), "find_by_status")
+            .await?;
+
         let mut all_ids: Vec<String> = Vec::new();
         for status in statuses {
-            // Trigger migration if needed
-            self.ensure_status_sorted_set(relayer_id, status).await?;
-
             // Get IDs from sorted set (already ordered by created_at)
             let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
             let ids: Vec<String> = redis::cmd("ZRANGE")
@@ -983,6 +1651,9 @@ impl TransactionRepository for RedisTransactionRepository {
             all_ids.extend(ids);
         }
 
+        // Release connection before nested call to avoid connection doubling
+        drop(conn);
+
         if all_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -991,8 +1662,11 @@ impl TransactionRepository for RedisTransactionRepository {
         all_ids.sort();
         all_ids.dedup();
 
-        // Fetch all transactions and sort by created_at (newest first)
-        let mut transactions = self.get_transactions_by_ids(&all_ids).await?;
+        // Fetch all transactions and sort by created_at (newest first); bodies are read
+        // from the primary for the same consistency reason as the index scan above
+        let mut transactions = self
+            .get_transactions_by_ids_on(self.connections.primary(), &all_ids)
+            .await?;
 
         // Sort by created_at descending (newest first)
         transactions
@@ -1009,12 +1683,14 @@ impl TransactionRepository for RedisTransactionRepository {
         query: PaginationQuery,
         oldest_first: bool,
     ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
-
-        // Ensure all status sorted sets are migrated
+        // Ensure all status sorted sets are migrated first (releases connection after each)
         for status in statuses {
             self.ensure_status_sorted_set(relayer_id, status).await?;
         }
+
+        let mut conn = self
+            .get_connection(self.connections.reader(), "find_by_status_paginated")
+            .await?;
 
         // For single status, we can paginate directly from the sorted set
         if statuses.len() == 1 {
@@ -1050,6 +1726,9 @@ impl TransactionRepository for RedisTransactionRepository {
                 .query_async(&mut conn)
                 .await
                 .map_err(|e| self.map_redis_error(e, "find_by_status_paginated"))?;
+
+            // Release connection before nested call to avoid connection doubling
+            drop(conn);
 
             let transactions = self.get_transactions_by_ids(&page_ids).await?;
 
@@ -1087,6 +1766,9 @@ impl TransactionRepository for RedisTransactionRepository {
 
             all_ids.extend(ids_with_scores);
         }
+
+        // Release connection before nested call to avoid connection doubling
+        drop(conn);
 
         // Remove duplicates (keep highest/lowest score based on sort order)
         let mut id_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -1153,12 +1835,116 @@ impl TransactionRepository for RedisTransactionRepository {
         })
     }
 
+    async fn find_by_status_paginated_filtered(
+        &self,
+        relayer_id: &str,
+        statuses: &[TransactionStatus],
+        query: PaginationQuery,
+        oldest_first: bool,
+        exclude_canceled: bool,
+    ) -> Result<PaginatedResult<TransactionRepoModel>, RepositoryError> {
+        if !exclude_canceled {
+            return self
+                .find_by_status_paginated(relayer_id, statuses, query, oldest_first)
+                .await;
+        }
+
+        // Excluding cancelled-in-progress transactions means removing them BEFORE
+        // counting and paginating, which the per-status sorted-set fast path (zcard +
+        // ZRANGE) cannot do. So for this listing-only path we load all matching
+        // transactions, drop the cancelled ones, then sort/paginate in memory. The hot
+        // internal callers use the unfiltered fast method above.
+        for status in statuses {
+            self.ensure_status_sorted_set(relayer_id, status).await?;
+        }
+
+        let mut conn = self
+            .get_connection(
+                self.connections.reader(),
+                "find_by_status_paginated_filtered",
+            )
+            .await?;
+
+        // Collect all ids (with scores) across the requested statuses.
+        let mut all_ids: Vec<(String, f64)> = Vec::new();
+        for status in statuses {
+            let sorted_key = self.relayer_status_sorted_key(relayer_id, status);
+            let ids_with_scores: Vec<(String, f64)> = redis::cmd("ZRANGE")
+                .arg(&sorted_key)
+                .arg(0)
+                .arg(-1)
+                .arg("WITHSCORES")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "find_by_status_paginated_filtered"))?;
+            all_ids.extend(ids_with_scores);
+        }
+
+        drop(conn);
+
+        // Dedup across statuses, keeping the extreme score for the sort direction.
+        let mut id_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (id, score) in all_ids {
+            id_map
+                .entry(id)
+                .and_modify(|s| {
+                    if oldest_first {
+                        if score < *s {
+                            *s = score
+                        }
+                    } else if score > *s {
+                        *s = score
+                    }
+                })
+                .or_insert(score);
+        }
+
+        let mut sorted_ids: Vec<(String, f64)> = id_map.into_iter().collect();
+        if oldest_first {
+            sorted_ids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            sorted_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let ordered_ids: Vec<String> = sorted_ids.into_iter().map(|(id, _)| id).collect();
+
+        // Load all matching transactions, then filter + paginate, preserving sort order.
+        let fetched = self.get_transactions_by_ids(&ordered_ids).await?;
+        let mut by_id: std::collections::HashMap<String, TransactionRepoModel> = fetched
+            .results
+            .into_iter()
+            .map(|t| (t.id.clone(), t))
+            .collect();
+
+        let filtered: Vec<TransactionRepoModel> = ordered_ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .filter(|t| t.is_canceled != Some(true))
+            .collect();
+
+        let total = filtered.len() as u64;
+        let start = ((query.page.saturating_sub(1)) * query.per_page) as usize;
+        let items: Vec<TransactionRepoModel> = filtered
+            .into_iter()
+            .skip(start)
+            .take(query.per_page as usize)
+            .collect();
+
+        Ok(PaginatedResult {
+            items,
+            total,
+            page: query.page,
+            per_page: query.per_page,
+        })
+    }
+
     async fn find_by_nonce(
         &self,
         relayer_id: &str,
         nonce: u64,
     ) -> Result<Option<TransactionRepoModel>, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "find_by_nonce")
+            .await?;
         let nonce_key = self.relayer_nonce_key(relayer_id, nonce);
 
         // Get transaction ID with this nonce for this relayer (should be single value)
@@ -1183,6 +1969,89 @@ impl TransactionRepository for RedisTransactionRepository {
         }
     }
 
+    async fn get_nonce_occupancy(
+        &self,
+        relayer_id: &str,
+        from_nonce: u64,
+        to_nonce: u64,
+    ) -> Result<Vec<(u64, Option<TransactionStatus>)>, RepositoryError> {
+        if from_nonce >= to_nonce {
+            return Ok(vec![]);
+        }
+
+        let nonces: Vec<u64> = (from_nonce..to_nonce).collect();
+        let nonce_keys: Vec<String> = nonces
+            .iter()
+            .map(|n| self.relayer_nonce_key(relayer_id, *n))
+            .collect();
+
+        // Phase 1: MGET nonce keys → tx_ids (single round trip)
+        // Uses primary to avoid replica lag fabricating false gaps.
+        let mut conn = self
+            .get_connection(self.connections.primary(), "get_nonce_occupancy")
+            .await?;
+        let tx_ids: Vec<Option<String>> = redis::cmd("MGET")
+            .arg(&nonce_keys)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "get_nonce_occupancy:mget_nonces"))?;
+
+        // Build tx data keys for non-None slots. We know the relayer_id so we
+        // skip the reverse lookup and go straight to the data key.
+        let mut tx_key_entries: Vec<(usize, String)> = Vec::new();
+        for (i, tx_id) in tx_ids.iter().enumerate() {
+            if let Some(id) = tx_id {
+                tx_key_entries.push((i, self.tx_key(relayer_id, id)));
+            }
+        }
+
+        // Phase 2: MGET tx data keys → JSON blobs (single round trip)
+        let tx_statuses: Vec<Option<TransactionStatus>> = if tx_key_entries.is_empty() {
+            vec![]
+        } else {
+            let data_keys: Vec<&str> = tx_key_entries.iter().map(|(_, k)| k.as_str()).collect();
+            let raw_values: Vec<Option<String>> = redis::cmd("MGET")
+                .arg(&data_keys)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| self.map_redis_error(e, "get_nonce_occupancy:mget_txs"))?;
+
+            raw_values
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.and_then(|json| {
+                        match serde_json::from_str::<TransactionRepoModel>(&json) {
+                            Ok(tx) => Some(tx.status),
+                            Err(e) => {
+                                let nonce = tx_key_entries.get(i).map(|(idx, _)| nonces[*idx]);
+                                warn!(
+                                    relayer_id = %relayer_id,
+                                    nonce = ?nonce,
+                                    error = %e,
+                                    "get_nonce_occupancy: failed to deserialize transaction, treating as empty"
+                                );
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        // Assemble results
+        let mut results: Vec<(u64, Option<TransactionStatus>)> =
+            nonces.iter().map(|n| (*n, None)).collect();
+
+        for (idx, (original_idx, _)) in tx_key_entries.iter().enumerate() {
+            if let Some(status) = tx_statuses.get(idx).and_then(|s| s.clone()) {
+                results[*original_idx].1 = Some(status);
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn update_status(
         &self,
         tx_id: String,
@@ -1200,61 +2069,248 @@ impl TransactionRepository for RedisTransactionRepository {
         tx_id: String,
         update: TransactionUpdateRequest,
     ) -> Result<TransactionRepoModel, RepositoryError> {
-        const MAX_RETRIES: u32 = 3;
-        const BACKOFF_MS: u64 = 100;
+        // Serialize only the non-None fields as a JSON patch.
+        let patch_json = serde_json::to_string(&update).map_err(|e| {
+            RepositoryError::InvalidData(format!("Failed to serialize update patch: {e}"))
+        })?;
 
-        // Fetch the original transaction state ONCE before retrying.
-        // This is critical: if conn.set() succeeds but update_indexes() fails,
-        // subsequent retries must still reference the original state to remove
-        // stale index entries. Otherwise, get_by_id() returns the already-updated
-        // record and update_indexes() skips removing the old indexes.
-        let original_tx = self.get_by_id(tx_id.clone()).await?;
-        let mut updated_tx = original_tx.clone();
-        updated_tx.apply_partial_update(update.clone());
-
-        let key = self.tx_key(&updated_tx.relayer_id, &tx_id);
-        let value = self.serialize_entity(&updated_tx, |t| &t.id, "transaction")?;
-
-        let mut last_error = None;
-
-        for attempt in 0..MAX_RETRIES {
-            let mut conn = self.client.as_ref().clone();
-
-            // Try to update transaction data
-            let result: Result<(), _> = conn.set(&key, &value).await;
-            match result {
-                Ok(_) => {}
-                Err(e) => {
-                    if attempt < MAX_RETRIES - 1 {
-                        warn!(tx_id = %tx_id, attempt = %attempt, error = %e, "failed to set transaction data, retrying");
-                        last_error = Some(self.map_redis_error(e, "partial_update"));
-                        tokio::time::sleep(tokio::time::Duration::from_millis(BACKOFF_MS)).await;
-                        continue;
-                    }
-                    return Err(self.map_redis_error(e, "partial_update"));
-                }
+        // If the update sets a final status, compute delete_at in Rust (depends on server config)
+        // and include it in the patch so the Lua script applies it atomically.
+        let delete_at_value = if let Some(ref status) = update.status {
+            if FINAL_TRANSACTION_STATUSES.contains(status) {
+                let expiration_hours = ServerConfig::get_transaction_expiration_hours();
+                let seconds = (expiration_hours * 3600.0) as i64;
+                let delete_time = Utc::now() + chrono::Duration::seconds(seconds);
+                Some(delete_time.to_rfc3339())
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        let delete_at_arg = delete_at_value.as_deref().unwrap_or("");
+        // The Lua script only decodes ARGV[5] on a status change, so skip
+        // building the metadata for non-status patches.
+        let index_metadata_json = if update.status.is_some() {
+            self.partial_update_index_metadata(&tx_id, &update)?
+        } else {
+            String::new()
+        };
 
-            // Try to update indexes with the original pre-update state
-            // This ensures stale indexes are removed even on retry attempts
-            match self.update_indexes(&updated_tx, Some(&original_tx)).await {
-                Ok(_) => {
-                    debug!(tx_id = %tx_id, attempt = %attempt, "successfully updated transaction");
-                    return Ok(updated_tx);
-                }
-                Err(e) if attempt < MAX_RETRIES - 1 => {
-                    warn!(tx_id = %tx_id, attempt = %attempt, error = %e, "failed to update indexes, retrying");
-                    last_error = Some(e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(BACKOFF_MS)).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
+        let (lookup_key, key_prefix, key_suffix) = self.tx_key_parts(&tx_id);
+
+        // Lua script: atomically applies a JSON patch to the stored transaction.
+        // Guards: rejects status changes on already-finalized transactions.
+        // Returns a two-element array {old_json, new_json} so Rust has the full
+        // pre-update state for index cleanup and metrics.
+        // Returns false if tx not found.
+        let patch_script = Script::new(
+            r#"
+            local relayer_id = redis.call('GET', KEYS[1])
+            if not relayer_id then return false end
+
+            local tx_key = ARGV[1] .. relayer_id .. ARGV[2]
+            local current = redis.call('GET', tx_key)
+            if not current then return false end
+
+            local tx = cjson.decode(current)
+            local patch = cjson.decode(ARGV[3])
+
+            -- Guard: reject status changes on finalized transactions.
+            -- A stale worker must not resurrect a tx that another worker
+            -- already moved to a terminal state.
+            local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
+            if final_states[tx["status"]] and patch["status"] then
+                return {current, current}
+            end
+
+            local old_snapshot = current
+            local old_status = tx["status"]
+
+            -- lua-cjson cannot distinguish empty Lua tables from empty
+            -- arrays, so a decode/encode round-trip turns [] into {}.
+            -- Record which keys held [] in the stored doc and the patch
+            -- so we can restore them after cjson.encode.
+            -- NOTE: this relies on each array-typed field having a unique key
+            -- name across the entire JSON document (including nested objects).
+            -- If the model ever introduces duplicate key names at different
+            -- nesting levels (e.g. metadata.hashes), the gsub below could
+            -- restore the wrong occurrence.
+            local empty_arrs = {}
+            for k in string.gmatch(current, '"([^"]+)"%s*:%s*%[%s*%]') do
+                empty_arrs[k] = true
+            end
+            for k in string.gmatch(ARGV[3], '"([^"]+)"%s*:%s*%[%s*%]') do
+                empty_arrs[k] = true
+            end
+
+            for k, v in pairs(patch) do
+                tx[k] = v
+            end
+
+            -- Apply delete_at if transitioning to a final state and not already set
+            if ARGV[4] ~= '' and (not tx["delete_at"] or tx["delete_at"] == cjson.null) then
+                tx["delete_at"] = ARGV[4]
+            end
+
+            local updated = cjson.encode(tx)
+            local new_status = tx["status"]
+
+            -- Restore empty arrays that cjson.encode converted to {}
+            for k, _ in pairs(empty_arrs) do
+                updated = string.gsub(
+                    updated, '"'..k..'"%s*:%s*{}', '"'..k..'":[]', 1
+                )
+            end
+
+            local index_meta = nil
+            if patch["status"] and new_status ~= old_status then
+                index_meta = cjson.decode(ARGV[5])
+            end
+
+            redis.call('SET', tx_key, updated)
+
+            if index_meta then
+                local tx_id = index_meta["tx_id"]
+                local new_status_sorted_suffix = index_meta["sorted"][new_status]
+                local old_status_sorted_suffix = index_meta["sorted"][old_status]
+                local old_status_legacy_suffix = index_meta["legacy"][old_status]
+
+                if new_status_sorted_suffix then
+                    local score = nil
+                    if new_status == "confirmed" and index_meta["confirmed_score"] ~= "" then
+                        score = index_meta["confirmed_score"]
+                    else
+                        local created_key = ARGV[1] .. relayer_id .. index_meta["created_key_suffix"]
+                        score = redis.call('ZSCORE', created_key, tx_id)
+                        if not score then score = 0 end
+                    end
+
+                    redis.call('ZADD', ARGV[1] .. relayer_id .. new_status_sorted_suffix, score, tx_id)
+                end
+
+                if old_status_sorted_suffix then
+                    redis.call('ZREM', ARGV[1] .. relayer_id .. old_status_sorted_suffix, tx_id)
+                end
+                if old_status_legacy_suffix then
+                    redis.call('SREM', ARGV[1] .. relayer_id .. old_status_legacy_suffix, tx_id)
+                end
+
+                if final_states[new_status] then
+                    for _, status in ipairs(index_meta["nonfinal"]) do
+                        local sorted_suffix = index_meta["sorted"][status]
+                        local legacy_suffix = index_meta["legacy"][status]
+                        if sorted_suffix then
+                            redis.call('ZREM', ARGV[1] .. relayer_id .. sorted_suffix, tx_id)
+                        end
+                        if legacy_suffix then
+                            redis.call('SREM', ARGV[1] .. relayer_id .. legacy_suffix, tx_id)
+                        end
+                    end
+                end
+            end
+
+            return {old_snapshot, updated}
+            "#,
+        );
+
+        let result: Option<Vec<String>> = self
+            .run_script_with_retry_vec(
+                &patch_script,
+                &lookup_key,
+                &key_prefix,
+                &key_suffix,
+                &[&patch_json, delete_at_arg, &index_metadata_json],
+                "partial_update",
+            )
+            .await?;
+
+        let parts = result.ok_or_else(|| {
+            RepositoryError::NotFound(format!("Transaction with ID {tx_id} not found"))
+        })?;
+
+        if parts.len() != 2 {
+            return Err(RepositoryError::UnexpectedError(format!(
+                "partial_update script returned {} elements, expected 2",
+                parts.len()
+            )));
+        }
+
+        let old_json = &parts[0];
+        let new_json = &parts[1];
+
+        let original_tx =
+            self.deserialize_entity::<TransactionRepoModel>(old_json, &tx_id, "transaction")?;
+        let updated_tx =
+            self.deserialize_entity::<TransactionRepoModel>(new_json, &tx_id, "transaction")?;
+
+        // Update the auxiliary indexes (nonce, relayer list, tx_by_created_at).
+        // Status sorted sets are excluded: the Lua script above already moved
+        // them atomically with the body write.
+        self.update_indexes(&updated_tx, Some(&original_tx), false)
+            .await?;
+
+        debug!(tx_id = %tx_id, "successfully updated transaction via patch");
+
+        // Track metrics only when the persisted status actually changed.
+        // The Lua script may silently reject a status patch on already-final
+        // transactions, so we compare the deserialized before/after states.
+        if original_tx.status != updated_tx.status {
+            self.track_status_change_metrics(
+                &original_tx,
+                &updated_tx,
+                &original_tx.status,
+                &updated_tx.status,
+            );
+        }
+
+        Ok(updated_tx)
+    }
+
+    async fn reconcile_stale_status_indexes(
+        &self,
+        relayer_id: &str,
+    ) -> Result<usize, RepositoryError> {
+        let cutoff_ms =
+            (Utc::now() - chrono::Duration::seconds(STALE_INDEX_MIN_AGE_SECS)).timestamp_millis();
+        let mut total_repaired = 0usize;
+        let mut per_status_counts = Vec::new();
+
+        // Non-final indexes: promote finalized ghosts into their final index so
+        // the following cleanup run reaps them; purge entries whose body is gone.
+        for status in NON_FINAL_STATUS_INDEXES {
+            let repaired = self
+                .reconcile_status_index(relayer_id, status, cutoff_ms, ReconcileMode::Promote)
+                .await?;
+            if repaired > 0 {
+                per_status_counts.push((status.to_string(), repaired));
+                total_repaired += repaired;
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            RepositoryError::UnexpectedError("partial_update exhausted retries".to_string())
-        }))
+        // Final indexes: purge body-less orphans. These are dangles left when a
+        // body was deleted (crash or partial delete) but its final-index entry
+        // survived — nothing else ever reaps them.
+        for status in FINAL_TRANSACTION_STATUSES {
+            let repaired = self
+                .reconcile_status_index(relayer_id, status, cutoff_ms, ReconcileMode::PurgeOrphans)
+                .await?;
+            if repaired > 0 {
+                per_status_counts.push((status.to_string(), repaired));
+                total_repaired += repaired;
+            }
+        }
+
+        if total_repaired > 0 {
+            info!(
+                relayer_id = %relayer_id,
+                repaired_count = total_repaired,
+                per_status_counts = ?per_status_counts,
+                "reconciled stale transaction status indexes"
+            );
+        }
+
+        Ok(total_repaired)
     }
 
     async fn update_network_data(
@@ -1281,6 +2337,191 @@ impl TransactionRepository for RedisTransactionRepository {
         self.partial_update(tx_id, update).await
     }
 
+    async fn increment_status_check_failures(
+        &self,
+        tx_id: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        self.run_atomic_script(
+            r#"
+            local function set_obj(json, key, tbl)
+                local enc = cjson.encode(tbl)
+                local r, n = string.gsub(json, '"'..key..'"%s*:%s*%b{}', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                r, n = string.gsub(json, '"'..key..'"%s*:%s*null', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                return string.gsub(json, '}%s*$', ',"'..key..'":'..enc..'}', 1)
+            end
+
+            local relayer_id = redis.call('GET', KEYS[1])
+            if not relayer_id then return false end
+
+            local tx_key = ARGV[1] .. relayer_id .. ARGV[2]
+            local current = redis.call('GET', tx_key)
+            if not current then return false end
+
+            local tx = cjson.decode(current)
+            local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
+            if final_states[tx["status"]] then return current end
+
+            local metadata = tx["metadata"]
+            if type(metadata) ~= 'table' then metadata = {} end
+            metadata["consecutive_failures"] = (metadata["consecutive_failures"] or 0) + 1
+            metadata["total_failures"] = (metadata["total_failures"] or 0) + 1
+
+            local updated = set_obj(current, "metadata", metadata)
+            redis.call('SET', tx_key, updated)
+            return updated
+            "#,
+            &tx_id,
+            &[],
+            "increment_status_check_failures",
+        )
+        .await
+    }
+
+    async fn reset_status_check_consecutive_failures(
+        &self,
+        tx_id: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        self.run_atomic_script(
+            r#"
+            local function set_obj(json, key, tbl)
+                local enc = cjson.encode(tbl)
+                local r, n = string.gsub(json, '"'..key..'"%s*:%s*%b{}', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                r, n = string.gsub(json, '"'..key..'"%s*:%s*null', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                return string.gsub(json, '}%s*$', ',"'..key..'":'..enc..'}', 1)
+            end
+
+            local relayer_id = redis.call('GET', KEYS[1])
+            if not relayer_id then return false end
+
+            local tx_key = ARGV[1] .. relayer_id .. ARGV[2]
+            local current = redis.call('GET', tx_key)
+            if not current then return false end
+
+            local tx = cjson.decode(current)
+            local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
+            if final_states[tx["status"]] then return current end
+
+            local metadata = tx["metadata"]
+            if type(metadata) ~= 'table' then metadata = {} end
+            metadata["consecutive_failures"] = 0
+
+            local updated = set_obj(current, "metadata", metadata)
+            redis.call('SET', tx_key, updated)
+            return updated
+            "#,
+            &tx_id,
+            &[],
+            "reset_status_check_consecutive_failures",
+        )
+        .await
+    }
+
+    async fn record_stellar_insufficient_fee_retry(
+        &self,
+        tx_id: String,
+        sent_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        self.run_atomic_script(
+            r#"
+            local function set_str(json, key, val)
+                local enc = cjson.encode(val)
+                local r, n = string.gsub(json, '"'..key..'"%s*:%s*"[^"]*"', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                r, n = string.gsub(json, '"'..key..'"%s*:%s*null', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                return string.gsub(json, '}%s*$', ',"'..key..'":'..enc..'}', 1)
+            end
+            local function set_obj(json, key, tbl)
+                local enc = cjson.encode(tbl)
+                local r, n = string.gsub(json, '"'..key..'"%s*:%s*%b{}', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                r, n = string.gsub(json, '"'..key..'"%s*:%s*null', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                return string.gsub(json, '}%s*$', ',"'..key..'":'..enc..'}', 1)
+            end
+
+            local relayer_id = redis.call('GET', KEYS[1])
+            if not relayer_id then return false end
+
+            local tx_key = ARGV[1] .. relayer_id .. ARGV[2]
+            local current = redis.call('GET', tx_key)
+            if not current then return false end
+
+            local tx = cjson.decode(current)
+            local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
+            if final_states[tx["status"]] then return current end
+
+            local metadata = tx["metadata"]
+            if type(metadata) ~= 'table' then metadata = {} end
+            metadata["insufficient_fee_retries"] = (metadata["insufficient_fee_retries"] or 0) + 1
+
+            local updated = set_str(current, "sent_at", ARGV[3])
+            updated = set_obj(updated, "metadata", metadata)
+            redis.call('SET', tx_key, updated)
+            return updated
+            "#,
+            &tx_id,
+            &[&sent_at],
+            "record_stellar_insufficient_fee_retry",
+        )
+        .await
+    }
+
+    async fn record_stellar_try_again_later_retry(
+        &self,
+        tx_id: String,
+        sent_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        self.run_atomic_script(
+            r#"
+            local function set_str(json, key, val)
+                local enc = cjson.encode(val)
+                local r, n = string.gsub(json, '"'..key..'"%s*:%s*"[^"]*"', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                r, n = string.gsub(json, '"'..key..'"%s*:%s*null', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                return string.gsub(json, '}%s*$', ',"'..key..'":'..enc..'}', 1)
+            end
+            local function set_obj(json, key, tbl)
+                local enc = cjson.encode(tbl)
+                local r, n = string.gsub(json, '"'..key..'"%s*:%s*%b{}', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                r, n = string.gsub(json, '"'..key..'"%s*:%s*null', '"'..key..'":'..enc, 1)
+                if n > 0 then return r end
+                return string.gsub(json, '}%s*$', ',"'..key..'":'..enc..'}', 1)
+            end
+
+            local relayer_id = redis.call('GET', KEYS[1])
+            if not relayer_id then return false end
+
+            local tx_key = ARGV[1] .. relayer_id .. ARGV[2]
+            local current = redis.call('GET', tx_key)
+            if not current then return false end
+
+            local tx = cjson.decode(current)
+            local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
+            if final_states[tx["status"]] then return current end
+
+            local metadata = tx["metadata"]
+            if type(metadata) ~= 'table' then metadata = {} end
+            metadata["try_again_later_retries"] = (metadata["try_again_later_retries"] or 0) + 1
+
+            local updated = set_str(current, "sent_at", ARGV[3])
+            updated = set_obj(updated, "metadata", metadata)
+            redis.call('SET', tx_key, updated)
+            return updated
+            "#,
+            &tx_id,
+            &[&sent_at],
+            "record_stellar_try_again_later_retry",
+        )
+        .await
+    }
+
     async fn set_confirmed_at(
         &self,
         tx_id: String,
@@ -1301,7 +2542,9 @@ impl TransactionRepository for RedisTransactionRepository {
         relayer_id: &str,
         statuses: &[TransactionStatus],
     ) -> Result<u64, RepositoryError> {
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.reader(), "count_by_status")
+            .await?;
         let mut total_count: u64 = 0;
 
         for status in statuses {
@@ -1365,8 +2608,9 @@ impl TransactionRepository for RedisTransactionRepository {
         }
 
         debug!(count = %requests.len(), "batch deleting transactions by requests (no fetch)");
-
-        let mut conn = self.client.as_ref().clone();
+        let mut conn = self
+            .get_connection(self.connections.primary(), "batch_delete_no_fetch")
+            .await?;
         let mut pipe = redis::pipe();
         pipe.atomic();
 
@@ -1444,10 +2688,13 @@ impl TransactionRepository for RedisTransactionRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{evm::Speed, EvmTransactionData, NetworkType};
+    use crate::models::{
+        evm::Speed, EvmTransactionData, MemoSpec, NetworkType, StellarTransactionData,
+        TransactionInput,
+    };
     use alloy::primitives::U256;
+    use deadpool_redis::{Config, Runtime};
     use lazy_static::lazy_static;
-    use redis::Client;
     use std::str::FromStr;
     use tokio;
     use uuid::Uuid;
@@ -1484,7 +2731,7 @@ mod tests {
                 to: Some("0xRecipient".to_string()),
                 chain_id: 1,
                 signature: None,
-                hash: Some(format!("0x{}", id)),
+                hash: Some(format!("0x{id}")),
                 speed: Some(Speed::Fast),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -1492,12 +2739,42 @@ mod tests {
             }),
             noop_count: None,
             is_canceled: Some(false),
+            metadata: None,
         }
     }
 
     fn create_test_transaction_with_relayer(id: &str, relayer_id: &str) -> TransactionRepoModel {
         let mut tx = create_test_transaction(id);
         tx.relayer_id = relayer_id.to_string();
+        tx
+    }
+
+    fn create_stellar_test_transaction(
+        id: &str,
+        relayer_id: &str,
+        sequence_number: i64,
+        max_fee: i64,
+        memo_id: u64,
+    ) -> TransactionRepoModel {
+        let mut tx = create_test_transaction_with_relayer(id, relayer_id);
+        tx.network_type = NetworkType::Stellar;
+        tx.network_data = NetworkTransactionData::Stellar(StellarTransactionData {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
+            fee: Some(100),
+            sequence_number: Some(sequence_number),
+            memo: Some(MemoSpec::Id { value: memo_id }),
+            valid_until: None,
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            signatures: vec![],
+            hash: None,
+            simulation_transaction_data: None,
+            transaction_input: TransactionInput::SignedXdr {
+                xdr: "AAAA".to_string(),
+                max_fee,
+            },
+            signed_envelope_xdr: None,
+            transaction_result_xdr: None,
+        });
         tx
     }
 
@@ -1528,16 +2805,88 @@ mod tests {
         let redis_url = std::env::var("REDIS_TEST_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
-        let client = Client::open(redis_url).expect("Failed to create Redis client");
-        let connection_manager = ConnectionManager::new(client)
-            .await
-            .expect("Failed to create connection manager");
+        let cfg = Config::from_url(&redis_url);
+        let pool = Arc::new(
+            cfg.builder()
+                .expect("Failed to create pool builder")
+                .max_size(16)
+                .runtime(Runtime::Tokio1)
+                .build()
+                .expect("Failed to build Redis pool"),
+        );
+
+        // Create RedisConnections with same pool for both primary and reader (for testing)
+        let connections = Arc::new(RedisConnections::new_single_pool(pool));
 
         let random_id = Uuid::new_v4().to_string();
-        let key_prefix = format!("test_prefix:{}", random_id);
+        let key_prefix = format!("test_prefix:{random_id}");
 
-        RedisTransactionRepository::new(Arc::new(connection_manager), key_prefix)
+        RedisTransactionRepository::new(connections, key_prefix)
             .expect("Failed to create RedisTransactionRepository")
+    }
+
+    fn old_status_score() -> f64 {
+        (Utc::now() - chrono::Duration::hours(2)).timestamp_millis() as f64
+    }
+
+    async fn zadd_status_member(
+        repo: &RedisTransactionRepository,
+        relayer_id: &str,
+        status: &TransactionStatus,
+        tx_id: &str,
+        score: f64,
+    ) {
+        let key = repo.relayer_status_sorted_key(relayer_id, status);
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test_zadd_status_member")
+            .await
+            .unwrap();
+        redis::cmd("ZADD")
+            .arg(&key)
+            .arg(score)
+            .arg(tx_id)
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    async fn zrem_status_member(
+        repo: &RedisTransactionRepository,
+        relayer_id: &str,
+        status: &TransactionStatus,
+        tx_id: &str,
+    ) {
+        let key = repo.relayer_status_sorted_key(relayer_id, status);
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test_zrem_status_member")
+            .await
+            .unwrap();
+        redis::cmd("ZREM")
+            .arg(&key)
+            .arg(tx_id)
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    async fn status_member_exists(
+        repo: &RedisTransactionRepository,
+        relayer_id: &str,
+        status: &TransactionStatus,
+        tx_id: &str,
+    ) -> bool {
+        let key = repo.relayer_status_sorted_key(relayer_id, status);
+        let mut conn = repo
+            .get_connection(repo.connections.primary(), "test_status_member_exists")
+            .await
+            .unwrap();
+        let score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&key)
+            .arg(tx_id)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        score.is_some()
     }
 
     #[tokio::test]
@@ -1552,12 +2901,18 @@ mod tests {
     async fn test_new_repository_empty_prefix_fails() {
         let redis_url = std::env::var("REDIS_TEST_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let client = Client::open(redis_url).expect("Failed to create Redis client");
-        let connection_manager = ConnectionManager::new(client)
-            .await
-            .expect("Failed to create connection manager");
+        let cfg = Config::from_url(&redis_url);
+        let pool = Arc::new(
+            cfg.builder()
+                .expect("Failed to create pool builder")
+                .max_size(16)
+                .runtime(Runtime::Tokio1)
+                .build()
+                .expect("Failed to build Redis pool"),
+        );
+        let connections = Arc::new(RedisConnections::new_single_pool(pool));
 
-        let result = RedisTransactionRepository::new(Arc::new(connection_manager), "".to_string());
+        let result = RedisTransactionRepository::new(connections, "".to_string());
         assert!(matches!(result, Err(RepositoryError::InvalidData(_))));
     }
 
@@ -1863,106 +3218,6 @@ mod tests {
             result.items[2].created_at,
             "2025-01-27T10:00:00.000000+00:00"
         );
-    }
-
-    #[tokio::test]
-    #[ignore = "Requires active Redis instance"]
-    async fn test_find_by_relayer_id_migration_from_old_index() {
-        let repo = setup_test_repo().await;
-        let relayer_id = Uuid::new_v4().to_string();
-
-        // Create transactions with different created_at timestamps
-        let mut tx1 = create_test_transaction_with_relayer("migrate-test-1", &relayer_id);
-        tx1.created_at = "2025-01-27T10:00:00.000000+00:00".to_string(); // Oldest
-
-        let mut tx2 = create_test_transaction_with_relayer("migrate-test-2", &relayer_id);
-        tx2.created_at = "2025-01-27T12:00:00.000000+00:00".to_string(); // Middle
-
-        let mut tx3 = create_test_transaction_with_relayer("migrate-test-3", &relayer_id);
-        tx3.created_at = "2025-01-27T14:00:00.000000+00:00".to_string(); // Newest
-
-        // Create transactions directly in Redis WITHOUT adding to sorted set
-        // This simulates old transactions created before the sorted set index existed
-        let mut conn = repo.client.as_ref().clone();
-        let relayer_list_key = repo.relayer_list_key();
-        let _: () = conn.sadd(&relayer_list_key, &relayer_id).await.unwrap();
-
-        for tx in &[&tx1, &tx2, &tx3] {
-            let key = repo.tx_key(&tx.relayer_id, &tx.id);
-            let reverse_key = repo.tx_to_relayer_key(&tx.id);
-            let value = repo.serialize_entity(tx, |t| &t.id, "transaction").unwrap();
-
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-            pipe.set(&key, &value);
-            pipe.set(&reverse_key, &tx.relayer_id);
-
-            // Add to status index (but NOT to sorted set)
-            let status_key = repo.relayer_status_key(&tx.relayer_id, &tx.status);
-            pipe.sadd(&status_key, &tx.id);
-
-            pipe.exec_async(&mut conn).await.unwrap();
-        }
-
-        // Verify sorted set is empty (transactions were created without sorted set index)
-        let relayer_sorted_key = repo.relayer_tx_by_created_at_key(&relayer_id);
-        let count: u64 = conn.zcard(&relayer_sorted_key).await.unwrap();
-        assert_eq!(count, 0, "Sorted set should be empty for old transactions");
-
-        // Call find_by_relayer_id - this should trigger migration
-        let query = PaginationQuery {
-            page: 1,
-            per_page: 10,
-        };
-        let result = repo
-            .find_by_relayer_id(&relayer_id, query.clone())
-            .await
-            .unwrap();
-
-        // Verify migration happened - sorted set should now have entries
-        let count_after: u64 = conn.zcard(&relayer_sorted_key).await.unwrap();
-        assert_eq!(
-            count_after, 3,
-            "Sorted set should be populated after migration"
-        );
-
-        // Verify results are correct and sorted (newest first)
-        assert_eq!(result.total, 3);
-        assert_eq!(result.items.len(), 3);
-
-        assert_eq!(
-            result.items[0].id, "migrate-test-3",
-            "First item should be newest after migration"
-        );
-        assert_eq!(
-            result.items[0].created_at,
-            "2025-01-27T14:00:00.000000+00:00"
-        );
-
-        assert_eq!(
-            result.items[1].id, "migrate-test-2",
-            "Second item should be middle after migration"
-        );
-        assert_eq!(
-            result.items[1].created_at,
-            "2025-01-27T12:00:00.000000+00:00"
-        );
-
-        assert_eq!(
-            result.items[2].id, "migrate-test-1",
-            "Third item should be oldest after migration"
-        );
-        assert_eq!(
-            result.items[2].created_at,
-            "2025-01-27T10:00:00.000000+00:00"
-        );
-
-        // Verify second call uses sorted set (no migration needed)
-        let result2 = repo.find_by_relayer_id(&relayer_id, query).await.unwrap();
-        assert_eq!(result2.total, 3);
-        assert_eq!(result2.items.len(), 3);
-        // Results should be identical since sorted set is now populated
-        assert_eq!(result.items[0].id, result2.items[0].id);
     }
 
     #[tokio::test]
@@ -2277,6 +3532,60 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires active Redis instance"]
+    async fn test_get_nonce_occupancy_mixed_slots() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // nonce 10 → Pending (default), nonce 11 → Failed, nonce 12 → empty
+        let tx1 = create_test_transaction_with_nonce(&Uuid::new_v4().to_string(), 10, &relayer_id);
+        repo.create(tx1).await.unwrap();
+
+        let mut tx2 =
+            create_test_transaction_with_nonce(&Uuid::new_v4().to_string(), 11, &relayer_id);
+        tx2.status = TransactionStatus::Failed;
+        repo.create(tx2).await.unwrap();
+
+        let result = repo.get_nonce_occupancy(&relayer_id, 10, 13).await.unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], (10, Some(TransactionStatus::Pending)));
+        assert_eq!(result[1], (11, Some(TransactionStatus::Failed)));
+        assert_eq!(result[2], (12, None));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_get_nonce_occupancy_empty_range() {
+        let repo = setup_test_repo().await;
+
+        let result = repo.get_nonce_occupancy("any-relayer", 5, 5).await.unwrap();
+        assert!(result.is_empty());
+
+        let result = repo
+            .get_nonce_occupancy("any-relayer", 10, 5)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_get_nonce_occupancy_all_empty() {
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // No transactions created — all slots should be None
+        let result = repo
+            .get_nonce_occupancy(&relayer_id, 100, 103)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert!(result.iter().all(|(_, status)| status.is_none()));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
     async fn test_update_status() {
         let repo = setup_test_repo().await;
         let random_id = Uuid::new_v4().to_string();
@@ -2310,6 +3619,7 @@ mod tests {
             priced_at: None,
             noop_count: None,
             delete_at: None,
+            metadata: None,
         };
 
         let updated = repo
@@ -2322,6 +3632,402 @@ mod tests {
             updated.sent_at,
             Some("2025-01-27T16:00:00.000000+00:00".to_string())
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_partial_update_confirmed_updates_status_indexes() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Submitted);
+        tx.confirmed_at = None;
+
+        repo.create(tx).await.unwrap();
+
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Confirmed),
+            confirmed_at: Some("2025-01-27T16:00:00.000000+00:00".to_string()),
+            ..Default::default()
+        };
+
+        repo.partial_update(tx_id.clone(), update).await.unwrap();
+
+        assert!(
+            !status_member_exists(&repo, &relayer_id, &TransactionStatus::Submitted, &tx_id).await
+        );
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_partial_update_finalization_purges_stale_nonfinal_indexes() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Submitted);
+        tx.confirmed_at = None;
+
+        repo.create(tx).await.unwrap();
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Sent,
+            &tx_id,
+            old_status_score(),
+        )
+        .await;
+
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Confirmed),
+            confirmed_at: Some("2025-01-27T16:00:00.000000+00:00".to_string()),
+            ..Default::default()
+        };
+
+        repo.partial_update(tx_id.clone(), update).await.unwrap();
+
+        for status in NON_FINAL_STATUS_INDEXES {
+            assert!(
+                !status_member_exists(&repo, &relayer_id, status, &tx_id).await,
+                "transaction should not remain in {status:?}"
+            );
+        }
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_stale_status_indexes_heals_final_status_ghost() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Submitted);
+
+        repo.create(tx).await.unwrap();
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Confirmed),
+            confirmed_at: Some("2025-01-27T16:00:00.000000+00:00".to_string()),
+            ..Default::default()
+        };
+        repo.partial_update(tx_id.clone(), update).await.unwrap();
+
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Submitted,
+            &tx_id,
+            old_status_score(),
+        )
+        .await;
+        zrem_status_member(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 1);
+        assert!(
+            !status_member_exists(&repo, &relayer_id, &TransactionStatus::Submitted, &tx_id).await
+        );
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_stale_status_indexes_removes_dangling_entry() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Sent,
+            &tx_id,
+            old_status_score(),
+        )
+        .await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 1);
+        assert!(!status_member_exists(&repo, &relayer_id, &TransactionStatus::Sent, &tx_id).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_stale_status_indexes_skips_young_entry() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Submitted,
+            &tx_id,
+            Utc::now().timestamp_millis() as f64,
+        )
+        .await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 0);
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Submitted, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_stale_status_indexes_skips_legit_inflight_entry() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Submitted);
+
+        repo.create(tx).await.unwrap();
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 0);
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Submitted, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_removes_final_index_orphan_with_missing_body() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // A body-less dangle in a final index: the body was deleted but its
+        // Confirmed entry survived. Nothing but this sweep reaps it.
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Confirmed,
+            &tx_id,
+            old_status_score(),
+        )
+        .await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 1);
+        assert!(
+            !status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_keeps_live_final_index_entry() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Submitted);
+
+        repo.create(tx).await.unwrap();
+        // Finalize with an old confirmed_at so the Confirmed entry falls within
+        // the reconcile scan window but keeps a present, matching body.
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Confirmed),
+            confirmed_at: Some("2025-01-27T16:00:00.000000+00:00".to_string()),
+            ..Default::default()
+        };
+        repo.partial_update(tx_id.clone(), update).await.unwrap();
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 0);
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+        let body = repo.get_by_id(tx_id.clone()).await.unwrap();
+        assert_eq!(body.status, TransactionStatus::Confirmed);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_respects_cutoff_for_final_orphan() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+
+        // Body-less, but scored just now: below the 1h staleness floor, so the
+        // sweep must leave it (a freshly-finalized tx whose body write is racing).
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Confirmed,
+            &tx_id,
+            Utc::now().timestamp_millis() as f64,
+        )
+        .await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 0);
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_final_index_never_zadds() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Confirmed,
+            &tx_id,
+            old_status_score(),
+        )
+        .await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 1);
+        // A final-index orphan is purged, never promoted: the id must not appear
+        // in any other status index afterwards.
+        for status in ALL_TRANSACTION_STATUSES {
+            assert!(
+                !status_member_exists(&repo, &relayer_id, status, &tx_id).await,
+                "orphan should not have been re-added to {status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reconcile_leaves_present_mismatched_final_body() {
+        let repo = setup_test_repo().await;
+        let tx_id = Uuid::new_v4().to_string();
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Submitted);
+
+        repo.create(tx).await.unwrap();
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Failed),
+            ..Default::default()
+        };
+        repo.partial_update(tx_id.clone(), update).await.unwrap();
+
+        // Fabricate a stale entry in a *different* final index than the body's
+        // status. The sweep leaves present bodies alone; this self-heals when
+        // the tx is deleted at cleanup (remove_all_indexes clears every index).
+        zadd_status_member(
+            &repo,
+            &relayer_id,
+            &TransactionStatus::Confirmed,
+            &tx_id,
+            old_status_score(),
+        )
+        .await;
+
+        let repaired = repo
+            .reconcile_stale_status_indexes(&relayer_id)
+            .await
+            .unwrap();
+
+        assert_eq!(repaired, 0);
+        assert!(
+            status_member_exists(&repo, &relayer_id, &TransactionStatus::Confirmed, &tx_id).await
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_partial_update_preserves_large_stellar_i64_fields() {
+        // End-to-end regression against a real Redis: large i64/u64 fields
+        // (sequence_number, SignedXdr.max_fee, and the memo Id) must survive the
+        // partial_update Lua `cjson` decode->encode round-trip. Before the
+        // string-serde fix, cjson re-emitted these as floats (e.g.
+        // 643918676885760.0) and the read-back failed with "invalid type:
+        // floating point, expected i64".
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        // All values exceed 2^32 so they exercise the large-integer path that
+        // the pre-fix code corrupted.
+        let seq = 643918676885760_i64;
+        let max_fee = 549755813888_i64;
+        let memo_id = 1099511627776_u64;
+
+        let tx = create_stellar_test_transaction(&tx_id, &relayer_id, seq, max_fee, memo_id);
+        repo.create(tx).await.unwrap();
+
+        let update = TransactionUpdateRequest {
+            status: Some(TransactionStatus::Sent),
+            sent_at: Some("2025-01-27T16:00:00.000000+00:00".to_string()),
+            ..Default::default()
+        };
+
+        // The Lua script returns the re-encoded JSON; this deserialization is
+        // exactly where the float corruption used to blow up.
+        let updated = repo.partial_update(tx_id.clone(), update).await.unwrap();
+        assert_large_stellar_fields(&updated, seq, max_fee, memo_id);
+
+        // Re-read from Redis to confirm what was actually persisted, not just
+        // the script's return value.
+        let reloaded = repo.get_by_id(tx_id).await.unwrap();
+        assert_large_stellar_fields(&reloaded, seq, max_fee, memo_id);
+    }
+
+    fn assert_large_stellar_fields(
+        tx: &TransactionRepoModel,
+        seq: i64,
+        max_fee: i64,
+        memo_id: u64,
+    ) {
+        let stellar = tx.network_data.get_stellar_transaction_data().unwrap();
+        assert_eq!(stellar.sequence_number, Some(seq));
+        assert_eq!(stellar.memo, Some(MemoSpec::Id { value: memo_id }));
+        match stellar.transaction_input {
+            TransactionInput::SignedXdr { max_fee: mf, .. } => assert_eq!(mf, max_fee),
+            other => panic!("expected SignedXdr, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2410,7 +4116,7 @@ mod tests {
     #[ignore = "Requires active Redis instance"]
     async fn test_debug_implementation() {
         let repo = setup_test_repo().await;
-        let debug_str = format!("{:?}", repo);
+        let debug_str = format!("{repo:?}");
         assert!(debug_str.contains("RedisTransactionRepository"));
         assert!(debug_str.contains("test_prefix"));
     }
@@ -2547,8 +4253,7 @@ mod tests {
             // Should have delete_at set
             assert!(
                 updated.delete_at.is_some(),
-                "delete_at should be set for status: {:?}",
-                status
+                "delete_at should be set for status: {status:?}"
             );
 
             // Verify the timestamp is reasonable (approximately 6 hours from now)
@@ -2562,10 +4267,9 @@ mod tests {
             let tolerance = Duration::minutes(5);
 
             assert!(
-                duration_from_before >= expected_duration - tolerance &&
-                duration_from_before <= expected_duration + tolerance,
-                "delete_at should be approximately 6 hours from now for status: {:?}. Duration: {:?}",
-                status, duration_from_before
+                duration_from_before >= expected_duration - tolerance
+                    && duration_from_before <= expected_duration + tolerance,
+                "delete_at should be approximately 6 hours from now for status: {status:?}. Duration: {duration_from_before:?}"
             );
         }
 
@@ -2608,8 +4312,7 @@ mod tests {
             // Should NOT have delete_at set
             assert!(
                 updated.delete_at.is_none(),
-                "delete_at should NOT be set for status: {:?}",
-                status
+                "delete_at should NOT be set for status: {status:?}"
             );
         }
 
@@ -2666,8 +4369,7 @@ mod tests {
         assert!(
             duration_from_before >= expected_duration - tolerance
                 && duration_from_before <= expected_duration + tolerance,
-            "delete_at should be approximately 8 hours from now. Duration: {:?}",
-            duration_from_before
+            "delete_at should be approximately 8 hours from now. Duration: {duration_from_before:?}"
         );
 
         // Also verify other fields were updated
@@ -2824,7 +4526,7 @@ mod tests {
         // Create multiple transactions
         let mut created_ids = Vec::new();
         for i in 1..=5 {
-            let tx_id = format!("test-multi-{}-{}", base_id, i);
+            let tx_id = format!("test-multi-{base_id}-{i}");
             let tx = create_test_transaction(&tx_id);
             repo.create(tx).await.unwrap();
             created_ids.push(tx_id);
@@ -2879,7 +4581,7 @@ mod tests {
 
         // Create some transactions
         let existing_ids: Vec<String> = (1..=3)
-            .map(|i| format!("test-mixed-existing-{}-{}", base_id, i))
+            .map(|i| format!("test-mixed-existing-{base_id}-{i}"))
             .collect();
 
         for id in &existing_ids {
@@ -2888,7 +4590,7 @@ mod tests {
         }
 
         let nonexistent_ids: Vec<String> = (1..=2)
-            .map(|i| format!("test-mixed-nonexistent-{}-{}", base_id, i))
+            .map(|i| format!("test-mixed-nonexistent-{base_id}-{i}"))
             .collect();
 
         // Try to delete mix of existing and non-existing
@@ -2983,7 +4685,7 @@ mod tests {
         let mut created_ids = Vec::new();
 
         for i in 0..count {
-            let tx_id = format!("test-large-{}-{}", base_id, i);
+            let tx_id = format!("test-large-{base_id}-{i}");
             let tx = create_test_transaction(&tx_id);
             repo.create(tx).await.unwrap();
             created_ids.push(tx_id);
@@ -3028,5 +4730,480 @@ mod tests {
         // relayer-2's transaction should still exist
         let remaining = repo.get_by_id(tx_id_2).await.unwrap();
         assert_eq!(remaining.relayer_id, relayer_2);
+    }
+
+    // ── increment_status_check_failures ─────────────────────────────
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_increment_status_check_failures_no_prior_metadata() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        tx.metadata = None;
+        repo.create(tx).await.unwrap();
+
+        let updated = repo.increment_status_check_failures(tx_id).await.unwrap();
+
+        let meta = updated.metadata.expect("metadata should be set");
+        assert_eq!(meta.consecutive_failures, 1);
+        assert_eq!(meta.total_failures, 1);
+        assert_eq!(meta.insufficient_fee_retries, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_increment_status_check_failures_accumulates() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        repo.increment_status_check_failures(tx_id.clone())
+            .await
+            .unwrap();
+        repo.increment_status_check_failures(tx_id.clone())
+            .await
+            .unwrap();
+        let updated = repo.increment_status_check_failures(tx_id).await.unwrap();
+
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.consecutive_failures, 3);
+        assert_eq!(meta.total_failures, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_increment_status_check_failures_noop_on_final_state() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Confirmed);
+        repo.create(tx).await.unwrap();
+
+        let result = repo.increment_status_check_failures(tx_id).await.unwrap();
+
+        // Should return unchanged — no metadata mutation on final state
+        assert!(result.metadata.is_none());
+        assert_eq!(result.status, TransactionStatus::Confirmed);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_increment_status_check_failures_not_found() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+
+        let result = repo
+            .increment_status_check_failures("nonexistent".to_string())
+            .await;
+
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    // ── reset_status_check_consecutive_failures ─────────────────────
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reset_consecutive_failures() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        // Increment a few times first
+        repo.increment_status_check_failures(tx_id.clone())
+            .await
+            .unwrap();
+        repo.increment_status_check_failures(tx_id.clone())
+            .await
+            .unwrap();
+
+        let updated = repo
+            .reset_status_check_consecutive_failures(tx_id)
+            .await
+            .unwrap();
+
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.consecutive_failures, 0);
+        // total_failures should be preserved
+        assert_eq!(meta.total_failures, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reset_consecutive_failures_noop_on_final_state() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Failed);
+        tx.metadata = Some(crate::models::TransactionMetadata {
+            consecutive_failures: 5,
+            total_failures: 10,
+            insufficient_fee_retries: 0,
+            try_again_later_retries: 0,
+            nonce_too_high_retries: 0,
+        });
+        repo.create(tx).await.unwrap();
+
+        let result = repo
+            .reset_status_check_consecutive_failures(tx_id)
+            .await
+            .unwrap();
+
+        // Should return unchanged on final state
+        let meta = result.metadata.unwrap();
+        assert_eq!(meta.consecutive_failures, 5);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reset_consecutive_failures_not_found() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+
+        let result = repo
+            .reset_status_check_consecutive_failures("nonexistent".to_string())
+            .await;
+
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    // ── record_stellar_insufficient_fee_retry ───────────────────────
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_insufficient_fee_retry() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        tx.sent_at = None;
+        repo.create(tx).await.unwrap();
+
+        let updated = repo
+            .record_stellar_insufficient_fee_retry(tx_id, "2025-03-18T10:00:00Z".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(updated.sent_at.as_deref(), Some("2025-03-18T10:00:00Z"));
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.insufficient_fee_retries, 1);
+        assert_eq!(meta.consecutive_failures, 0);
+        assert_eq!(meta.total_failures, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_insufficient_fee_retry_accumulates() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        repo.record_stellar_insufficient_fee_retry(
+            tx_id.clone(),
+            "2025-03-18T10:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let updated = repo
+            .record_stellar_insufficient_fee_retry(tx_id, "2025-03-18T10:01:00Z".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(updated.sent_at.as_deref(), Some("2025-03-18T10:01:00Z"));
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.insufficient_fee_retries, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_insufficient_fee_retry_noop_on_final_state() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Confirmed);
+        tx.sent_at = Some("old-time".to_string());
+        repo.create(tx).await.unwrap();
+
+        let result = repo
+            .record_stellar_insufficient_fee_retry(tx_id, "new-time".to_string())
+            .await
+            .unwrap();
+
+        // Should return unchanged on final state
+        assert_eq!(result.sent_at.as_deref(), Some("old-time"));
+        assert!(result.metadata.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_insufficient_fee_retry_not_found() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+
+        let result = repo
+            .record_stellar_insufficient_fee_retry(
+                "nonexistent".to_string(),
+                "2025-03-18T10:00:00Z".to_string(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    // ── record_stellar_try_again_later_retry ────────────────────────
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_try_again_later_retry() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        tx.sent_at = None;
+        repo.create(tx).await.unwrap();
+
+        let updated = repo
+            .record_stellar_try_again_later_retry(tx_id, "2025-03-18T10:00:00Z".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(updated.sent_at.as_deref(), Some("2025-03-18T10:00:00Z"));
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.try_again_later_retries, 1);
+        assert_eq!(meta.consecutive_failures, 0);
+        assert_eq!(meta.total_failures, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_try_again_later_retry_accumulates() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        repo.record_stellar_try_again_later_retry(
+            tx_id.clone(),
+            "2025-03-18T10:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let updated = repo
+            .record_stellar_try_again_later_retry(tx_id, "2025-03-18T10:01:00Z".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(updated.sent_at.as_deref(), Some("2025-03-18T10:01:00Z"));
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.try_again_later_retries, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_try_again_later_retry_noop_on_final_state() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let mut tx =
+            create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Confirmed);
+        tx.sent_at = Some("old-time".to_string());
+        repo.create(tx).await.unwrap();
+
+        let result = repo
+            .record_stellar_try_again_later_retry(tx_id, "new-time".to_string())
+            .await
+            .unwrap();
+
+        // Should return unchanged on final state
+        assert_eq!(result.sent_at.as_deref(), Some("old-time"));
+        assert!(result.metadata.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_record_try_again_later_retry_not_found() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+
+        let result = repo
+            .record_stellar_try_again_later_retry(
+                "nonexistent".to_string(),
+                "2025-03-18T10:00:00Z".to_string(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    // ── metadata preservation across operations ─────────────────────
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_increment_failures_preserves_try_again_later_retries() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        // Set try_again_later_retries = 1
+        repo.record_stellar_try_again_later_retry(
+            tx_id.clone(),
+            "2025-03-18T10:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Now increment failures — should NOT clobber try_again_later_retries
+        let updated = repo.increment_status_check_failures(tx_id).await.unwrap();
+
+        let meta = updated.metadata.unwrap();
+        assert_eq!(
+            meta.try_again_later_retries, 1,
+            "try_again_later_retries must survive increment_status_check_failures"
+        );
+        assert_eq!(meta.consecutive_failures, 1);
+        assert_eq!(meta.total_failures, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_increment_failures_preserves_insufficient_fee_retries() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        // Set insufficient_fee_retries = 1
+        repo.record_stellar_insufficient_fee_retry(
+            tx_id.clone(),
+            "2025-03-18T10:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Now increment failures — should NOT clobber insufficient_fee_retries
+        let updated = repo.increment_status_check_failures(tx_id).await.unwrap();
+
+        let meta = updated.metadata.unwrap();
+        assert_eq!(
+            meta.insufficient_fee_retries, 1,
+            "insufficient_fee_retries must survive increment_status_check_failures"
+        );
+        assert_eq!(meta.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_reset_failures_preserves_retry_counters() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        // Set both retry counters
+        repo.record_stellar_try_again_later_retry(
+            tx_id.clone(),
+            "2025-03-18T10:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+        repo.record_stellar_insufficient_fee_retry(
+            tx_id.clone(),
+            "2025-03-18T10:01:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Increment then reset consecutive failures
+        repo.increment_status_check_failures(tx_id.clone())
+            .await
+            .unwrap();
+        let updated = repo
+            .reset_status_check_consecutive_failures(tx_id)
+            .await
+            .unwrap();
+
+        let meta = updated.metadata.unwrap();
+        assert_eq!(meta.consecutive_failures, 0);
+        assert_eq!(meta.total_failures, 1);
+        assert_eq!(
+            meta.try_again_later_retries, 1,
+            "try_again_later_retries must survive reset"
+        );
+        assert_eq!(
+            meta.insufficient_fee_retries, 1,
+            "insufficient_fee_retries must survive reset"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_fee_and_try_again_later_retries_independent() {
+        let _lock = ENV_MUTEX.lock().await;
+        let repo = setup_test_repo().await;
+        let relayer_id = Uuid::new_v4().to_string();
+        let tx_id = Uuid::new_v4().to_string();
+        let tx = create_test_transaction_with_status(&tx_id, &relayer_id, TransactionStatus::Sent);
+        repo.create(tx).await.unwrap();
+
+        // Set try_again_later_retries = 2
+        repo.record_stellar_try_again_later_retry(
+            tx_id.clone(),
+            "2025-03-18T10:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+        repo.record_stellar_try_again_later_retry(
+            tx_id.clone(),
+            "2025-03-18T10:01:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Set insufficient_fee_retries = 1 — should NOT clobber try_again_later_retries
+        let updated = repo
+            .record_stellar_insufficient_fee_retry(tx_id, "2025-03-18T10:02:00Z".to_string())
+            .await
+            .unwrap();
+
+        let meta = updated.metadata.unwrap();
+        assert_eq!(
+            meta.try_again_later_retries, 2,
+            "try_again_later_retries must survive insufficient_fee_retry"
+        );
+        assert_eq!(meta.insufficient_fee_retries, 1);
     }
 }
