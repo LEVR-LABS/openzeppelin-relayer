@@ -16,72 +16,63 @@ env:
   CONTAINER_NAME: openzeppeline
   SECRET_NAME: levr-v1/openzeppeline-relayer
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  build-and-push-ecr:
+  setup-environment:
     runs-on: ubuntu-latest
+    outputs:
+      target_env: ${{ steps.set_env.outputs.target_env }}
+      config_name: ${{ steps.set_env.outputs.config_name }}
     steps:
-      - name: check push branch
-        id: env_check
+      - name: Determine Environment
+        id: set_env
         run: |
-          echo "Running on branch ${{ github.ref }}"
-
-          if   [ "${{ github.ref }}" = "refs/heads/devops" ]; then
-              echo "::set-output name=ENV_NAME_TAG::dev"
-              echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::AWS_ACCESS_KEY_ID"
-              echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::AWS_SECRET_ACCESS_KEY"
-              echo "::set-output name=AWS_ACCOUNT_ID::V1_DEV_AWS_ACCOUNT_ID"
-              echo "::set-output name=CONFIG_NAME::config.levr.json"
-              echo "::set-output name=SECRET_NAME::levr-v1/openzeppeline-relayer"
-
-          elif [ "${{ github.ref }}" = "refs/heads/test" ]; then
-              echo "::set-output name=ENV_NAME_TAG::test"
-
-          elif [ "${{ github.ref }}" = "refs/heads/levr-v1-main" ]; then
-              echo "::set-output name=ENV_NAME_TAG::prod"
-              echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::PROD_AWS_ACCESS_KEY_ID"
-              echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::PROD_AWS_SECRET_ACCESS_KEY"
-              echo "::set-output name=AWS_ACCOUNT_ID::PROD_AWS_ACCOUNT_ID"
-              echo "::set-output name=CONFIG_NAME::config.prod.levr.json"
-              echo "::set-output name=SECRET_NAME::levr-v1/openzeppeline-relayer"
-
+          if [ "${{ github.ref }}" = "refs/heads/devops" ]; then
+            echo "target_env=dev" >> $GITHUB_OUTPUT
+            echo "config_name=config.levr.json" >> $GITHUB_OUTPUT
           elif [ "${{ github.ref }}" = "refs/heads/levr-v1-staging" ]; then
-              echo "::set-output name=ENV_NAME_TAG::levr-v1-staging"
-              echo "::set-output name=AWS_ACCESS_KEY_ID_NAME::STAGING_AWS_ACCESS_KEY_ID"
-              echo "::set-output name=AWS_SECRET_ACCESS_KEY_NAME::STAGING_AWS_SECRET_ACCESS_KEY"
-              echo "::set-output name=AWS_ACCOUNT_ID::STAGING_AWS_ACCOUNT_ID"
-              echo "::set-output name=CONFIG_NAME::config.staging.levr.json"
-              echo "::set-output name=SECRET_NAME::levr-v1/openzeppeline-relayer"
-
-
+            echo "target_env=staging" >> $GITHUB_OUTPUT
+            echo "config_name=config.staging.levr.json" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/levr-v1-main" ]; then
+            echo "target_env=prod" >> $GITHUB_OUTPUT
+            echo "config_name=config.prod.levr.json" >> $GITHUB_OUTPUT
           fi
+
+  build-and-push-ecr:
+    needs: setup-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.setup-environment.outputs.target_env }}
+    steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set unique Docker image tag
         id: set-tag
-        run: echo "::set-output name=TAG::$(date '+%Y%m%d%H%M%S')-${{ github.run_id }}"
+        run: echo "TAG=$(date '+%Y%m%d%H%M%S')-${{ github.run_id }}" >> $GITHUB_OUTPUT
+       
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets[steps.env_check.outputs.AWS_ACCESS_KEY_ID_NAME] }}
-          aws-secret-access-key: ${{ secrets[steps.env_check.outputs.AWS_SECRET_ACCESS_KEY_NAME] }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
+  
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Generate config file
         id: generate-config
-        env:
-          SECRET_NAME: ${{ steps.env_check.outputs.SECRET_NAME }}
         run: |
-          mv ${APP_DIR}/config/${{ steps.env_check.outputs.CONFIG_NAME }} ${APP_DIR}/config/config.json
+          mv ${APP_DIR}/config/${{ needs.setup-environment.outputs.config_name }} ${APP_DIR}/config/config.json
           ls -al ${APP_DIR}/config
 
-          SECRET_JSON=$(aws ssm get-parameter --name /aws/reference/secretsmanager/${SECRET_NAME} --with-decryption | jq -r '.Parameter.Value')
+          SECRET_JSON=$(aws ssm get-parameter --name /aws/reference/secretsmanager/${{env.SECRET_NAME}} --with-decryption | jq -r '.Parameter.Value')
 
-          if [ "${{ steps.env_check.outputs.ENV_NAME_TAG }}" = "prod" ] || [ "${{ steps.env_check.outputs.ENV_NAME_TAG }}" = "levr-v1-staging" ]; then
+          if [ "${{ needs.setup-environment.outputs.target_env }}" = "prod" ] || [ "${{ needs.setup-environment.outputs.target_env }}" = "staging" ]; then
             MONAD_MAINNET_RPC_URL_1=$(echo "$SECRET_JSON" | jq -r '.MONAD_MAINNET_RPC_URL_1')
             MONAD_MAINNET_RPC_URL_2=$(echo "$SECRET_JSON" | jq -r '.MONAD_MAINNET_RPC_URL_2')
             echo "Substituting mainnet RPC URLs..."
@@ -162,12 +153,12 @@ jobs:
           fi
 
       - name: Build and Push Docker Image to ECR (main)
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.production
           push: true
-          tags: ${{ secrets[steps.env_check.outputs.AWS_ACCOUNT_ID] }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets[steps.env_check.outputs.AWS_ACCOUNT_ID] }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
+          tags: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}, ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:latest
 
       - name: Fill in the new image ID in the Amazon ECS task definition
         id: task-def
@@ -177,7 +168,7 @@ jobs:
           # task-definition-arn: task-definition-arn
           task-definition-family: ${{ env.ECS_TASK_DEFINITION_FAMILY }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ secrets[steps.env_check.outputs.AWS_ACCOUNT_ID] }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
+          image: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_APP }}:${{ steps.set-tag.outputs.TAG }}
 
       - name: Deploy Amazon ECS task definition
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
@@ -194,11 +185,11 @@ jobs:
           if [ "${{ job.status }}" == "success" ]; then
             STATUS="✅ Success"
             COLOR=65280  # Green
-            DESCRIPTION="Successfully deployed Openzeppelin Relayer Service to ${{ steps.env_check.outputs.ENV_NAME_TAG }}"
+            DESCRIPTION="Successfully deployed Openzeppelin Relayer Service to ${{ needs.setup-environment.outputs.target_env }}"
           elif [ "${{ job.status }}" == "failure" ]; then
             STATUS="❌ Failed"
             COLOR=16711680  # Red
-            DESCRIPTION="Failed to deploy Openzeppelin Relayer Service to ${{ steps.env_check.outputs.ENV_NAME_TAG }}"
+            DESCRIPTION="Failed to deploy Openzeppelin Relayer Service to ${{ needs.setup-environment.outputs.target_env }}"
           elif [ "${{ job.status }}" == "cancelled" ]; then
             STATUS="⏹️ Cancelled"
             COLOR=16776960  # Yellow
@@ -231,7 +222,7 @@ jobs:
                   },
                   {
                     "name": "Environment", 
-                    "value": "${{ steps.env_check.outputs.ENV_NAME_TAG }}", 
+                    "value": "${{ needs.setup-environment.outputs.target_env }}", 
                     "inline": true
                   },
                   {
