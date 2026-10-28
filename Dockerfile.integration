@@ -1,12 +1,17 @@
+# Floor for the system trust store. 20260909-r3 distrusts the compromised
+# eMudhra intermediates (https://emudhra.we-have-a-problem.com). apk fails the
+# build if it cannot satisfy the floor, and changing it invalidates cached layers.
+ARG MIN_CA_CERTIFICATES_BUNDLE_VERSION=20260909-r3
+
 # Multi-stage Dockerfile for Integration Tests
 # Uses Chainguard images for security and minimal footprint
 
 # ============================================================================
 # Builder Stage - Compile integration tests
 # ============================================================================
-# Rustc v1.91.1
-# The digest needs to be updated everytime the minimum version is changed, and if the version is above 1.91.1
-FROM cgr.dev/chainguard/rust:latest-dev@sha256:33faad9a26e8437ed9725bea3eb2d1e85facd1c035a31af8d485ea8c0a935532 AS builder
+# Rustc v1.93.0 minimum (MSRV, see rust-version in Cargo.toml)
+# The digest needs to be updated everytime the minimum version is changed, and if the version is above 1.93.0
+FROM cgr.dev/chainguard/rust:latest-dev@sha256:63fe36977879f68bb449c681f1e1e3a60d7368ec2b7a67f21fae3737fe7cc3a4 AS builder
 
 USER root
 RUN apk update && apk --no-cache add \
@@ -48,6 +53,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime Stage - Minimal image with only what's needed to run tests and generate coverage
 # ============================================================================
 FROM cgr.dev/chainguard/wolfi-base AS runtime
+ARG MIN_CA_CERTIFICATES_BUNDLE_VERSION
+
+RUN apk add --no-cache "ca-certificates-bundle>=${MIN_CA_CERTIFICATES_BUNDLE_VERSION}"
 
 WORKDIR /app
 
