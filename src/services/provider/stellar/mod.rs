@@ -6,22 +6,36 @@
 
 use async_trait::async_trait;
 use eyre::Result;
-use soroban_rs::stellar_rpc_client::Client;
-use soroban_rs::stellar_rpc_client::{
+use stellar_rpc_client::Client;
+use stellar_rpc_client::{
     Error as StellarClientError, EventStart, EventType, GetEventsResponse, GetLatestLedgerResponse,
     GetLedgerEntriesResponse, GetNetworkResponse, GetTransactionResponse,
     GetTransactionResponseRaw, GetTransactionsRequest, GetTransactionsResponse,
     SendTransactionResponse, SimulateTransactionResponse,
 };
-use soroban_rs::xdr::{
+use stellar_xdr::{
     AccountEntry, ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
     LedgerKey, Limits, MuxedAccount, Operation, OperationBody, ReadXdr, ScAddress, ScSymbol, ScVal,
     SequenceNumber, Transaction, TransactionEnvelope, TransactionV1Envelope, Uint256, VecM,
     WriteXdr,
 };
 #[cfg(test)]
-use soroban_rs::xdr::{AccountId, LedgerKeyAccount, PublicKey};
-use soroban_rs::SorobanTransactionResponse;
+use stellar_xdr::{AccountId, LedgerKeyAccount, PublicKey};
+
+/// Thin wrapper around an RPC `getTransaction` response.
+///
+/// Kept as a distinct type so the provider trait can evolve (for example adding
+/// decoded Soroban return values) without changing the `stellar_rpc_client` type.
+#[derive(Debug, Clone)]
+pub struct SorobanTransactionResponse {
+    pub response: stellar_rpc_client::GetTransactionResponse,
+}
+
+impl From<stellar_rpc_client::GetTransactionResponse> for SorobanTransactionResponse {
+    fn from(response: stellar_rpc_client::GetTransactionResponse) -> Self {
+        Self { response }
+    }
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
@@ -57,7 +71,7 @@ fn generate_unique_rpc_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Cache for soroban_rs Stellar RPC clients, keyed by URL.
+/// Cache for stellar_rpc_client Stellar RPC clients, keyed by URL.
 /// Avoids recreating jsonrpsee HTTP clients on every retry attempt.
 static STELLAR_RPC_CLIENT_CACHE: Lazy<SyncClientCache<String, Client>> =
     Lazy::new(SyncClientCache::new);
@@ -133,17 +147,24 @@ fn categorize_stellar_error_with_context(
         StellarClientError::JsonRpc(jsonrpsee_err) => {
             match jsonrpsee_err {
                 // Handle Call errors with error codes
-                jsonrpsee_core::error::Error::Call(err_obj) => {
+                jsonrpsee_core::ClientError::Call(err_obj) => {
                     let code = err_obj.code() as i64;
                     let message = add_context(err_obj.message().to_string());
-                    ProviderError::RpcErrorCode { code, message }
+                    let data = err_obj
+                        .data()
+                        .and_then(|raw| serde_json::from_str(raw.get()).ok());
+                    ProviderError::RpcErrorCode {
+                        code,
+                        message,
+                        data,
+                    }
                 }
 
                 // Handle request timeouts
-                jsonrpsee_core::error::Error::RequestTimeout => ProviderError::Timeout,
+                jsonrpsee_core::ClientError::RequestTimeout => ProviderError::Timeout,
 
                 // Handle transport errors (network-level issues)
-                jsonrpsee_core::error::Error::Transport(transport_err) => {
+                jsonrpsee_core::ClientError::Transport(transport_err) => {
                     // Check source chain for reqwest errors
                     let mut source = transport_err.source();
                     while let Some(s) = source {
@@ -626,6 +647,9 @@ fn json_rpc_error_to_provider_error(error: &serde_json::Value) -> ProviderError 
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown error")
                 .to_string(),
+            // Drop JSON null so clients don't see `"data": null` (Alloy/jsonrpsee
+            // parse null into `None`; keep the raw-JSON path aligned).
+            data: error.get("data").filter(|v| !v.is_null()).cloned(),
         };
     }
     ProviderError::Other(format!("JSON-RPC error: {error}"))
@@ -775,7 +799,7 @@ impl StellarProviderTrait for StellarProvider {
             ProviderError::Other(format!("Failed to deserialize GetTransactionResponse: {e}"))
         })?;
 
-        raw.try_into().map_err(|e: soroban_rs::xdr::Error| {
+        raw.try_into().map_err(|e: stellar_xdr::Error| {
             ProviderError::Other(format!("Failed to decode getTransaction XDR: {e}"))
         })
     }
@@ -906,10 +930,10 @@ impl StellarProviderTrait for StellarProvider {
             source_account: dummy_account,
             fee: 100,
             seq_num: SequenceNumber(0),
-            cond: soroban_rs::xdr::Preconditions::None,
-            memo: soroban_rs::xdr::Memo::None,
+            cond: stellar_xdr::Preconditions::None,
+            memo: stellar_xdr::Memo::None,
             operations,
-            ext: soroban_rs::xdr::TransactionExt::V0,
+            ext: stellar_xdr::TransactionExt::V0,
         };
 
         let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
@@ -951,17 +975,48 @@ mod stellar_rpc_tests {
     use futures::FutureExt;
     use lazy_static::lazy_static;
     use mockall::predicate as p;
-    use soroban_rs::stellar_rpc_client::{
+    use stellar_rpc_client::{
         EventStart, GetEventsResponse, GetLatestLedgerResponse, GetLedgerEntriesResponse,
         GetNetworkResponse, GetTransactionEvents, GetTransactionResponse, GetTransactionsRequest,
         GetTransactionsResponse, SimulateTransactionResponse,
     };
-    use soroban_rs::xdr::{
-        AccountEntryExt, Hash, LedgerKey, OperationResult, String32, Thresholds,
-        TransactionEnvelope, TransactionResult, TransactionResultExt, TransactionResultResult,
-        VecM,
+    use stellar_xdr::{
+        AccountEntryExt, Hash, LedgerKey, Memo, MuxedAccount, Operation, OperationBody,
+        OperationResult, Preconditions, SequenceNumber, SetOptionsOp, String32, Thresholds,
+        Transaction, TransactionEnvelope, TransactionExt, TransactionResult, TransactionResultExt,
+        TransactionResultResult, TransactionV1Envelope, Uint256, VecM,
     };
-    use soroban_rs::{create_mock_set_options_tx_envelope, SorobanTransactionResponse};
+
+    /// Minimal valid envelope (single SetOptions op) for tests that only need *some* envelope.
+    fn create_mock_set_options_tx_envelope() -> TransactionEnvelope {
+        let source_account = MuxedAccount::Ed25519(Uint256([0; 32]));
+        let set_options_op = Operation {
+            source_account: None,
+            body: OperationBody::SetOptions(SetOptionsOp {
+                inflation_dest: None,
+                clear_flags: None,
+                set_flags: None,
+                master_weight: None,
+                low_threshold: None,
+                med_threshold: None,
+                high_threshold: None,
+                home_domain: None,
+                signer: None,
+            }),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account,
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![set_options_op].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+    }
     use std::str::FromStr;
     use std::sync::Mutex;
 
@@ -1053,6 +1108,10 @@ mod stellar_rpc_tests {
 
     fn dummy_get_transaction_response() -> GetTransactionResponse {
         GetTransactionResponse {
+            application_order: None,
+            fee_bump: None,
+            tx_hash: None,
+            created_at: None,
             status: "SUCCESS".to_string(),
             envelope: None,
             result: Some(create_success_tx_result()),
@@ -1673,7 +1732,7 @@ mod stellar_rpc_tests {
 
     #[test]
     fn test_categorize_stellar_error_with_context_xdr_error() {
-        use soroban_rs::xdr::Error as XdrError;
+        use stellar_xdr::Error as XdrError;
         let err = StellarClientError::Xdr(XdrError::Invalid);
         let result = categorize_stellar_error_with_context(err, Some("Test operation"));
         match result {
@@ -1743,14 +1802,51 @@ mod stellar_rpc_tests {
     }
 
     #[test]
-    fn test_categorize_stellar_error_with_context_json_rpc_call_error() {
-        // Test that RPC Call errors are properly categorized as RpcErrorCode
-        // We'll test this indirectly through other error types since creating Call errors
-        // requires jsonrpsee internals that aren't easily accessible in tests
-        let err = StellarClientError::TransactionSubmissionTimeout;
+    fn test_categorize_stellar_error_with_context_json_rpc_call_preserves_data() {
+        let payload = serde_json::json!({"reason": "txBAD_AUTH"});
+        let err_obj =
+            jsonrpsee_types::ErrorObject::owned(3, "transaction failed", Some(payload.clone()));
+        let err = StellarClientError::JsonRpc(jsonrpsee_core::ClientError::Call(err_obj));
+        let result = categorize_stellar_error_with_context(err, Some("Failed to simulate"));
+
+        match result {
+            ProviderError::RpcErrorCode {
+                code,
+                message,
+                data,
+            } => {
+                assert_eq!(code, 3);
+                assert!(message.contains("Failed to simulate"));
+                assert!(message.contains("transaction failed"));
+                assert_eq!(data, Some(payload));
+            }
+            other => panic!("expected RpcErrorCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_categorize_stellar_error_with_context_json_rpc_call_without_data() {
+        let err_obj = jsonrpsee_types::ErrorObject::owned(
+            -32601,
+            "Method not found",
+            None::<serde_json::Value>,
+        );
+        let err = StellarClientError::JsonRpc(jsonrpsee_core::ClientError::Call(err_obj));
         let result = categorize_stellar_error_with_context(err, Some("Test operation"));
-        // Verify timeout is properly categorized
-        assert!(matches!(result, ProviderError::Timeout));
+
+        match result {
+            ProviderError::RpcErrorCode {
+                code,
+                message,
+                data,
+            } => {
+                assert_eq!(code, -32601);
+                assert!(message.contains("Test operation"));
+                assert!(message.contains("Method not found"));
+                assert!(data.is_none());
+            }
+            other => panic!("expected RpcErrorCode, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2146,6 +2242,90 @@ mod stellar_rpc_tests {
             matches!(err, ProviderError::RpcErrorCode { code: -32601, .. }),
             "Unexpected error: {err}"
         );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_json_rpc_error_preserves_data() {
+        let _env_guard = setup_test_env();
+        std::env::set_var("PROVIDER_MAX_RETRIES", "1");
+
+        let error_data = serde_json::json!({"status": "FAILED", "errorResultXdr": "AAAAAA=="});
+        let mut mock_server = mockito::Server::new_async().await;
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32000,
+                        "message": "transaction submission failed",
+                        "data": error_data
+                    }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let err = provider.get_transaction(&dummy_hash()).await.unwrap_err();
+        match err {
+            ProviderError::RpcErrorCode {
+                code,
+                message,
+                data,
+            } => {
+                assert_eq!(code, -32000);
+                assert!(message.contains("transaction submission failed"));
+                assert_eq!(data, Some(error_data));
+            }
+            other => panic!("expected RpcErrorCode with data, got {other:?}"),
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_null_error_data_becomes_none() {
+        let _env_guard = setup_test_env();
+
+        let mut mock_server = mockito::Server::new_async().await;
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32000,
+                        "message": "transaction submission failed",
+                        "data": null
+                    }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = StellarProvider::new(create_test_provider_config(
+            vec![RpcConfig::new(mock_server.url())],
+            5,
+        ))
+        .unwrap();
+
+        let err = provider.get_transaction(&dummy_hash()).await.unwrap_err();
+        match err {
+            ProviderError::RpcErrorCode { data, .. } => assert!(data.is_none()),
+            other => panic!("expected RpcErrorCode with data=None, got {other:?}"),
+        }
         mock.assert_async().await;
     }
 
